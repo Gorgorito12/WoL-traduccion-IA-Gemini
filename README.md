@@ -53,7 +53,7 @@ pip install google-generativeai tqdm
 Ejemplo:
 
 ```bat
-cd C:\Users\Jeison\Documents\translator
+cd C:\Users\User\Documents\translator
 ```
 
 Asegúrate de que el archivo `translate_gemini.py` esté en esta carpeta.
