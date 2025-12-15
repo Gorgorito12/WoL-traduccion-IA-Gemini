@@ -121,11 +121,16 @@ def translate_batch_gemini(
 
     first_candidate = response.candidates[0]
     finish_reason = getattr(first_candidate, "finish_reason", None)
-    if finish_reason and str(finish_reason).lower() != "stop":
-        raise ValueError(f"Respuesta no completada (finish_reason={finish_reason}).")
+    normalized_finish = str(finish_reason).lower() if finish_reason else ""
 
     if not response.parts or not response.text:
         raise ValueError("Respuesta vacía o sin texto utilizable.")
+
+    if finish_reason and normalized_finish != "stop":
+        logging.warning(
+            "finish_reason inesperado (%s) pero se recibió texto; continuando.",
+            finish_reason,
+        )
 
     cleaned_text = clean_json_response(response.text)
     try:
@@ -134,7 +139,11 @@ def translate_batch_gemini(
         raise ValueError(f"JSON inválido: {exc}. Texto recibido: {cleaned_text[:120]}")
 
     if len(translations) != len(batch):
-        raise ValueError(f"Tamaño incorrecto: Enviados {len(batch)}, Recibidos {len(translations)}")
+        err = ValueError(
+            f"Tamaño incorrecto: Enviados {len(batch)}, Recibidos {len(translations)}"
+        )
+        setattr(err, "partial_translations", translations)
+        raise err
 
     return translations
 
@@ -153,11 +162,18 @@ def is_retryable_error(exc: Exception) -> bool:
         "json inválido",
         "tamaño incorrecto",
         "sin candidatos",
+        "finish_reason=safety",
+        "finish_reason=blocked",
     )
 
     message = str(exc).lower()
 
     if any(signal in message for signal in transient_signals):
+        return True
+
+    finish_reason_hints = ("finish_reason=safety", "finish_reason=blocked", "safety", "blocked")
+
+    if any(hint in message for hint in finish_reason_hints):
         return True
 
     if isinstance(exc, ValueError) and any(signal in message for signal in value_error_retryables):
@@ -169,11 +185,15 @@ def translate_batch_with_retry(
     model, batch, source, target, max_retries
 ) -> List[str]:
     attempt = 0
+    last_partial: Optional[List[str]] = None
     while True:
         try:
             return translate_batch_gemini(model, batch, source, target)
         except Exception as exc:
             attempt += 1
+            partial = getattr(exc, "partial_translations", None)
+            if partial:
+                last_partial = partial
             retryable = is_retryable_error(exc)
             logging.warning(
                 "Error en lote (intento %s/%s, reintentar=%s): %s",
@@ -184,6 +204,8 @@ def translate_batch_with_retry(
             )
             if (not retryable) or attempt > max_retries:
                 logging.error("Fallo crítico en hilo. Saltando lote." )
+                if last_partial:
+                    return last_partial
                 return list(batch)
 
             backoff = min(BACKOFF_SECONDS * (2 ** (attempt - 1)), BACKOFF_MAX_SECONDS)
