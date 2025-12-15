@@ -147,9 +147,22 @@ def is_retryable_error(exc: Exception) -> bool:
         "deadline exceeded",
         "overloaded",
     )
+    value_error_retryables = (
+        "respuesta no completada",
+        "respuesta vacía",
+        "json inválido",
+        "tamaño incorrecto",
+        "sin candidatos",
+    )
+
     message = str(exc).lower()
+
     if any(signal in message for signal in transient_signals):
         return True
+
+    if isinstance(exc, ValueError) and any(signal in message for signal in value_error_retryables):
+        return True
+
     return not isinstance(exc, ValueError)
 
 def translate_batch_with_retry(
