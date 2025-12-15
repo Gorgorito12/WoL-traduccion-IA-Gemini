@@ -7,6 +7,7 @@ import logging
 import re
 import time
 import json
+import random
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
@@ -21,7 +22,7 @@ DEFAULT_SOURCE_LANG = "English"
 DEFAULT_TARGET_LANG = "Latin American Spanish"
 
 # Mantenemos lotes medianos para agilidad
-MAX_CHARS = 4500 
+MAX_BUDGET_BYTES = 4500
 
 # ¡AQUÍ ESTÁ LA MAGIA! 
 # Número de lotes que se traducirán AL MISMO TIEMPO.
@@ -30,6 +31,7 @@ MAX_WORKERS = 8
 
 DEFAULT_MAX_RETRIES = 5
 BACKOFF_SECONDS = 1.0
+BACKOFF_MAX_SECONDS = 30.0
 
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
 
@@ -58,12 +60,12 @@ def decode_auto(path: Path) -> str:
         return raw.decode("utf-16")
     return raw.decode("utf-8")
 
-def yield_batches(strings: Iterable[str], max_chars: int) -> Iterator[List[str]]:
+def yield_batches(strings: Iterable[str], max_budget_bytes: int, max_items: int = 50) -> Iterator[List[str]]:
     batch: List[str] = []
     current_len = 0
     for text in strings:
-        text_len = len(text) + 10 
-        if batch and (current_len + text_len) > max_chars:
+        text_len = len(text.encode("utf-8")) + 32  # amortiza comillas y tokens
+        if batch and (current_len + text_len > max_budget_bytes or len(batch) >= max_items):
             yield batch
             batch = []
             current_len = 0
@@ -83,9 +85,9 @@ def clean_json_response(text: str) -> str:
     return text.strip()
 
 def translate_batch_gemini(
-    model: genai.GenerativeModel, 
-    batch: Sequence[str], 
-    source_lang: str, 
+    model: genai.GenerativeModel,
+    batch: Sequence[str],
+    source_lang: str,
     target_lang: str
 ) -> List[str]:
     
@@ -112,21 +114,43 @@ def translate_batch_gemini(
     {json.dumps(batch)}
     """
 
+    response = model.generate_content(prompt)
+
+    if not response.candidates:
+        raise ValueError("Respuesta sin candidatos.")
+
+    first_candidate = response.candidates[0]
+    finish_reason = getattr(first_candidate, "finish_reason", None)
+    if finish_reason and str(finish_reason).lower() != "stop":
+        raise ValueError(f"Respuesta no completada (finish_reason={finish_reason}).")
+
+    if not response.parts or not response.text:
+        raise ValueError("Respuesta vacía o sin texto utilizable.")
+
+    cleaned_text = clean_json_response(response.text)
     try:
-        response = model.generate_content(prompt)
-        if not response.parts:
-             raise ValueError("Respuesta vacía.")
-
-        cleaned_text = clean_json_response(response.text)
         translations = json.loads(cleaned_text)
-        
-        if len(translations) != len(batch):
-            raise ValueError(f"Tamaño incorrecto: Enviados {len(batch)}, Recibidos {len(translations)}")
-            
-        return translations
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"JSON inválido: {exc}. Texto recibido: {cleaned_text[:120]}")
 
-    except Exception as e:
-        raise e
+    if len(translations) != len(batch):
+        raise ValueError(f"Tamaño incorrecto: Enviados {len(batch)}, Recibidos {len(translations)}")
+
+    return translations
+
+
+def is_retryable_error(exc: Exception) -> bool:
+    transient_signals = (
+        "rate limit",
+        "temporarily unavailable",
+        "try again",
+        "deadline exceeded",
+        "overloaded",
+    )
+    message = str(exc).lower()
+    if any(signal in message for signal in transient_signals):
+        return True
+    return not isinstance(exc, ValueError)
 
 def translate_batch_with_retry(
     model, batch, source, target, max_retries
@@ -137,21 +161,31 @@ def translate_batch_with_retry(
             return translate_batch_gemini(model, batch, source, target)
         except Exception as exc:
             attempt += 1
-            if attempt > max_retries:
-                logging.error(f"Fallo crítico en hilo. Saltando lote.")
-                return list(batch) 
+            retryable = is_retryable_error(exc)
+            logging.warning(
+                "Error en lote (intento %s/%s, reintentar=%s): %s",
+                attempt,
+                max_retries,
+                retryable,
+                exc,
+            )
+            if (not retryable) or attempt > max_retries:
+                logging.error("Fallo crítico en hilo. Saltando lote." )
+                return list(batch)
 
-            wait = BACKOFF_SECONDS 
-            time.sleep(wait)
+            backoff = min(BACKOFF_SECONDS * (2 ** (attempt - 1)), BACKOFF_MAX_SECONDS)
+            backoff += random.uniform(0, BACKOFF_SECONDS)
+            time.sleep(backoff)
 
 def translate_strings(
     inners: Iterable[str],
     api_key: str,
     source_lang: str,
     target_lang: str,
-    max_chars: int = MAX_CHARS,
+    max_budget_bytes: int = MAX_BUDGET_BYTES,
     max_retries: int = DEFAULT_MAX_RETRIES,
     progress_callback: Optional[Callable[[Sequence[str]], None]] = None,
+    cache_path: Optional[Path] = None,
 ) -> List[str]:
     
     setup_gemini(api_key)
@@ -170,6 +204,12 @@ def translate_strings(
         indexes_by_protected.setdefault(protected_text, []).append(idx)
 
     cache: Dict[str, str] = {}
+    if cache_path and cache_path.exists():
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logging.warning("No se pudo cargar caché previa (%s): %s", cache_path, exc)
+            cache = {}
     unique_to_translate: List[str] = []
     for text in protected:
         if not text.strip():
@@ -180,7 +220,7 @@ def translate_strings(
             unique_to_translate.append(text)
 
     # Creamos todos los lotes
-    batches = list(yield_batches(unique_to_translate, max_chars))
+    batches = list(yield_batches(unique_to_translate, max_budget_bytes))
     
     # Mapa para ordenar resultados: {indice_lote: [textos_originales]}
     batch_map = {i: batch for i, batch in enumerate(batches)}
@@ -192,7 +232,7 @@ def translate_strings(
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         # Lanzamos todas las tareas
         future_to_batch_idx = {
-            executor.submit(translate_batch_with_retry, model, batch, source_lang, target_lang, max_retries): idx 
+            executor.submit(translate_batch_with_retry, model, batch, source_lang, target_lang, max_retries): idx
             for idx, batch in batch_map.items()
         }
 
@@ -204,8 +244,13 @@ def translate_strings(
             try:
                 translated_batch = future.result()
             except Exception as exc:
-                logging.error(f"Excepción no manejada en hilo: {exc}")
-                translated_batch = original_batch # Fallback
+                logging.error(
+                    "Excepción no manejada en hilo (lote %s, %s items): %s",
+                    batch_idx,
+                    len(original_batch),
+                    exc,
+                )
+                translated_batch = original_batch  # Fallback
 
             # Guardamos en caché y actualizamos lista principal
             for original, translated_item in zip(original_batch, translated_batch):
@@ -214,6 +259,12 @@ def translate_strings(
                     translations[idx] = unprotect_tokens(translated_item, token_maps[idx])
             
             # Guardamos progreso parcial (thread-safe porque estamos en el hilo principal)
+            if cache_path:
+                try:
+                    cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception as exc:
+                    logging.warning("No se pudo persistir la caché en lote %s: %s", batch_idx, exc)
+
             if progress_callback:
                 progress_callback(list(translations))
 
@@ -264,11 +315,13 @@ def main() -> None:
 
     tree = parse_strings_xml(args.input)
     elements = list(iter_translatable_elements(tree.getroot()))
-    
+
     print(f"🔥 MODO POTENCIA: {DEFAULT_MODEL} + {MAX_WORKERS} Hilos.")
 
     texts = extract_texts(elements)
     write_output_snapshot(tree, elements, texts, args.output)
+
+    cache_file = args.output.with_suffix(args.output.suffix + ".cache.json")
 
     try:
         translated = translate_strings(
@@ -276,6 +329,7 @@ def main() -> None:
             api_key=args.api_key,
             source_lang=args.source,
             target_lang=args.target,
+            cache_path=cache_file,
             progress_callback=lambda current: write_output_snapshot(
                 tree, elements, current, args.output
             )
