@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import time
 import json
@@ -13,6 +14,7 @@ from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence,
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import google.generativeai as genai
+from google.api_core import exceptions as google_exceptions
 from tqdm import tqdm
 
 # --- CONFIGURACIÓN DE POTENCIA ---
@@ -83,9 +85,9 @@ def clean_json_response(text: str) -> str:
     return text.strip()
 
 def translate_batch_gemini(
-    model: genai.GenerativeModel, 
-    batch: Sequence[str], 
-    source_lang: str, 
+    model: genai.GenerativeModel,
+    batch: Sequence[str],
+    source_lang: str,
     target_lang: str
 ) -> List[str]:
     
@@ -112,21 +114,43 @@ def translate_batch_gemini(
     {json.dumps(batch)}
     """
 
+    response = model.generate_content(prompt)
+
+    if not response.parts:
+        raise ValueError("Respuesta vacía.")
+
+    raw_text = str(response.text)
+    cleaned_text = clean_json_response(raw_text)
+
     try:
-        response = model.generate_content(prompt)
-        if not response.parts:
-             raise ValueError("Respuesta vacía.")
-
-        cleaned_text = clean_json_response(response.text)
         translations = json.loads(cleaned_text)
-        
-        if len(translations) != len(batch):
-            raise ValueError(f"Tamaño incorrecto: Enviados {len(batch)}, Recibidos {len(translations)}")
-            
-        return translations
+    except json.JSONDecodeError as exc:
+        logging.error("JSON malformado en respuesta de Gemini: %s", raw_text)
+        raise ValueError("Respuesta JSON inválida") from exc
 
-    except Exception as e:
-        raise e
+    if not isinstance(translations, list) or not all(isinstance(item, str) for item in translations):
+        logging.error("Formato inesperado en respuesta: %s", raw_text)
+        raise ValueError("La respuesta no es una lista de strings")
+
+    if len(translations) != len(batch):
+        logging.error(
+            "Tamaño incorrecto: enviados %s, recibidos %s. Respuesta: %s",
+            len(batch), len(translations), raw_text
+        )
+        raise ValueError(f"Tamaño incorrecto: Enviados {len(batch)}, Recibidos {len(translations)}")
+
+    return translations
+
+def _is_retryable_error(exc: Exception) -> bool:
+    if isinstance(exc, (google_exceptions.ResourceExhausted, google_exceptions.ServiceUnavailable)):
+        return True
+    status_code = getattr(exc, "code", None)
+    if status_code in (429, 503):
+        return True
+    http_status = getattr(getattr(exc, "response", None), "status_code", None)
+    if http_status in (429, 503):
+        return True
+    return False
 
 def translate_batch_with_retry(
     model, batch, source, target, max_retries
@@ -137,11 +161,13 @@ def translate_batch_with_retry(
             return translate_batch_gemini(model, batch, source, target)
         except Exception as exc:
             attempt += 1
-            if attempt > max_retries:
-                logging.error(f"Fallo crítico en hilo. Saltando lote.")
-                return list(batch) 
+            retryable = _is_retryable_error(exc)
+            if attempt > max_retries or not retryable:
+                logging.error("Fallo crítico en hilo (reintentos=%s, reintetable=%s): %s", attempt, retryable, exc)
+                return list(batch)
 
-            wait = BACKOFF_SECONDS 
+            wait = min(BACKOFF_SECONDS * (2 ** (attempt - 1)), 30)
+            logging.warning("Intento %s fallido: %s. Reintentando en %.1fs", attempt, exc, wait)
             time.sleep(wait)
 
 def translate_strings(
@@ -170,6 +196,16 @@ def translate_strings(
         indexes_by_protected.setdefault(protected_text, []).append(idx)
 
     cache: Dict[str, str] = {}
+    checkpoint_path = Path(".translation_checkpoint.json")
+
+    if checkpoint_path.exists():
+        try:
+            checkpoint_data = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            cache.update(checkpoint_data.get("cache", {}))
+            logging.info("Checkpoint cargado: %s entradas", len(cache))
+        except Exception as exc:
+            logging.warning("No se pudo cargar checkpoint: %s", exc)
+
     unique_to_translate: List[str] = []
     for text in protected:
         if not text.strip():
@@ -181,7 +217,7 @@ def translate_strings(
 
     # Creamos todos los lotes
     batches = list(yield_batches(unique_to_translate, max_chars))
-    
+
     # Mapa para ordenar resultados: {indice_lote: [textos_originales]}
     batch_map = {i: batch for i, batch in enumerate(batches)}
     total_batches = len(batches)
@@ -189,33 +225,43 @@ def translate_strings(
     print(f"🚀 Iniciando motor MULTIHILO: {MAX_WORKERS} trabajadores simultáneos...")
 
     # --- PROCESAMIENTO PARALELO ---
+    results_by_batch: Dict[int, Sequence[str]] = {}
+    next_to_process = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         # Lanzamos todas las tareas
         future_to_batch_idx = {
-            executor.submit(translate_batch_with_retry, model, batch, source_lang, target_lang, max_retries): idx 
+            executor.submit(translate_batch_with_retry, model, batch, source_lang, target_lang, max_retries): idx
             for idx, batch in batch_map.items()
         }
 
         # Procesamos conforme terminan
         for future in tqdm(as_completed(future_to_batch_idx), total=total_batches, desc="Traduciendo en Paralelo", unit="lote"):
             batch_idx = future_to_batch_idx[future]
-            original_batch = batch_map[batch_idx]
-            
             try:
-                translated_batch = future.result()
+                results_by_batch[batch_idx] = future.result()
             except Exception as exc:
-                logging.error(f"Excepción no manejada en hilo: {exc}")
-                translated_batch = original_batch # Fallback
+                logging.error("Excepción no manejada en hilo: %s", exc)
+                results_by_batch[batch_idx] = batch_map[batch_idx]
 
-            # Guardamos en caché y actualizamos lista principal
-            for original, translated_item in zip(original_batch, translated_batch):
-                cache[original] = translated_item
-                for idx in indexes_by_protected.get(original, []):
-                    translations[idx] = unprotect_tokens(translated_item, token_maps[idx])
-            
-            # Guardamos progreso parcial (thread-safe porque estamos en el hilo principal)
-            if progress_callback:
-                progress_callback(list(translations))
+            # Procesa en orden los lotes ya disponibles
+            while next_to_process in results_by_batch:
+                original_batch = batch_map[next_to_process]
+                translated_batch = results_by_batch.pop(next_to_process)
+
+                for original, translated_item in zip(original_batch, translated_batch):
+                    cache[original] = translated_item
+                    for idx in indexes_by_protected.get(original, []):
+                        translations[idx] = unprotect_tokens(translated_item, token_maps[idx])
+
+                checkpoint_path.write_text(
+                    json.dumps({"cache": cache}, ensure_ascii=False, indent=2),
+                    encoding="utf-8"
+                )
+
+                if progress_callback:
+                    progress_callback(list(translations))
+
+                next_to_process += 1
 
     return translations
 
@@ -250,21 +296,26 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--api-key", type=str, required=True)
+    parser.add_argument("--api-key", type=str, required=False)
     parser.add_argument("--source", default=DEFAULT_SOURCE_LANG)
     parser.add_argument("--target", default=DEFAULT_TARGET_LANG)
+    parser.add_argument("--log-level", default="WARNING", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     return parser.parse_args()
 
 def main() -> None:
-    logging.basicConfig(level=logging.WARNING)
     args = parse_args()
+    logging.basicConfig(level=getattr(logging, args.log_level))
 
     if not args.input.exists():
         raise SystemExit(f"No existe: {args.input}")
 
+    api_key = args.api_key or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise SystemExit("Debe proporcionar --api-key o la variable de entorno GEMINI_API_KEY")
+
     tree = parse_strings_xml(args.input)
     elements = list(iter_translatable_elements(tree.getroot()))
-    
+
     print(f"🔥 MODO POTENCIA: {DEFAULT_MODEL} + {MAX_WORKERS} Hilos.")
 
     texts = extract_texts(elements)
@@ -273,7 +324,7 @@ def main() -> None:
     try:
         translated = translate_strings(
             texts,
-            api_key=args.api_key,
+            api_key=api_key,
             source_lang=args.source,
             target_lang=args.target,
             progress_callback=lambda current: write_output_snapshot(
@@ -281,6 +332,9 @@ def main() -> None:
             )
         )
         write_output_snapshot(tree, elements, translated, args.output)
+        checkpoint_file = Path(".translation_checkpoint.json")
+        if checkpoint_file.exists():
+            checkpoint_file.unlink()
         print(f"\n✅ Terminado: {args.output}")
 
     except Exception as e:
