@@ -186,6 +186,7 @@ def translate_strings(
     max_retries: int = DEFAULT_MAX_RETRIES,
     progress_callback: Optional[Callable[[Sequence[str]], None]] = None,
     cache_path: Optional[Path] = None,
+    existing_translations: Optional[Sequence[str]] = None,
 ) -> List[str]:
     
     setup_gemini(api_key)
@@ -195,13 +196,6 @@ def translate_strings(
     token_maps: List[Dict[str, str]] = []
     translations: List[str] = []
     indexes_by_protected: Dict[str, List[int]] = {}
-    
-    for idx, inner in enumerate(inners):
-        protected_text, token_map = protect_tokens(inner)
-        protected.append(protected_text)
-        token_maps.append(token_map)
-        translations.append(inner)
-        indexes_by_protected.setdefault(protected_text, []).append(idx)
 
     cache: Dict[str, str] = {}
     if cache_path and cache_path.exists():
@@ -210,6 +204,22 @@ def translate_strings(
         except Exception as exc:
             logging.warning("No se pudo cargar caché previa (%s): %s", cache_path, exc)
             cache = {}
+
+    for idx, inner in enumerate(inners):
+        protected_text, token_map = protect_tokens(inner)
+        protected.append(protected_text)
+        token_maps.append(token_map)
+
+        initial_translation = inner
+        if existing_translations and idx < len(existing_translations):
+            candidate = existing_translations[idx]
+            if candidate and candidate.strip():
+                initial_translation = candidate
+                if candidate != inner:
+                    cache.setdefault(protected_text, candidate)
+
+        translations.append(initial_translation)
+        indexes_by_protected.setdefault(protected_text, []).append(idx)
     unique_to_translate: List[str] = []
     for text in protected:
         if not text.strip():
@@ -297,6 +307,27 @@ def write_output_snapshot(tree, elements, texts, output):
     update_elements_text(elements, texts)
     tree.write(output, encoding="utf-8", xml_declaration=True)
 
+
+def load_existing_translations(path: Path, reference_count: int) -> Optional[List[str]]:
+    if not path.exists():
+        return None
+
+    try:
+        existing_tree = parse_strings_xml(path)
+        existing_elements = list(iter_translatable_elements(existing_tree.getroot()))
+        if len(existing_elements) != reference_count:
+            logging.warning(
+                "El archivo de salida existente (%s) no coincide en longitud (esperado %s, encontrado %s). Ignorando.",
+                path,
+                reference_count,
+                len(existing_elements),
+            )
+            return None
+        return extract_texts(existing_elements)
+    except Exception as exc:
+        logging.warning("No se pudo cargar traducciones previas desde %s: %s", path, exc)
+        return None
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("input", type=Path)
@@ -319,7 +350,13 @@ def main() -> None:
     print(f"🔥 MODO POTENCIA: {DEFAULT_MODEL} + {MAX_WORKERS} Hilos.")
 
     texts = extract_texts(elements)
-    write_output_snapshot(tree, elements, texts, args.output)
+    existing_translations = load_existing_translations(args.output, len(elements))
+    starting_texts = existing_translations or texts
+
+    if existing_translations:
+        print("↩️  Reanudando traducción desde archivo existente.")
+
+    write_output_snapshot(tree, elements, starting_texts, args.output)
 
     cache_file = args.output.with_suffix(args.output.suffix + ".cache.json")
 
@@ -330,6 +367,7 @@ def main() -> None:
             source_lang=args.source,
             target_lang=args.target,
             cache_path=cache_file,
+            existing_translations=existing_translations,
             progress_callback=lambda current: write_output_snapshot(
                 tree, elements, current, args.output
             )
