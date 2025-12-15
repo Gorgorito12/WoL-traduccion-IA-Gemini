@@ -297,6 +297,8 @@ def parse_strings_xml(path: Path) -> ET.ElementTree:
 
 def iter_translatable_elements(root: ET.Element) -> Iterator[ET.Element]:
     def tag_matches(tag: str, name: str) -> bool:
+        if not isinstance(tag, str):
+            return False
         return tag.split("}")[-1].lower() == name
     for elem in root.iter():
         if tag_matches(elem.tag, "string"):
