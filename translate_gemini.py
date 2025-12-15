@@ -281,9 +281,19 @@ def translate_strings(
     return translations
 
 # --- XML Utils ---
+class CommentedTreeBuilder(ET.TreeBuilder):
+    """TreeBuilder que conserva comentarios XML al parsear."""
+
+    def comment(self, data):
+        self.start(ET.Comment, {})
+        self.data(data)
+        self.end(ET.Comment)
+
+
 def parse_strings_xml(path: Path) -> ET.ElementTree:
     content = decode_auto(path)
-    return ET.ElementTree(ET.fromstring(content))
+    parser = ET.XMLParser(target=CommentedTreeBuilder())
+    return ET.ElementTree(ET.fromstring(content, parser=parser))
 
 def iter_translatable_elements(root: ET.Element) -> Iterator[ET.Element]:
     def tag_matches(tag: str, name: str) -> bool:
