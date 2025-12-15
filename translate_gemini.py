@@ -92,23 +92,44 @@ def translate_batch_gemini(
 ) -> List[str]:
     
     prompt = f"""
-    You are a professional video game localizer specializing in history.
-    
-    Task: Translate the following strings for 'Age of Empires 3: Wars of Liberty' from {source_lang} to **Latin American Spanish**.
+    You are a professional video game localization specialist with expertise in historical settings.
 
-    HISTORICAL CONTEXT (1789-1916):
-    - Eras: Napoleonic Wars, Industrial Revolution, WWI.
-    - Terminology: Accurate military terms (Muskets, Cannons, Ironclads, Trenches).
+    TASK
+    Translate the following strings for “Age of Empires III: Wars of Liberty” from {source_lang} into **Latin American Spanish**.
 
-    LOCALIZATION RULES (LATAM):
-    1. **NO 'Vosotros'**: Use 'Ustedes'.
-    2. **Vocabulary**: 'Computadora', 'Costo', 'Tomar', 'Video'.
-    3. **Tone**: Neutral Spanish.
-    
-    CRITICAL TECHNICAL RULES:
-    1. DO NOT translate tokens like '__TOK0__'.
-    2. Return ONLY a valid JSON list of strings.
-    3. The output list must have exactly the same number of elements as the input list.
+    HISTORICAL FRAME (1789–1916)
+    - Periods covered: Napoleonic Wars, Industrial Revolution, World War I.
+    - Use accurate military and civilian terminology appropriate to the era
+      (e.g., muskets, cannons, ironclads, trenches).
+    - Avoid modern or anachronistic expressions.
+    - Do NOT use archaic or literary Spanish; the result must remain clear and playable.
+
+    LOCALIZATION RULES (LATAM)
+    1. Use “Ustedes”, never “Vosotros”.
+    2. Neutral Latin American Spanish.
+    3. Preferred vocabulary:
+       - computadora (not ordenador)
+       - costo (not precio when used in UI)
+       - tomar (not coger)
+       - video (not vídeo)
+    4. Imperatives should be neutral and formal (e.g., “Presione”, “Seleccione”).
+
+    STYLE & CONSISTENCY
+    - If the same English sentence appears multiple times, translate it exactly the same way each time.
+    - Keep sentences concise and suitable for UI/game text.
+    - Do not add explanations, clarifications, or extra words.
+
+    CRITICAL TECHNICAL RULES (STRICT)
+    1. DO NOT translate, modify, reorder, or remove tokens such as:
+       __TOK0__, __TOK1__, %s, %1$s, %d, \n, \t, or any placeholder.
+    2. DO NOT merge, split, or rephrase strings.
+    3. Translate only the human-readable text.
+    4. Return ONLY a valid JSON array of strings.
+    5. The output array MUST contain exactly the same number of elements, in the same order, as the input array.
+    6. If a string is empty or contains only placeholders, return it unchanged.
+
+    COMPLIANCE
+    If any rule cannot be followed, return the original string unchanged.
 
     Input List:
     {json.dumps(batch)}
