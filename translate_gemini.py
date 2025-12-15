@@ -234,12 +234,31 @@ def translate_strings(
         translations.append(initial_translation)
         indexes_by_protected.setdefault(protected_text, []).append(idx)
     unique_to_translate: List[str] = []
+    already_enqueued: set[str] = set()
+
     for text in protected:
         if not text.strip():
             cache[text] = text
+            # Propagamos el texto vacío tal cual a todas sus posiciones.
+            for idx in indexes_by_protected.get(text, []):
+                translations[idx] = unprotect_tokens(text, token_maps[idx])
             continue
+
+        cached_value = cache.get(text)
+
+        if cached_value and cached_value.strip():
+            # Ya teníamos una traducción previa en caché: la aplicamos a todas
+            # las apariciones de este texto y evitamos re-traducirlo.
+            for idx in indexes_by_protected.get(text, []):
+                translations[idx] = unprotect_tokens(cached_value, token_maps[idx])
+            continue
+
+        # Si no hay caché (o está vacía), registramos entrada y lo programamos
+        # para traducción, cuidando de no encolar duplicados.
         if text not in cache:
             cache[text] = ""
+        if text not in already_enqueued:
+            already_enqueued.add(text)
             unique_to_translate.append(text)
 
     # Creamos todos los lotes
