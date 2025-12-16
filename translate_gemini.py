@@ -27,11 +27,12 @@ MAX_BUDGET_BYTES = 4500
 # ¡AQUÍ ESTÁ LA MAGIA! 
 # Número de lotes que se traducirán AL MISMO TIEMPO.
 # Con tu cuenta de pago, 8 es un número seguro y muy rápido.
-MAX_WORKERS = 8 
-
 DEFAULT_MAX_RETRIES = 5
 BACKOFF_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 30.0
+
+DEFAULT_COMPACT_PROMPT = False
+DEFAULT_MAX_WORKERS = 8
 
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
 
@@ -84,56 +85,51 @@ def clean_json_response(text: str) -> str:
         text = text[:-3]
     return text.strip()
 
+def build_prompt(batch: Sequence[str], source_lang: str, target_lang: str, compact: bool) -> str:
+    if compact:
+        return (
+            "Translate for 'Age of Empires III: Wars of Liberty'. "
+            f"{source_lang} -> {target_lang}. "
+            "Rules: Latin American Spanish, use 'Ustedes'; avoid anachronisms; keep UI tone concise. "
+            "Preferred words: computadora, costo (UI), tomar, video. "
+            "Respect placeholders (__TOK#, %s, %1$s, %d, \\n, \\t); do not move, delete, or edit them. "
+            "Return ONLY a JSON array, same length/order as input; empty/placeholder-only strings stay the same. "
+            "If unsure, return the original string. Input list: "
+            f"{json.dumps(batch, ensure_ascii=False)}"
+        )
+
+    return f"""
+    You are a professional video game localization specialist for “Age of Empires III: Wars of Liberty”.
+
+    TASK
+    Translate from {source_lang} to {target_lang} with natural, concise UI/game text.
+
+    ERA & STYLE (1789–1916)
+    - Use accurate terms for Napoleonic Wars, Industrial Revolution, and WWI.
+    - Avoid anachronisms; do not use archaic Spanish.
+    - Latin American Spanish; always “Ustedes”, never “Vosotros”.
+    - Preferred: computadora, costo (UI), tomar, video. Imperatives: “Presione”, “Seleccione”.
+
+    TECHNICAL RULES (STRICT)
+    1. DO NOT translate or alter placeholders (__TOK#, %s, %1$s, %d, \n, \t).
+    2. Do not merge/split/rephrase strings.
+    3. Output ONLY a JSON array of strings, same length/order as input.
+    4. If a string is empty or only placeholders, return it unchanged.
+    5. If any rule fails, return the original string unchanged.
+
+    Input List: {json.dumps(batch, ensure_ascii=False)}
+    """
+
+
 def translate_batch_gemini(
     model: genai.GenerativeModel,
     batch: Sequence[str],
     source_lang: str,
-    target_lang: str
+    target_lang: str,
+    compact_prompt: bool,
 ) -> List[str]:
-    
-    prompt = f"""
-    You are a professional video game localization specialist with expertise in historical settings.
 
-    TASK
-    Translate the following strings for “Age of Empires III: Wars of Liberty” from {source_lang} into **Latin American Spanish**.
-
-    HISTORICAL FRAME (1789–1916)
-    - Periods covered: Napoleonic Wars, Industrial Revolution, World War I.
-    - Use accurate military and civilian terminology appropriate to the era
-      (e.g., muskets, cannons, ironclads, trenches).
-    - Avoid modern or anachronistic expressions.
-    - Do NOT use archaic or literary Spanish; the result must remain clear and playable.
-
-    LOCALIZATION RULES (LATAM)
-    1. Use “Ustedes”, never “Vosotros”.
-    2. Neutral Latin American Spanish.
-    3. Preferred vocabulary:
-       - computadora (not ordenador)
-       - costo (not precio when used in UI)
-       - tomar (not coger)
-       - video (not vídeo)
-    4. Imperatives should be neutral and formal (e.g., “Presione”, “Seleccione”).
-
-    STYLE & CONSISTENCY
-    - If the same English sentence appears multiple times, translate it exactly the same way each time.
-    - Keep sentences concise and suitable for UI/game text.
-    - Do not add explanations, clarifications, or extra words.
-
-    CRITICAL TECHNICAL RULES (STRICT)
-    1. DO NOT translate, modify, reorder, or remove tokens such as:
-       __TOK0__, __TOK1__, %s, %1$s, %d, \n, \t, or any placeholder.
-    2. DO NOT merge, split, or rephrase strings.
-    3. Translate only the human-readable text.
-    4. Return ONLY a valid JSON array of strings.
-    5. The output array MUST contain exactly the same number of elements, in the same order, as the input array.
-    6. If a string is empty or contains only placeholders, return it unchanged.
-
-    COMPLIANCE
-    If any rule cannot be followed, return the original string unchanged.
-
-    Input List:
-    {json.dumps(batch)}
-    """
+    prompt = build_prompt(batch, source_lang, target_lang, compact_prompt)
 
     response = model.generate_content(prompt)
 
@@ -203,13 +199,18 @@ def is_retryable_error(exc: Exception) -> bool:
     return not isinstance(exc, ValueError)
 
 def translate_batch_with_retry(
-    model, batch, source, target, max_retries
+    model,
+    batch,
+    source,
+    target,
+    max_retries,
+    compact_prompt: bool,
 ) -> List[str]:
     attempt = 0
     last_partial: Optional[List[str]] = None
     while True:
         try:
-            return translate_batch_gemini(model, batch, source, target)
+            return translate_batch_gemini(model, batch, source, target, compact_prompt)
         except Exception as exc:
             attempt += 1
             partial = getattr(exc, "partial_translations", None)
@@ -240,6 +241,8 @@ def translate_strings(
     target_lang: str,
     max_budget_bytes: int = MAX_BUDGET_BYTES,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+    compact_prompt: bool = DEFAULT_COMPACT_PROMPT,
     progress_callback: Optional[Callable[[Sequence[str]], None]] = None,
     cache_path: Optional[Path] = None,
     existing_translations: Optional[Sequence[str]] = None,
@@ -311,13 +314,21 @@ def translate_strings(
     batch_map = {i: batch for i, batch in enumerate(batches)}
     total_batches = len(batches)
 
-    print(f"🚀 Iniciando motor MULTIHILO: {MAX_WORKERS} trabajadores simultáneos...")
+    print(f"🚀 Iniciando motor MULTIHILO: {max_workers} trabajadores simultáneos...")
 
     # --- PROCESAMIENTO PARALELO ---
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Lanzamos todas las tareas
         future_to_batch_idx = {
-            executor.submit(translate_batch_with_retry, model, batch, source_lang, target_lang, max_retries): idx
+            executor.submit(
+                translate_batch_with_retry,
+                model,
+                batch,
+                source_lang,
+                target_lang,
+                max_retries,
+                compact_prompt,
+            ): idx
             for idx, batch in batch_map.items()
         }
 
@@ -428,6 +439,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-key", type=str, required=True)
     parser.add_argument("--source", default=DEFAULT_SOURCE_LANG)
     parser.add_argument("--target", default=DEFAULT_TARGET_LANG)
+    parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
+    parser.add_argument("--max-budget-bytes", type=int, default=MAX_BUDGET_BYTES)
+    parser.add_argument("--compact-prompt", action="store_true", default=DEFAULT_COMPACT_PROMPT)
     return parser.parse_args()
 
 def main() -> None:
@@ -440,7 +454,7 @@ def main() -> None:
     tree = parse_strings_xml(args.input)
     elements = list(iter_translatable_elements(tree.getroot()))
 
-    print(f"🔥 MODO POTENCIA: {DEFAULT_MODEL} + {MAX_WORKERS} Hilos.")
+    print(f"🔥 MODO POTENCIA: {DEFAULT_MODEL} + {args.max_workers} Hilos.")
 
     texts = extract_texts(elements)
     existing_translations = load_existing_translations(args.output, len(elements))
@@ -461,6 +475,9 @@ def main() -> None:
             target_lang=args.target,
             cache_path=cache_file,
             existing_translations=existing_translations,
+            max_workers=args.max_workers,
+            max_budget_bytes=args.max_budget_bytes,
+            compact_prompt=args.compact_prompt,
             progress_callback=lambda current: write_output_snapshot(
                 tree, elements, current, args.output
             )
