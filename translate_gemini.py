@@ -1,4 +1,4 @@
-"""Script FINAL: Gemini 2.5 Flash + MULTIHILO (Paralelismo para máxima velocidad)."""
+"""Final script: Gemini 2.5 Flash + MULTITHREADING (Parallelism for maximum speed)."""
 
 from __future__ import annotations
 
@@ -16,22 +16,22 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import google.generativeai as genai
 from tqdm import tqdm
 
-# --- CONFIGURACIÓN DE POTENCIA ---
-DEFAULT_MODEL = "gemini-2.5-flash" 
+# --- POWER CONFIGURATION ---
+DEFAULT_MODEL = "gemini-2.5-flash"
 DEFAULT_SOURCE_LANG = "English"
-DEFAULT_TARGET_LANG = "Latin American Spanish"
+DEFAULT_TARGET_LANG = "Brazilian Portuguese (PT-BR)"
 
-# Mantenemos lotes medianos para agilidad
+# Keep medium batches for agility
 MAX_BUDGET_BYTES = 4500
 
-# ¡AQUÍ ESTÁ LA MAGIA! 
-# Número de lotes que se traducirán AL MISMO TIEMPO.
-# Con tu cuenta de pago, 8 es un número seguro y muy rápido.
+# Here's the magic!
+# Number of batches that will be translated AT THE SAME TIME.
+# With a paid account, 8 is a safe and fast number.
 DEFAULT_MAX_RETRIES = 5
 BACKOFF_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 30.0
 
-# Usa el prompt compacto por defecto para reducir tokens sin perder reglas clave.
+# Use the compact prompt by default to reduce tokens without losing key rules.
 DEFAULT_COMPACT_PROMPT = True
 DEFAULT_MAX_WORKERS = 8
 
@@ -91,8 +91,8 @@ def build_prompt(batch: Sequence[str], source_lang: str, target_lang: str, compa
         return (
             "Translate for 'Age of Empires III: Wars of Liberty'. "
             f"{source_lang} -> {target_lang}. "
-            "Rules: Latin American Spanish, use 'Ustedes'; avoid anachronisms; keep UI tone concise. "
-            "Preferred words: computadora, costo (UI), tomar, video. "
+            "Rules: Brazilian Portuguese (PT-BR); use 'vocês'; avoid anachronisms; keep UI tone concise. "
+            "Preferred words: computador, custo (UI), pegar, vídeo. Imperatives: 'Pressione', 'Selecione'. "
             "Respect placeholders (__TOK#, %s, %1$s, %d, \\n, \\t); do not move, delete, or edit them. "
             "Return ONLY a JSON array, same length/order as input; empty/placeholder-only strings stay the same. "
             "If unsure, return the original string. Input list: "
@@ -107,9 +107,9 @@ def build_prompt(batch: Sequence[str], source_lang: str, target_lang: str, compa
 
     ERA & STYLE (1789–1916)
     - Use accurate terms for Napoleonic Wars, Industrial Revolution, and WWI.
-    - Avoid anachronisms; do not use archaic Spanish.
-    - Latin American Spanish; always “Ustedes”, never “Vosotros”.
-    - Preferred: computadora, costo (UI), tomar, video. Imperatives: “Presione”, “Seleccione”.
+    - Avoid anachronisms; do not use archaic Portuguese.
+    - Brazilian Portuguese (PT-BR); always “vocês”, avoid “vós”.
+    - Preferred: computador, custo (UI), pegar, vídeo. Imperatives: “Pressione”, “Selecione”.
 
     TECHNICAL RULES (STRICT)
     1. DO NOT translate or alter placeholders (__TOK#, %s, %1$s, %d, \n, \t).
@@ -135,18 +135,18 @@ def translate_batch_gemini(
     response = model.generate_content(prompt)
 
     if not response.candidates:
-        raise ValueError("Respuesta sin candidatos.")
+        raise ValueError("Response has no candidates.")
 
     first_candidate = response.candidates[0]
     finish_reason = getattr(first_candidate, "finish_reason", None)
     normalized_finish = str(finish_reason).lower() if finish_reason else ""
 
     if not response.parts or not response.text:
-        raise ValueError("Respuesta vacía o sin texto utilizable.")
+        raise ValueError("Empty response or missing usable text.")
 
     if finish_reason and normalized_finish != "stop":
         logging.warning(
-            "finish_reason inesperado (%s) pero se recibió texto; continuando.",
+            "Unexpected finish_reason (%s) but text was received; continuing.",
             finish_reason,
         )
 
@@ -154,11 +154,11 @@ def translate_batch_gemini(
     try:
         translations = json.loads(cleaned_text)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"JSON inválido: {exc}. Texto recibido: {cleaned_text[:120]}")
+        raise ValueError(f"Invalid JSON: {exc}. Received text: {cleaned_text[:120]}")
 
     if len(translations) != len(batch):
         err = ValueError(
-            f"Tamaño incorrecto: Enviados {len(batch)}, Recibidos {len(translations)}"
+            f"Incorrect size: sent {len(batch)}, received {len(translations)}"
         )
         setattr(err, "partial_translations", translations)
         raise err
@@ -175,11 +175,11 @@ def is_retryable_error(exc: Exception) -> bool:
         "overloaded",
     )
     value_error_retryables = (
-        "respuesta no completada",
-        "respuesta vacía",
-        "json inválido",
-        "tamaño incorrecto",
-        "sin candidatos",
+        "incomplete response",
+        "empty response",
+        "invalid json",
+        "incorrect size",
+        "no candidates",
         "finish_reason=safety",
         "finish_reason=blocked",
     )
@@ -219,14 +219,14 @@ def translate_batch_with_retry(
                 last_partial = partial
             retryable = is_retryable_error(exc)
             logging.warning(
-                "Error en lote (intento %s/%s, reintentar=%s): %s",
+                "Batch error (attempt %s/%s, will_retry=%s): %s",
                 attempt,
                 max_retries,
                 retryable,
                 exc,
             )
             if (not retryable) or attempt > max_retries:
-                logging.error("Fallo crítico en hilo. Saltando lote." )
+                logging.error("Critical failure in thread. Skipping batch." )
                 if last_partial:
                     return last_partial
                 return list(batch)
@@ -262,7 +262,7 @@ def translate_strings(
         try:
             cache = json.loads(cache_path.read_text(encoding="utf-8"))
         except Exception as exc:
-            logging.warning("No se pudo cargar caché previa (%s): %s", cache_path, exc)
+            logging.warning("Could not load previous cache (%s): %s", cache_path, exc)
             cache = {}
 
     for idx, inner in enumerate(inners):
@@ -286,7 +286,7 @@ def translate_strings(
     for text in protected:
         if not text.strip():
             cache[text] = text
-            # Propagamos el texto vacío tal cual a todas sus posiciones.
+            # Propagate the empty text to every matching position as-is.
             for idx in indexes_by_protected.get(text, []):
                 translations[idx] = unprotect_tokens(text, token_maps[idx])
             continue
@@ -294,32 +294,31 @@ def translate_strings(
         cached_value = cache.get(text)
 
         if cached_value and cached_value.strip():
-            # Ya teníamos una traducción previa en caché: la aplicamos a todas
-            # las apariciones de este texto y evitamos re-traducirlo.
+            # There was a previous cached translation: apply it everywhere and avoid retranslating.
             for idx in indexes_by_protected.get(text, []):
                 translations[idx] = unprotect_tokens(cached_value, token_maps[idx])
             continue
 
-        # Si no hay caché (o está vacía), registramos entrada y lo programamos
-        # para traducción, cuidando de no encolar duplicados.
+        # If there is no cache (or it's empty), register the entry and schedule it for translation,
+        # ensuring we don't enqueue duplicates.
         if text not in cache:
             cache[text] = ""
         if text not in already_enqueued:
             already_enqueued.add(text)
             unique_to_translate.append(text)
 
-    # Creamos todos los lotes
+    # Create all batches
     batches = list(yield_batches(unique_to_translate, max_budget_bytes))
-    
-    # Mapa para ordenar resultados: {indice_lote: [textos_originales]}
+
+    # Map to order results: {batch_index: [original_texts]}
     batch_map = {i: batch for i, batch in enumerate(batches)}
     total_batches = len(batches)
 
-    print(f"🚀 Iniciando motor MULTIHILO: {max_workers} trabajadores simultáneos...")
+    print(f"🚀 Starting MULTITHREAD engine: {max_workers} simultaneous workers...")
 
-    # --- PROCESAMIENTO PARALELO ---
+    # --- PARALLEL PROCESSING ---
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Lanzamos todas las tareas
+        # Launch all tasks
         future_to_batch_idx = {
             executor.submit(
                 translate_batch_with_retry,
@@ -333,8 +332,13 @@ def translate_strings(
             for idx, batch in batch_map.items()
         }
 
-        # Procesamos conforme terminan
-        for future in tqdm(as_completed(future_to_batch_idx), total=total_batches, desc="Traduciendo en Paralelo", unit="lote"):
+        # Process tasks as they complete
+        for future in tqdm(
+            as_completed(future_to_batch_idx),
+            total=total_batches,
+            desc="Translating in parallel",
+            unit="batch",
+        ):
             batch_idx = future_to_batch_idx[future]
             original_batch = batch_map[batch_idx]
             
@@ -342,25 +346,25 @@ def translate_strings(
                 translated_batch = future.result()
             except Exception as exc:
                 logging.error(
-                    "Excepción no manejada en hilo (lote %s, %s items): %s",
+                    "Unhandled exception in thread (batch %s, %s items): %s",
                     batch_idx,
                     len(original_batch),
                     exc,
                 )
                 translated_batch = original_batch  # Fallback
 
-            # Guardamos en caché y actualizamos lista principal
+            # Save to cache and update the main list
             for original, translated_item in zip(original_batch, translated_batch):
                 cache[original] = translated_item
                 for idx in indexes_by_protected.get(original, []):
                     translations[idx] = unprotect_tokens(translated_item, token_maps[idx])
             
-            # Guardamos progreso parcial (thread-safe porque estamos en el hilo principal)
+            # Persist partial progress (thread-safe because we're on the main thread)
             if cache_path:
                 try:
                     cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
                 except Exception as exc:
-                    logging.warning("No se pudo persistir la caché en lote %s: %s", batch_idx, exc)
+                    logging.warning("Could not persist cache for batch %s: %s", batch_idx, exc)
 
             if progress_callback:
                 progress_callback(list(translations))
@@ -386,9 +390,9 @@ def iter_translatable_elements(root: ET.Element) -> Iterator[ET.Element]:
     def tag_matches(tag: str, name: str) -> bool:
         if not isinstance(tag, str):
             return False
-        # Algunos nodos especiales (p. ej. comentarios) pueden filtrarse con
-        # un ``tag`` inesperado; usamos ``split`` de forma segura para evitar
-        # AttributeError cuando el tag no es un string normal.
+        # Some special nodes (e.g., comments) may leak in with an unexpected
+        # ``tag``; use ``split`` safely to avoid AttributeError when the tag is
+        # not a normal string.
         splitter = getattr(tag, "split", None)
         if splitter is None:
             return False
@@ -422,7 +426,7 @@ def load_existing_translations(path: Path, reference_count: int) -> Optional[Lis
         existing_elements = list(iter_translatable_elements(existing_tree.getroot()))
         if len(existing_elements) != reference_count:
             logging.warning(
-                "El archivo de salida existente (%s) no coincide en longitud (esperado %s, encontrado %s). Ignorando.",
+                "Existing output file (%s) length mismatch (expected %s, found %s). Ignoring.",
                 path,
                 reference_count,
                 len(existing_elements),
@@ -430,7 +434,7 @@ def load_existing_translations(path: Path, reference_count: int) -> Optional[Lis
             return None
         return extract_texts(existing_elements)
     except Exception as exc:
-        logging.warning("No se pudo cargar traducciones previas desde %s: %s", path, exc)
+        logging.warning("Could not load previous translations from %s: %s", path, exc)
         return None
 
 def parse_args() -> argparse.Namespace:
@@ -447,13 +451,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         dest="compact_prompt",
         default=DEFAULT_COMPACT_PROMPT,
-        help="Usa un prompt condensado (por defecto) para gastar menos tokens.",
+        help="Use a condensed prompt (default) to spend fewer tokens.",
     )
     parser.add_argument(
         "--detailed-prompt",
         action="store_false",
         dest="compact_prompt",
-        help="Usa el prompt detallado si quieres máxima explicitud a costa de más tokens.",
+        help="Use the detailed prompt for maximum explicitness at the cost of more tokens.",
     )
     return parser.parse_args()
 
@@ -462,23 +466,23 @@ def main() -> None:
     args = parse_args()
 
     if not args.input.exists():
-        raise SystemExit(f"No existe: {args.input}")
+        raise SystemExit(f"Missing file: {args.input}")
 
     tree = parse_strings_xml(args.input)
     elements = list(iter_translatable_elements(tree.getroot()))
 
-    print(f"🔥 MODO POTENCIA: {DEFAULT_MODEL} + {args.max_workers} Hilos.")
+    print(f"🔥 POWER MODE: {DEFAULT_MODEL} + {args.max_workers} threads.")
     if args.compact_prompt:
-        print("💾 Prompt compacto activado (optimiza tokens sin perder reglas).")
+        print("💾 Compact prompt enabled (saves tokens without losing rules).")
     else:
-        print("🧭 Prompt detallado activado (más contexto, mayor costo de tokens).")
+        print("🧭 Detailed prompt enabled (more context, higher token cost).")
 
     texts = extract_texts(elements)
     existing_translations = load_existing_translations(args.output, len(elements))
     starting_texts = existing_translations or texts
 
     if existing_translations:
-        print("↩️  Reanudando traducción desde archivo existente.")
+        print("↩️  Resuming translation from existing file.")
 
     write_output_snapshot(tree, elements, starting_texts, args.output)
 
@@ -500,7 +504,7 @@ def main() -> None:
             )
         )
         write_output_snapshot(tree, elements, translated, args.output)
-        print(f"\n✅ Terminado: {args.output}")
+        print(f"\n✅ Finished: {args.output}")
 
     except Exception as e:
         print(f"\n❌ Error: {e}")
