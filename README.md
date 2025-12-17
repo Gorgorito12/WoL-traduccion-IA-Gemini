@@ -7,6 +7,8 @@ Script en **Python** para traducir archivos XML del mod **Age of Empires III: Wa
 
 Diseñado específicamente para localización de videojuegos históricos (1789–1916) con reglas estrictas de traducción para **español latinoamericano**.
 
+Incluye un **prompt compacto activado por defecto** para reducir consumo de tokens sin perder fidelidad ni reglas críticas. Si necesitas instrucciones más detalladas, activa el modo extenso con `--detailed-prompt`.
+
 ---
 
 ## Requisitos
@@ -68,6 +70,8 @@ Ejemplo completo de ejecución:
 python translate_gemini.py "unithelpstringsy.xml" "unithelpstringsy_es_latam.xml" --api-key "TU_API_KEY_AQUI" --source "English" --target "Latin American Spanish"
 ```
 
+El modo compacto está activo por defecto. Si necesitas un prompt más detallado (mayor uso de tokens) agrega `--detailed-prompt`; si prefieres reafirmar el modo compacto, puedes usar `--compact-prompt`.
+
 ---
 
 ## Parámetros del comando
@@ -79,6 +83,18 @@ python translate_gemini.py "unithelpstringsy.xml" "unithelpstringsy_es_latam.xml
 | `--api-key`                     | Obligatorio. API Key de Google Gemini                |
 | `--source`                      | Idioma origen (por defecto: English)                 |
 | `--target`                      | Idioma destino (por defecto: Latin American Spanish) |
+| `--compact-prompt`              | Usa el prompt condensado (por defecto)               |
+| `--detailed-prompt`             | Usa el prompt detallado si quieres máximo contexto   |
+
+---
+
+## Optimización de tokens sin perder calidad
+
+- **Prompts compactos y reutilizables:** usa el modo compacto por defecto; sólo cambia a `--detailed-prompt` si necesitas contexto adicional.
+- **Caché automática:** se guarda en `*.cache.json`; reutiliza traducciones previas para evitar peticiones repetidas.
+- **Procesamiento por lotes y deduplicación:** el script agrupa y elimina duplicados para reducir llamadas a la API.
+- **Control de progreso sin ruido:** se actualiza el archivo de salida de forma incremental para reanudar sin re-traducir.
+- **Segmenta archivos grandes:** puedes dividir XML enormes en partes y reiniciar cada segmento aprovechando la caché.
 
 ---
 
