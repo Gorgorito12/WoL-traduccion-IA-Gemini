@@ -31,7 +31,8 @@ DEFAULT_MAX_RETRIES = 5
 BACKOFF_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 30.0
 
-DEFAULT_COMPACT_PROMPT = False
+# Usa el prompt compacto por defecto para reducir tokens sin perder reglas clave.
+DEFAULT_COMPACT_PROMPT = True
 DEFAULT_MAX_WORKERS = 8
 
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
@@ -441,7 +442,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target", default=DEFAULT_TARGET_LANG)
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
     parser.add_argument("--max-budget-bytes", type=int, default=MAX_BUDGET_BYTES)
-    parser.add_argument("--compact-prompt", action="store_true", default=DEFAULT_COMPACT_PROMPT)
+    parser.add_argument(
+        "--compact-prompt",
+        action="store_true",
+        dest="compact_prompt",
+        default=DEFAULT_COMPACT_PROMPT,
+        help="Usa un prompt condensado (por defecto) para gastar menos tokens.",
+    )
+    parser.add_argument(
+        "--detailed-prompt",
+        action="store_false",
+        dest="compact_prompt",
+        help="Usa el prompt detallado si quieres máxima explicitud a costa de más tokens.",
+    )
     return parser.parse_args()
 
 def main() -> None:
@@ -455,6 +468,10 @@ def main() -> None:
     elements = list(iter_translatable_elements(tree.getroot()))
 
     print(f"🔥 MODO POTENCIA: {DEFAULT_MODEL} + {args.max_workers} Hilos.")
+    if args.compact_prompt:
+        print("💾 Prompt compacto activado (optimiza tokens sin perder reglas).")
+    else:
+        print("🧭 Prompt detallado activado (más contexto, mayor costo de tokens).")
 
     texts = extract_texts(elements)
     existing_translations = load_existing_translations(args.output, len(elements))
