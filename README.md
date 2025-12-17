@@ -45,7 +45,7 @@ venv\Scripts\activate
 ### 3. Instalar dependencias necesarias
 
 ```bat
-pip install google-generativeai tqdm
+pip install google-genai tqdm
 ```
 
 ---
