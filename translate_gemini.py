@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import logging
 import re
 import time
@@ -82,6 +83,12 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
     """,
 )
 
+
+@dataclass(frozen=True)
+class DocumentFormat:
+    encoding: str
+    newline: str
+
 def setup_gemini(api_key: str) -> genai.Client:
     """Create a Google GenAI client (google-genai SDK)."""
     return genai.Client(api_key=api_key)
@@ -109,6 +116,17 @@ def decode_auto(path: Path) -> Tuple[str, str]:
     if raw.startswith(b"\xfe\xff"):
         return raw.decode("utf-16"), "utf-16-be"
     return raw.decode("utf-8"), "utf-8"
+
+
+def detect_declared_encoding(content: str) -> Optional[str]:
+    match = re.search(r"<\?xml[^>]*encoding=['\"]([^'\"]+)['\"]", content, re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
+    return None
+
+
+def detect_newline(content: str) -> str:
+    return "\r\n" if "\r\n" in content else "\n"
 
 def yield_batches(strings: Iterable[str], max_budget_bytes: int, max_items: int = 50) -> Iterator[List[str]]:
     batch: List[str] = []
@@ -414,10 +432,14 @@ class CommentedTreeBuilder(ET.TreeBuilder):
         self.end(ET.Comment)
 
 
-def parse_strings_xml(path: Path) -> Tuple[ET.ElementTree, str]:
+def parse_strings_xml(path: Path) -> Tuple[ET.ElementTree, DocumentFormat]:
     content, encoding = decode_auto(path)
+    declared = detect_declared_encoding(content)
+    if declared:
+        encoding = declared
+    newline = detect_newline(content)
     parser = ET.XMLParser(target=CommentedTreeBuilder())
-    return ET.ElementTree(ET.fromstring(content, parser=parser)), encoding
+    return ET.ElementTree(ET.fromstring(content, parser=parser)), DocumentFormat(encoding=encoding, newline=newline)
 
 def iter_translatable_elements(root: ET.Element) -> Iterator[ET.Element]:
     def tag_matches(tag: str, name: str) -> bool:
@@ -440,13 +462,34 @@ def iter_translatable_elements(root: ET.Element) -> Iterator[ET.Element]:
 def extract_texts(elements: Iterable[ET.Element]) -> List[str]:
     return [(elem.text or "") for elem in elements]
 
+
+def indent(elem: ET.Element, level: int = 0) -> None:
+    i = "\n" + "  " * level
+    if len(elem):
+        if not (elem.text and elem.text.strip()):
+            elem.text = i + "  "
+        for child in elem:
+            indent(child, level + 1)
+        if not (elem.tail and elem.tail.strip()):
+            elem.tail = i
+    else:
+        if not (elem.tail and elem.tail.strip()):
+            elem.tail = i
+
 def update_elements_text(elements: Iterable[ET.Element], texts: Sequence[str]) -> None:
     for elem, text in zip(elements, texts):
         elem.text = text
 
-def write_output_snapshot(tree, elements, texts, output, encoding: str):
+def write_output_snapshot(tree, elements, texts, output, fmt: DocumentFormat):
     update_elements_text(elements, texts)
-    tree.write(output, encoding=encoding, xml_declaration=True)
+    indent(tree.getroot())
+    buffer = io.BytesIO()
+    tree.write(buffer, encoding=fmt.encoding, xml_declaration=True, short_empty_elements=False)
+    serialized = buffer.getvalue().decode(fmt.encoding)
+    if fmt.newline != "\n":
+        serialized = serialized.replace("\n", fmt.newline)
+    with output.open("w", encoding=fmt.encoding, newline="") as fp:
+        fp.write(serialized)
 
 
 def load_existing_translations(path: Path, reference_count: int) -> Optional[List[str]]:
@@ -500,7 +543,7 @@ def main() -> None:
     if not args.input.exists():
         raise SystemExit(f"File does not exist: {args.input}")
 
-    tree, input_encoding = parse_strings_xml(args.input)
+    tree, doc_format = parse_strings_xml(args.input)
     elements = list(iter_translatable_elements(tree.getroot()))
 
     print(f"🔥 HIGH-POWER MODE: {DEFAULT_MODEL} + {args.max_workers} threads.")
@@ -516,7 +559,7 @@ def main() -> None:
     if existing_translations:
         print("↩️  Resuming translation from existing output file.")
 
-    write_output_snapshot(tree, elements, starting_texts, args.output, input_encoding)
+    write_output_snapshot(tree, elements, starting_texts, args.output, doc_format)
 
     cache_file = args.output.with_suffix(args.output.suffix + ".cache.json")
 
@@ -533,10 +576,10 @@ def main() -> None:
             compact_prompt=args.compact_prompt,
             prompt_config=DEFAULT_PROMPT_CONFIG,
             progress_callback=lambda current: write_output_snapshot(
-                tree, elements, current, args.output, input_encoding
+                tree, elements, current, args.output, doc_format
             )
         )
-        write_output_snapshot(tree, elements, translated, args.output, input_encoding)
+        write_output_snapshot(tree, elements, translated, args.output, doc_format)
         print(f"\n✅ Completed: {args.output}")
 
     except Exception as e:
