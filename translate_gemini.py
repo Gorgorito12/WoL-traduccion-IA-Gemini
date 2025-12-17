@@ -56,11 +56,13 @@ def unprotect_tokens(text: str, token_map: Dict[str, str]) -> str:
         text = text.replace(key, value)
     return text
 
-def decode_auto(path: Path) -> str:
+def decode_auto(path: Path) -> Tuple[str, str]:
     raw = path.read_bytes()
-    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
-        return raw.decode("utf-16")
-    return raw.decode("utf-8")
+    if raw.startswith(b"\xff\xfe"):
+        return raw.decode("utf-16"), "utf-16-le"
+    if raw.startswith(b"\xfe\xff"):
+        return raw.decode("utf-16"), "utf-16-be"
+    return raw.decode("utf-8"), "utf-8"
 
 def yield_batches(strings: Iterable[str], max_budget_bytes: int, max_items: int = 50) -> Iterator[List[str]]:
     batch: List[str] = []
@@ -377,10 +379,10 @@ class CommentedTreeBuilder(ET.TreeBuilder):
         self.end(ET.Comment)
 
 
-def parse_strings_xml(path: Path) -> ET.ElementTree:
-    content = decode_auto(path)
+def parse_strings_xml(path: Path) -> Tuple[ET.ElementTree, str]:
+    content, encoding = decode_auto(path)
     parser = ET.XMLParser(target=CommentedTreeBuilder())
-    return ET.ElementTree(ET.fromstring(content, parser=parser))
+    return ET.ElementTree(ET.fromstring(content, parser=parser)), encoding
 
 def iter_translatable_elements(root: ET.Element) -> Iterator[ET.Element]:
     def tag_matches(tag: str, name: str) -> bool:
@@ -408,9 +410,9 @@ def update_elements_text(elements: Iterable[ET.Element], texts: Sequence[str]) -
     for elem, text in zip(elements, texts):
         elem.text = text
 
-def write_output_snapshot(tree, elements, texts, output):
+def write_output_snapshot(tree, elements, texts, output, encoding: str):
     update_elements_text(elements, texts)
-    tree.write(output, encoding="utf-8", xml_declaration=True)
+    tree.write(output, encoding=encoding, xml_declaration=True)
 
 
 def load_existing_translations(path: Path, reference_count: int) -> Optional[List[str]]:
@@ -418,7 +420,7 @@ def load_existing_translations(path: Path, reference_count: int) -> Optional[Lis
         return None
 
     try:
-        existing_tree = parse_strings_xml(path)
+        existing_tree, _ = parse_strings_xml(path)
         existing_elements = list(iter_translatable_elements(existing_tree.getroot()))
         if len(existing_elements) != reference_count:
             logging.warning(
@@ -464,7 +466,7 @@ def main() -> None:
     if not args.input.exists():
         raise SystemExit(f"No existe: {args.input}")
 
-    tree = parse_strings_xml(args.input)
+    tree, input_encoding = parse_strings_xml(args.input)
     elements = list(iter_translatable_elements(tree.getroot()))
 
     print(f"🔥 MODO POTENCIA: {DEFAULT_MODEL} + {args.max_workers} Hilos.")
@@ -480,7 +482,7 @@ def main() -> None:
     if existing_translations:
         print("↩️  Reanudando traducción desde archivo existente.")
 
-    write_output_snapshot(tree, elements, starting_texts, args.output)
+    write_output_snapshot(tree, elements, starting_texts, args.output, input_encoding)
 
     cache_file = args.output.with_suffix(args.output.suffix + ".cache.json")
 
@@ -496,10 +498,10 @@ def main() -> None:
             max_budget_bytes=args.max_budget_bytes,
             compact_prompt=args.compact_prompt,
             progress_callback=lambda current: write_output_snapshot(
-                tree, elements, current, args.output
+                tree, elements, current, args.output, input_encoding
             )
         )
-        write_output_snapshot(tree, elements, translated, args.output)
+        write_output_snapshot(tree, elements, translated, args.output, input_encoding)
         print(f"\n✅ Terminado: {args.output}")
 
     except Exception as e:
