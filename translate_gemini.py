@@ -58,30 +58,55 @@ class PromptConfig:
 
 DEFAULT_PROMPT_CONFIG = PromptConfig(
     compact_template=(
-        "You are a professional localization specialist. "
-        "Translate the provided list from {source_lang} to {target_lang} for a historical video game set in 1789–1916 (Age of Empires III: Wars of Liberty), keeping terminology appropriate to that era (late 18th to early 20th century) and avoiding modern slang. "
-        "Keep placeholders (__TOK#, %s, %1$s, %d, \\n, \\t) unchanged and in the same position. "
-        "Do not merge or split strings; preserve order and length. "
-        "Return ONLY a JSON array of translated strings. "
-        "If a string is empty or only placeholders, return it unchanged. "
-        "If unsure, return the original text. Input list: {input_list}"
+        "You are a professional video game localization specialist. "
+        "Translate the provided list from {source_lang} to {target_lang} "
+        "for a historical video game set between 1789 and 1916 "
+        "(Age of Empires III: Wars of Liberty). "
+        "Use historically appropriate terminology from the late 18th to early 20th century, "
+        "avoid modern slang, and keep the language clear and playable. "
+        "DO NOT modernize or embellish the text. "
+        "Keep all placeholders (__TOK#, %s, %1$s, %d, \n, \t) unchanged and in the same position. "
+        "Do NOT merge, split, rephrase, or reorder strings. "
+        "Ensure identical source strings receive identical translations. "
+        "Return ONLY a valid JSON array of translated strings, "
+        "with the exact same number of elements and order as the input. "
+        "If a string is empty or contains only placeholders, return it unchanged. "
+        "If any rule cannot be followed, return the original string unchanged. "
+        "Input list: {input_list}"
     ),
     detailed_template=f"""
-    You are an expert software localization specialist.
+    You are an expert video game localization specialist with experience in historical settings.
 
     TASK
-    Translate from {{source_lang}} to {{target_lang}} for a historical video game set in 1789–1916 (Age of Empires III: Wars of Liberty), keeping terminology appropriate to that era (late 18th to early 20th century) and avoiding modern slang, while keeping the tone concise and natural.
+    Translate the following strings from {{source_lang}} to {{target_lang}} for
+    “Age of Empires III: Wars of Liberty”, a historical strategy game set between 1789 and 1916.
+
+    ERA & STYLE
+    - Historical scope: Napoleonic Wars, Industrial Revolution, World War I.
+    - Use accurate military and civilian terminology appropriate to the late 18th, 19th, and early 20th centuries.
+    - Avoid modern slang, contemporary expressions, or anachronistic terms.
+    - Do NOT use archaic or literary language; the translation must remain clear, concise, and suitable for gameplay.
+    - Maintain a neutral, professional tone appropriate for UI and in-game text.
+
+    CONSISTENCY
+    - If the same source string appears multiple times, translate it exactly the same way each time.
+    - Keep sentences concise; do not add explanations or extra words.
 
     TECHNICAL RULES (STRICT)
-    1. Do not translate or modify placeholders (__TOK#, %s, %1$s, %d, \n, \t).
-    2. Do not merge, split, or rephrase strings; maintain order and count.
-    3. Output ONLY a JSON array of strings, same length and order as input.
-    4. If a string is empty or only placeholders, return it unchanged.
-    5. If you are uncertain, return the original text unchanged.
+    1. Do NOT translate, modify, reorder, or remove placeholders such as:
+       __TOK#, %s, %1$s, %d, \n, \t.
+    2. Do NOT merge, split, expand, or rephrase strings.
+    3. Preserve the original order and number of strings.
+    4. Output ONLY a valid JSON array of strings.
+    5. The output array MUST have the exact same length and order as the input array.
+    6. If a string is empty or contains only placeholders, return it unchanged.
+    7. If any rule cannot be followed or the translation is uncertain, return the original string unchanged.
 
-    Input List: {{input_list}}
+    Input List:
+    {{input_list}}
     """,
 )
+
 
 
 @dataclass(frozen=True)
