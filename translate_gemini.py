@@ -88,6 +88,7 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
 class DocumentFormat:
     encoding: str
     newline: str
+    xml_declaration: bool
 
 def setup_gemini(api_key: str) -> genai.Client:
     """Create a Google GenAI client (google-genai SDK)."""
@@ -123,6 +124,11 @@ def detect_declared_encoding(content: str) -> Optional[str]:
     if match:
         return match.group(1).lower()
     return None
+
+
+def has_xml_declaration(content: str) -> bool:
+    stripped = content.lstrip("\ufeff \t\r\n")
+    return stripped.startswith("<?xml")
 
 
 def detect_newline(content: str) -> str:
@@ -437,9 +443,13 @@ def parse_strings_xml(path: Path) -> Tuple[ET.ElementTree, DocumentFormat]:
     declared = detect_declared_encoding(content)
     if declared:
         encoding = declared
+    xml_decl = has_xml_declaration(content)
     newline = detect_newline(content)
     parser = ET.XMLParser(target=CommentedTreeBuilder())
-    return ET.ElementTree(ET.fromstring(content, parser=parser)), DocumentFormat(encoding=encoding, newline=newline)
+    return (
+        ET.ElementTree(ET.fromstring(content, parser=parser)),
+        DocumentFormat(encoding=encoding, newline=newline, xml_declaration=xml_decl),
+    )
 
 def iter_translatable_elements(root: ET.Element) -> Iterator[ET.Element]:
     def tag_matches(tag: str, name: str) -> bool:
@@ -484,7 +494,12 @@ def write_output_snapshot(tree, elements, texts, output, fmt: DocumentFormat):
     update_elements_text(elements, texts)
     indent(tree.getroot())
     buffer = io.BytesIO()
-    tree.write(buffer, encoding=fmt.encoding, xml_declaration=True, short_empty_elements=False)
+    tree.write(
+        buffer,
+        encoding=fmt.encoding,
+        xml_declaration=fmt.xml_declaration,
+        short_empty_elements=False,
+    )
     serialized = buffer.getvalue().decode(fmt.encoding)
     if fmt.newline != "\n":
         serialized = serialized.replace("\n", fmt.newline)
