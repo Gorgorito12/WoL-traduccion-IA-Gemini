@@ -59,7 +59,7 @@ class PromptConfig:
 DEFAULT_PROMPT_CONFIG = PromptConfig(
     compact_template=(
         "You are a professional localization specialist. "
-        "Translate the provided list from {source_lang} to {target_lang}. "
+        "Translate the provided list from {source_lang} to {target_lang} for a historical video game set in 1789–1916 (Age of Empires III: Wars of Liberty), keeping terminology appropriate to that era (late 18th to early 20th century) and avoiding modern slang. "
         "Keep placeholders (__TOK#, %s, %1$s, %d, \\n, \\t) unchanged and in the same position. "
         "Do not merge or split strings; preserve order and length. "
         "Return ONLY a JSON array of translated strings. "
@@ -70,7 +70,7 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
     You are an expert software localization specialist.
 
     TASK
-    Translate from {{source_lang}} to {{target_lang}} while keeping the tone concise and natural.
+    Translate from {{source_lang}} to {{target_lang}} for a historical video game set in 1789–1916 (Age of Empires III: Wars of Liberty), keeping terminology appropriate to that era (late 18th to early 20th century) and avoiding modern slang, while keeping the tone concise and natural.
 
     TECHNICAL RULES (STRICT)
     1. Do not translate or modify placeholders (__TOK#, %s, %1$s, %d, \n, \t).
