@@ -39,6 +39,7 @@ DEFAULT_MAX_WORKERS = 8
 
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
 DEFAULT_SKIP_SYMBOL_CONTAINS = ["folder", "path", "dir", "directory"]
+DEFAULT_PROTECTED_TERMS = ["Age of Empires III: Wars of Liberty"]
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,8 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
         "avoid modern slang, and keep the language clear and playable. "
         "DO NOT modernize or embellish the text. "
         "Keep all placeholders (__TOK#, %s, %1$s, %d, \n, \t) unchanged and in the same position. "
+        "Treat any __PROTECT_x__ tokens as immutable placeholders. "
+        "If a string contains escaped newlines (\\n) or bullet characters (•), keep them exactly as written (do not convert \\n to real newlines). "
         "Do NOT merge, split, rephrase, or reorder strings. "
         "Ensure identical source strings receive identical translations. "
         "Return ONLY a valid JSON array of translated strings, "
@@ -95,13 +98,15 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
 
     TECHNICAL RULES (STRICT)
     1. Do NOT translate, modify, reorder, or remove placeholders such as:
-       __TOK#, %s, %1$s, %d, \n, \t.
-    2. Do NOT merge, split, expand, or rephrase strings.
-    3. Preserve the original order and number of strings.
-    4. Output ONLY a valid JSON array of strings.
-    5. The output array MUST have the exact same length and order as the input array.
-    6. If a string is empty or contains only placeholders, return it unchanged.
-    7. If any rule cannot be followed or the translation is uncertain, return the original string unchanged.
+       __TOK#, %s, %1$s, %d, \n, \t, and __PROTECT_x__ tokens.
+    2. Preserve literal escape sequences: keep \\n and similar sequences as-is (do NOT convert them to real newlines).
+       Maintain bullet characters (•) and surrounding spacing exactly.
+    3. Do NOT merge, split, expand, or rephrase strings.
+    4. Preserve the original order and number of strings.
+    5. Output ONLY a valid JSON array of strings.
+    6. The output array MUST have the exact same length and order as the input array.
+    7. If a string is empty or contains only placeholders, return it unchanged.
+    8. If any rule cannot be followed or the translation is uncertain, return the original string unchanged.
 
     Input List:
     {{input_list}}
@@ -153,6 +158,67 @@ def unprotect_tokens(text: str, token_map: Dict[str, str]) -> str:
     for key, value in token_map.items():
         text = text.replace(key, value)
     return text
+
+def protect_phrases(
+    text: str,
+    phrases: Sequence[str],
+    regex_patterns: Sequence[re.Pattern[str]],
+) -> Tuple[str, Dict[str, str]]:
+    token_map: Dict[str, str] = {}
+    protected = text
+    idx = 0
+
+    for phrase in phrases:
+        if not phrase:
+            continue
+        while phrase in protected:
+            token = f"__PROTECT_{idx}__"
+            protected = protected.replace(phrase, token, 1)
+            token_map[token] = phrase
+            idx += 1
+
+    for pattern in regex_patterns:
+        def repl(match: re.Match[str]) -> str:
+            nonlocal idx
+            token = f"__PROTECT_{idx}__"
+            token_map[token] = match.group(0)
+            idx += 1
+            return token
+
+        protected = pattern.sub(repl, protected)
+
+    return protected, token_map
+
+
+def restore_protected_terms(
+    text: str,
+    token_map: Dict[str, str],
+    original_text: str,
+) -> str:
+    restored = text
+    for token, phrase in token_map.items():
+        restored = restored.replace(token, phrase)
+
+    for phrase in token_map.values():
+        orig_count = original_text.count(phrase)
+        if orig_count and restored.count(phrase) < orig_count:
+            logging.warning(
+                "Protected phrase missing or altered; restoring from source text."
+            )
+            return original_text
+
+    return restored
+
+
+def restore_all_tokens(
+    text: str,
+    placeholder_map: Dict[str, str],
+    protected_map: Dict[str, str],
+    original_text: str,
+) -> str:
+    restored = unprotect_tokens(text, placeholder_map)
+    restored = restore_protected_terms(restored, protected_map, original_text)
+    return restored
 
 
 def compile_regex_list(patterns: Optional[Sequence[str]]) -> List[re.Pattern[str]]:
@@ -379,12 +445,19 @@ def translate_strings(
     cache_path: Optional[Path] = None,
     existing_translations: Optional[Sequence[str]] = None,
     prompt_config: PromptConfig = DEFAULT_PROMPT_CONFIG,
+    protected_terms: Optional[Sequence[str]] = None,
+    protected_regex: Optional[Sequence[re.Pattern[str]]] = None,
 ) -> List[str]:
     
     client = setup_gemini(api_key)
 
+    protected_terms = protected_terms or []
+    protected_regex = protected_regex or []
+
     protected: List[str] = []
     token_maps: List[Dict[str, str]] = []
+    phrase_maps: List[Dict[str, str]] = []
+    original_texts: List[str] = []
     translations: List[str] = []
     indexes_by_protected: Dict[str, List[int]] = {}
 
@@ -397,9 +470,12 @@ def translate_strings(
             cache = {}
 
     for idx, inner in enumerate(inners):
-        protected_text, token_map = protect_tokens(inner)
+        phrase_protected, phrase_map = protect_phrases(inner, protected_terms, protected_regex)
+        protected_text, token_map = protect_tokens(phrase_protected)
         protected.append(protected_text)
         token_maps.append(token_map)
+        phrase_maps.append(phrase_map)
+        original_texts.append(inner)
 
         initial_translation = inner
         if existing_translations and idx < len(existing_translations):
@@ -419,7 +495,9 @@ def translate_strings(
             cache[text] = text
             # Propagate empty text as-is to every position.
             for idx in indexes_by_protected.get(text, []):
-                translations[idx] = unprotect_tokens(text, token_maps[idx])
+                translations[idx] = restore_all_tokens(
+                    text, token_maps[idx], phrase_maps[idx], original_texts[idx]
+                )
             continue
 
         cached_value = cache.get(text)
@@ -427,7 +505,9 @@ def translate_strings(
         if cached_value and cached_value.strip():
             # We already had a cached translation: reuse it everywhere and skip re-translation.
             for idx in indexes_by_protected.get(text, []):
-                translations[idx] = unprotect_tokens(cached_value, token_maps[idx])
+                translations[idx] = restore_all_tokens(
+                    cached_value, token_maps[idx], phrase_maps[idx], original_texts[idx]
+                )
             continue
 
         # If there is no cache (or it is empty), register an entry and queue it for translation,
@@ -489,7 +569,12 @@ def translate_strings(
             for original, translated_item in zip(original_batch, translated_batch):
                 cache[original] = translated_item
                 for idx in indexes_by_protected.get(original, []):
-                    translations[idx] = unprotect_tokens(translated_item, token_maps[idx])
+                    translations[idx] = restore_all_tokens(
+                        translated_item,
+                        token_maps[idx],
+                        phrase_maps[idx],
+                        original_texts[idx],
+                    )
 
             # Save partial progress (thread-safe because we are on the main thread)
             if cache_path:
@@ -741,12 +826,28 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable automatic path-like text detection.",
     )
+    parser.add_argument(
+        "--protect",
+        action="append",
+        default=[],
+        help='Exact phrases to protect from translation (repeatable). Example: --protect "Age of Empires III: Wars of Liberty"',
+    )
+    parser.add_argument(
+        "--protect-regex",
+        action="append",
+        default=[],
+        help="Regular expressions for phrases to protect from translation (repeatable).",
+    )
     return parser.parse_args()
 
 def main() -> None:
     logging.basicConfig(level=logging.WARNING)
     args = parse_args()
     skip_rules = build_skip_rules(args)
+    protected_terms = list(DEFAULT_PROTECTED_TERMS)
+    if args.protect:
+        protected_terms.extend(args.protect)
+    protected_regex = compile_regex_list(args.protect_regex)
 
     if not args.input.exists():
         raise SystemExit(f"File does not exist: {args.input}")
@@ -813,6 +914,8 @@ def main() -> None:
             compact_prompt=args.compact_prompt,
             prompt_config=DEFAULT_PROMPT_CONFIG,
             progress_callback=progress_callback,
+            protected_terms=protected_terms,
+            protected_regex=protected_regex,
         )
         final_texts = assemble_full_texts(
             targets, translated_subset, enforce_skip_integrity=True
