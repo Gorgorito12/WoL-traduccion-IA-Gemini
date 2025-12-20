@@ -38,6 +38,7 @@ DEFAULT_COMPACT_PROMPT = True
 DEFAULT_MAX_WORKERS = 8
 
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
+DEFAULT_SKIP_SYMBOL_CONTAINS = ["folder", "path", "dir", "directory"]
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,24 @@ class DocumentFormat:
     newline: str
     xml_declaration: bool
 
+
+@dataclass(frozen=True)
+class TranslationTarget:
+    element: ET.Element
+    text: str
+    symbol: Optional[str]
+    skip: bool
+    reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SkipRules:
+    symbol_exact: Sequence[str]
+    symbol_contains: Sequence[str]
+    symbol_regex: Sequence[re.Pattern[str]]
+    text_regex: Sequence[re.Pattern[str]]
+    enable_path_heuristic: bool = True
+
 def setup_gemini(api_key: str) -> genai.Client:
     """Create a Google GenAI client (google-genai SDK)."""
     return genai.Client(api_key=api_key)
@@ -134,6 +153,18 @@ def unprotect_tokens(text: str, token_map: Dict[str, str]) -> str:
     for key, value in token_map.items():
         text = text.replace(key, value)
     return text
+
+
+def compile_regex_list(patterns: Optional[Sequence[str]]) -> List[re.Pattern[str]]:
+    if not patterns:
+        return []
+    compiled: List[re.Pattern[str]] = []
+    for pattern in patterns:
+        try:
+            compiled.append(re.compile(pattern, re.IGNORECASE))
+        except re.error as exc:
+            logging.warning("Invalid regex skipped (%s): %s", pattern, exc)
+    return compiled
 
 def decode_auto(path: Path) -> Tuple[str, str]:
     raw = path.read_bytes()
@@ -158,6 +189,25 @@ def has_xml_declaration(content: str) -> bool:
 
 def detect_newline(content: str) -> str:
     return "\r\n" if "\r\n" in content else "\n"
+
+
+def is_path_like_text(text: str) -> bool:
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    # Drive letter prefix (e.g., C:\ or D:/)
+    if re.match(r"^[a-zA-Z]:[\\/]", stripped):
+        return True
+    has_slash = ("\\" in stripped) or ("/" in stripped)
+    trailing_sep = stripped.endswith("\\") or stripped.endswith("/")
+    if has_slash and trailing_sep:
+        return True
+    # Folder-like sequences such as \User\Documents\ or /home/user/
+    if re.search(r"[\\/][^\\/]+[\\/]", stripped):
+        return True
+    return False
 
 def yield_batches(strings: Iterable[str], max_budget_bytes: int, max_items: int = 50) -> Iterator[List[str]]:
     batch: List[str] = []
@@ -476,7 +526,37 @@ def parse_strings_xml(path: Path) -> Tuple[ET.ElementTree, DocumentFormat]:
         DocumentFormat(encoding=encoding, newline=newline, xml_declaration=xml_decl),
     )
 
-def iter_translatable_elements(root: ET.Element) -> Iterator[ET.Element]:
+
+def should_skip_element(elem: ET.Element, rules: SkipRules) -> Tuple[bool, Optional[str]]:
+    text = elem.text or ""
+    symbol = elem.attrib.get("symbol")
+    symbol_lower = symbol.lower() if symbol else ""
+
+    # Mandatory skip for folder-like symbols.
+    if symbol and ("folder" in symbol_lower or symbol_lower.endswith("folder")):
+        return True, "symbol-folder"
+
+    normalized_exact = {s.lower() for s in rules.symbol_exact}
+    normalized_contains = [s.lower() for s in rules.symbol_contains]
+
+    if symbol and symbol_lower in normalized_exact:
+        return True, "symbol-exact"
+
+    if symbol and any(token in symbol_lower for token in normalized_contains):
+        return True, "symbol-contains"
+
+    if symbol and any(pattern.search(symbol) for pattern in rules.symbol_regex):
+        return True, "symbol-regex"
+
+    if any(pattern.search(text or "") for pattern in rules.text_regex):
+        return True, "text-regex"
+
+    if rules.enable_path_heuristic and is_path_like_text(text):
+        return True, "path-like-text"
+
+    return False, None
+
+def iter_translatable_elements(root: ET.Element, skip_rules: SkipRules) -> Iterator[TranslationTarget]:
     def tag_matches(tag: str, name: str) -> bool:
         if not isinstance(tag, str):
             return False
@@ -486,16 +566,27 @@ def iter_translatable_elements(root: ET.Element) -> Iterator[ET.Element]:
         if splitter is None:
             return False
         return splitter("}")[-1].lower() == name
+
+    def build_target(elem: ET.Element) -> TranslationTarget:
+        skip, reason = should_skip_element(elem, skip_rules)
+        return TranslationTarget(
+            element=elem,
+            text=elem.text or "",
+            symbol=elem.attrib.get("symbol"),
+            skip=skip,
+            reason=reason,
+        )
+
     for elem in root.iter():
         if tag_matches(elem.tag, "string"):
-            yield elem
+            yield build_target(elem)
         elif tag_matches(elem.tag, "plurals"):
             for item in elem:
                 if tag_matches(item.tag, "item"):
-                    yield item
+                    yield build_target(item)
 
-def extract_texts(elements: Iterable[ET.Element]) -> List[str]:
-    return [(elem.text or "") for elem in elements]
+def extract_texts(elements: Iterable[TranslationTarget]) -> List[str]:
+    return [elem.text for elem in elements]
 
 
 def indent(elem: ET.Element, level: int = 0) -> None:
@@ -532,13 +623,46 @@ def write_output_snapshot(tree, elements, texts, output, fmt: DocumentFormat):
         fp.write(serialized)
 
 
-def load_existing_translations(path: Path, reference_count: int) -> Optional[List[str]]:
+def assemble_full_texts(
+    targets: Sequence[TranslationTarget],
+    translated: Sequence[str],
+    enforce_skip_integrity: bool = True,
+) -> List[str]:
+    merged: List[str] = []
+    translated_iter = iter(translated)
+    for target in targets:
+        if target.skip:
+            merged.append(target.text)
+            continue
+        try:
+            merged.append(next(translated_iter))
+        except StopIteration:
+            raise ValueError("Not enough translated items to map back to elements.")
+    try:
+        next(translated_iter)
+        raise ValueError("Too many translated items supplied.")
+    except StopIteration:
+        pass
+
+    if enforce_skip_integrity:
+        for idx, target in enumerate(targets):
+            if target.skip and merged[idx] != target.text:
+                logging.warning(
+                    "Restoring skipped element (symbol=%s, reason=%s) to original text.",
+                    target.symbol,
+                    target.reason,
+                )
+                merged[idx] = target.text
+    return merged
+
+
+def load_existing_translations(path: Path, reference_count: int, skip_rules: SkipRules) -> Optional[List[str]]:
     if not path.exists():
         return None
 
     try:
         existing_tree, _ = parse_strings_xml(path)
-        existing_elements = list(iter_translatable_elements(existing_tree.getroot()))
+        existing_elements = list(iter_translatable_elements(existing_tree.getroot(), skip_rules))
         if len(existing_elements) != reference_count:
             logging.warning(
                 "Existing output file (%s) length mismatch (expected %s, found %s). Ignoring.",
@@ -551,6 +675,20 @@ def load_existing_translations(path: Path, reference_count: int) -> Optional[Lis
     except Exception as exc:
         logging.warning("Could not load previous translations from %s: %s", path, exc)
         return None
+
+
+def build_skip_rules(args: argparse.Namespace) -> SkipRules:
+    symbol_contains = list(DEFAULT_SKIP_SYMBOL_CONTAINS)
+    if args.skip_symbol_contains:
+        symbol_contains.extend(args.skip_symbol_contains)
+    return SkipRules(
+        symbol_exact=args.skip_symbol or [],
+        symbol_contains=symbol_contains,
+        symbol_regex=compile_regex_list(args.skip_symbol_regex),
+        text_regex=compile_regex_list(args.skip_text_regex),
+        enable_path_heuristic=not args.no_path_heuristic,
+    )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -574,17 +712,50 @@ def parse_args() -> argparse.Namespace:
         dest="compact_prompt",
         help="Use the detailed prompt for maximum explicitness at higher token cost.",
     )
+    parser.add_argument(
+        "--skip-symbol",
+        action="append",
+        default=[],
+        help="Exact symbol names to skip translation (repeatable).",
+    )
+    parser.add_argument(
+        "--skip-symbol-contains",
+        action="append",
+        default=[],
+        help="Substring match (case-insensitive) for symbol names to skip (repeatable).",
+    )
+    parser.add_argument(
+        "--skip-symbol-regex",
+        action="append",
+        default=[],
+        help="Regular expression for symbol names to skip (repeatable).",
+    )
+    parser.add_argument(
+        "--skip-text-regex",
+        action="append",
+        default=[],
+        help="Regular expression for element text to skip (repeatable).",
+    )
+    parser.add_argument(
+        "--no-path-heuristic",
+        action="store_true",
+        help="Disable automatic path-like text detection.",
+    )
     return parser.parse_args()
 
 def main() -> None:
     logging.basicConfig(level=logging.WARNING)
     args = parse_args()
+    skip_rules = build_skip_rules(args)
 
     if not args.input.exists():
         raise SystemExit(f"File does not exist: {args.input}")
 
     tree, doc_format = parse_strings_xml(args.input)
-    elements = list(iter_translatable_elements(tree.getroot()))
+    targets = list(iter_translatable_elements(tree.getroot(), skip_rules))
+    elements = [target.element for target in targets]
+    translatable_targets = [target for target in targets if not target.skip]
+    translatable_texts = [target.text for target in translatable_targets]
 
     print(f"🔥 HIGH-POWER MODE: {DEFAULT_MODEL} + {args.max_workers} threads.")
     if args.compact_prompt:
@@ -592,34 +763,61 @@ def main() -> None:
     else:
         print("🧭 Detailed prompt enabled (more context, higher token cost).")
 
-    texts = extract_texts(elements)
-    existing_translations = load_existing_translations(args.output, len(elements))
-    starting_texts = existing_translations or texts
+    skipped_count = len(targets) - len(translatable_targets)
+    if skipped_count:
+        print(f"🛑 Skip filter engaged: {skipped_count} element(s) protected from translation.")
 
-    if existing_translations:
+    existing_translations_full = load_existing_translations(args.output, len(targets), skip_rules)
+    existing_translations_subset: Optional[List[str]] = None
+    if existing_translations_full:
         print("↩️  Resuming translation from existing output file.")
+        existing_translations_subset = [
+            text for target, text in zip(targets, existing_translations_full) if not target.skip
+        ]
+        for target, text in zip(targets, existing_translations_full):
+            if target.skip and text != target.text:
+                logging.warning(
+                    "Existing output differs for skipped element (symbol=%s, reason=%s); restoring input text.",
+                    target.symbol,
+                    target.reason,
+                )
+        starting_texts = assemble_full_texts(
+            targets, existing_translations_subset, enforce_skip_integrity=True
+        )
+    else:
+        starting_texts = [target.text for target in targets]
 
     write_output_snapshot(tree, elements, starting_texts, args.output, doc_format)
 
+    if not translatable_texts:
+        print("🔒 No elements eligible for translation. Output snapshot written.")
+        print(f"\n✅ Completed: {args.output}")
+        return
+
     cache_file = args.output.with_suffix(args.output.suffix + ".cache.json")
 
+    def progress_callback(current_subset: Sequence[str]) -> None:
+        merged = assemble_full_texts(targets, current_subset, enforce_skip_integrity=True)
+        write_output_snapshot(tree, elements, merged, args.output, doc_format)
+
     try:
-        translated = translate_strings(
-            texts,
+        translated_subset = translate_strings(
+            translatable_texts,
             api_key=args.api_key,
             source_lang=args.source,
             target_lang=args.target,
             cache_path=cache_file,
-            existing_translations=existing_translations,
+            existing_translations=existing_translations_subset,
             max_workers=args.max_workers,
             max_budget_bytes=args.max_budget_bytes,
             compact_prompt=args.compact_prompt,
             prompt_config=DEFAULT_PROMPT_CONFIG,
-            progress_callback=lambda current: write_output_snapshot(
-                tree, elements, current, args.output, doc_format
-            )
+            progress_callback=progress_callback,
         )
-        write_output_snapshot(tree, elements, translated, args.output, doc_format)
+        final_texts = assemble_full_texts(
+            targets, translated_subset, enforce_skip_integrity=True
+        )
+        write_output_snapshot(tree, elements, final_texts, args.output, doc_format)
         print(f"\n✅ Completed: {args.output}")
 
     except Exception as e:
