@@ -40,6 +40,8 @@ DEFAULT_MAX_WORKERS = 8
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
 DEFAULT_SKIP_SYMBOL_CONTAINS = ["folder", "path", "dir", "directory"]
 DEFAULT_PROTECTED_TERMS = ["Age of Empires III: Wars of Liberty"]
+DEFAULT_VERSION_REGEX = r"\b\d+(?:\.\d+){1,4}(?:[-_][0-9A-Za-z]+)*[A-Za-z]?\b"
+DEFAULT_SKIP_METADATA_PATTERNS = [r"^\s*[^\n:]{1,40}:\s*(<VERSION_TOKEN>)\s*$"]
 
 
 @dataclass(frozen=True)
@@ -137,6 +139,9 @@ class SkipRules:
     symbol_contains: Sequence[str]
     symbol_regex: Sequence[re.Pattern[str]]
     text_regex: Sequence[re.Pattern[str]]
+    metadata_regex: Sequence[re.Pattern[str]]
+    version_pattern: re.Pattern[str]
+    max_metadata_length: int = 60
     enable_path_heuristic: bool = True
 
 def setup_gemini(api_key: str) -> genai.Client:
@@ -153,6 +158,18 @@ def protect_tokens(text: str) -> Tuple[str, Dict[str, str]]:
         idx += 1
         return key
     return PLACEHOLDER_RE.sub(repl, text), token_map
+
+def protect_version_tokens(
+    text: str, pattern: re.Pattern[str]
+) -> Tuple[str, List[str]]:
+    versions: List[str] = []
+
+    def repl(match: re.Match[str]) -> str:
+        idx = len(versions)
+        versions.append(match.group(0))
+        return f"__VER_{idx}__"
+
+    return pattern.sub(repl, text), versions
 
 def unprotect_tokens(text: str, token_map: Dict[str, str]) -> str:
     for key, value in token_map.items():
@@ -210,14 +227,39 @@ def restore_protected_terms(
     return restored
 
 
+def restore_version_tokens(
+    text: str,
+    versions: Sequence[str],
+    original_text: str,
+) -> str:
+    restored = text
+    for idx, value in enumerate(versions):
+        placeholder = f"__VER_{idx}__"
+        restored = restored.replace(placeholder, value)
+
+    if any(f"__VER_{idx}__" in restored for idx in range(len(versions))):
+        logging.warning("Version placeholder leaked into output; restoring from source text.")
+        return original_text
+
+    for value in versions:
+        original_count = original_text.count(value)
+        if original_count and restored.count(value) < original_count:
+            logging.warning("Version token missing or altered; restoring from source text.")
+            return original_text
+
+    return restored
+
+
 def restore_all_tokens(
     text: str,
     placeholder_map: Dict[str, str],
     protected_map: Dict[str, str],
     original_text: str,
+    versions: Sequence[str],
 ) -> str:
     restored = unprotect_tokens(text, placeholder_map)
     restored = restore_protected_terms(restored, protected_map, original_text)
+    restored = restore_version_tokens(restored, versions, original_text)
     return restored
 
 
@@ -231,6 +273,45 @@ def compile_regex_list(patterns: Optional[Sequence[str]]) -> List[re.Pattern[str
         except re.error as exc:
             logging.warning("Invalid regex skipped (%s): %s", pattern, exc)
     return compiled
+
+
+def compile_version_regex(pattern: str) -> re.Pattern[str]:
+    try:
+        return re.compile(pattern, re.IGNORECASE)
+    except re.error as exc:
+        raise SystemExit(f"Invalid version regex: {pattern}. {exc}") from exc
+
+
+def compile_metadata_regexes(
+    patterns: Sequence[str], version_regex: str
+) -> List[re.Pattern[str]]:
+    compiled: List[re.Pattern[str]] = []
+    for pattern in patterns:
+        normalized = pattern.replace("<VERSION_TOKEN>", f"(?:{version_regex})")
+        try:
+            compiled.append(re.compile(normalized, re.IGNORECASE))
+        except re.error as exc:
+            logging.warning("Invalid metadata regex skipped (%s): %s", normalized, exc)
+    return compiled
+
+
+def count_matches(text: str, pattern: re.Pattern[str]) -> int:
+    return len(list(pattern.finditer(text)))
+
+
+def is_metadata_line(
+    text: str,
+    metadata_patterns: Sequence[re.Pattern[str]],
+    version_pattern: re.Pattern[str],
+    max_length: int,
+) -> bool:
+    if len(text.strip()) == 0:
+        return False
+    if len(text) > max_length:
+        return False
+    if count_matches(text, version_pattern) != 1:
+        return False
+    return any(pattern.search(text) for pattern in metadata_patterns)
 
 def decode_auto(path: Path) -> Tuple[str, str]:
     raw = path.read_bytes()
@@ -447,16 +528,19 @@ def translate_strings(
     prompt_config: PromptConfig = DEFAULT_PROMPT_CONFIG,
     protected_terms: Optional[Sequence[str]] = None,
     protected_regex: Optional[Sequence[re.Pattern[str]]] = None,
+    version_pattern: Optional[re.Pattern[str]] = None,
 ) -> List[str]:
     
     client = setup_gemini(api_key)
 
     protected_terms = protected_terms or []
     protected_regex = protected_regex or []
+    version_pattern = version_pattern or compile_version_regex(DEFAULT_VERSION_REGEX)
 
     protected: List[str] = []
     token_maps: List[Dict[str, str]] = []
     phrase_maps: List[Dict[str, str]] = []
+    version_maps: List[List[str]] = []
     original_texts: List[str] = []
     translations: List[str] = []
     indexes_by_protected: Dict[str, List[int]] = {}
@@ -470,11 +554,15 @@ def translate_strings(
             cache = {}
 
     for idx, inner in enumerate(inners):
-        phrase_protected, phrase_map = protect_phrases(inner, protected_terms, protected_regex)
+        version_protected, version_map = protect_version_tokens(inner, version_pattern)
+        phrase_protected, phrase_map = protect_phrases(
+            version_protected, protected_terms, protected_regex
+        )
         protected_text, token_map = protect_tokens(phrase_protected)
         protected.append(protected_text)
         token_maps.append(token_map)
         phrase_maps.append(phrase_map)
+        version_maps.append(version_map)
         original_texts.append(inner)
 
         initial_translation = inner
@@ -496,7 +584,11 @@ def translate_strings(
             # Propagate empty text as-is to every position.
             for idx in indexes_by_protected.get(text, []):
                 translations[idx] = restore_all_tokens(
-                    text, token_maps[idx], phrase_maps[idx], original_texts[idx]
+                    text,
+                    token_maps[idx],
+                    phrase_maps[idx],
+                    original_texts[idx],
+                    version_maps[idx],
                 )
             continue
 
@@ -506,7 +598,11 @@ def translate_strings(
             # We already had a cached translation: reuse it everywhere and skip re-translation.
             for idx in indexes_by_protected.get(text, []):
                 translations[idx] = restore_all_tokens(
-                    cached_value, token_maps[idx], phrase_maps[idx], original_texts[idx]
+                    cached_value,
+                    token_maps[idx],
+                    phrase_maps[idx],
+                    original_texts[idx],
+                    version_maps[idx],
                 )
             continue
 
@@ -574,6 +670,7 @@ def translate_strings(
                         token_maps[idx],
                         phrase_maps[idx],
                         original_texts[idx],
+                        version_maps[idx],
                     )
 
             # Save partial progress (thread-safe because we are on the main thread)
@@ -635,6 +732,9 @@ def should_skip_element(elem: ET.Element, rules: SkipRules) -> Tuple[bool, Optio
 
     if any(pattern.search(text or "") for pattern in rules.text_regex):
         return True, "text-regex"
+
+    if is_metadata_line(text, rules.metadata_regex, rules.version_pattern, rules.max_metadata_length):
+        return True, "metadata-line"
 
     if rules.enable_path_heuristic and is_path_like_text(text):
         return True, "path-like-text"
@@ -762,7 +862,11 @@ def load_existing_translations(path: Path, reference_count: int, skip_rules: Ski
         return None
 
 
-def build_skip_rules(args: argparse.Namespace) -> SkipRules:
+def build_skip_rules(
+    args: argparse.Namespace,
+    metadata_regex: Sequence[re.Pattern[str]],
+    version_pattern: re.Pattern[str],
+) -> SkipRules:
     symbol_contains = list(DEFAULT_SKIP_SYMBOL_CONTAINS)
     if args.skip_symbol_contains:
         symbol_contains.extend(args.skip_symbol_contains)
@@ -771,6 +875,8 @@ def build_skip_rules(args: argparse.Namespace) -> SkipRules:
         symbol_contains=symbol_contains,
         symbol_regex=compile_regex_list(args.skip_symbol_regex),
         text_regex=compile_regex_list(args.skip_text_regex),
+        metadata_regex=metadata_regex,
+        version_pattern=version_pattern,
         enable_path_heuristic=not args.no_path_heuristic,
     )
 
@@ -822,6 +928,15 @@ def parse_args() -> argparse.Namespace:
         help="Regular expression for element text to skip (repeatable).",
     )
     parser.add_argument(
+        "--skip-metadata-regex",
+        action="append",
+        default=[],
+        help=(
+            "Regular expressions to skip short metadata lines (repeatable). "
+            "Use <VERSION_TOKEN> as a placeholder for the version regex."
+        ),
+    )
+    parser.add_argument(
         "--no-path-heuristic",
         action="store_true",
         help="Disable automatic path-like text detection.",
@@ -838,16 +953,29 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Regular expressions for phrases to protect from translation (repeatable).",
     )
+    parser.add_argument(
+        "--version-regex",
+        default=DEFAULT_VERSION_REGEX,
+        help="Regex used to detect version tokens for protection/restoration.",
+    )
     return parser.parse_args()
 
 def main() -> None:
     logging.basicConfig(level=logging.WARNING)
     args = parse_args()
-    skip_rules = build_skip_rules(args)
+    version_pattern = compile_version_regex(args.version_regex)
+    metadata_patterns = compile_metadata_regexes(
+        DEFAULT_SKIP_METADATA_PATTERNS + (args.skip_metadata_regex or []),
+        args.version_regex,
+    )
+    skip_rules = build_skip_rules(args, metadata_patterns, version_pattern)
     protected_terms = list(DEFAULT_PROTECTED_TERMS)
     if args.protect:
         protected_terms.extend(args.protect)
-    protected_regex = compile_regex_list(args.protect_regex)
+    protect_regex_strings = [args.version_regex]
+    if args.protect_regex:
+        protect_regex_strings.extend(args.protect_regex)
+    protected_regex = compile_regex_list(protect_regex_strings)
 
     if not args.input.exists():
         raise SystemExit(f"File does not exist: {args.input}")
@@ -916,6 +1044,7 @@ def main() -> None:
             progress_callback=progress_callback,
             protected_terms=protected_terms,
             protected_regex=protected_regex,
+            version_pattern=version_pattern,
         )
         final_texts = assemble_full_texts(
             targets, translated_subset, enforce_skip_integrity=True
