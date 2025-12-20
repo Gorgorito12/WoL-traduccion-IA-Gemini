@@ -38,6 +38,19 @@ DEFAULT_COMPACT_PROMPT = True
 DEFAULT_MAX_WORKERS = 8
 
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
+NON_TRANSLATABLE_PHRASES = [
+    "Age of Empires III: Wars of Liberty",
+]
+
+
+def _build_protection_regex() -> re.Pattern[str]:
+    phrase_group = "|".join(re.escape(phrase) for phrase in NON_TRANSLATABLE_PHRASES)
+    if phrase_group:
+        return re.compile(rf"({PLACEHOLDER_RE.pattern}|{phrase_group})")
+    return PLACEHOLDER_RE
+
+
+PROTECTION_RE = _build_protection_regex()
 
 
 @dataclass(frozen=True)
@@ -128,7 +141,7 @@ def protect_tokens(text: str) -> Tuple[str, Dict[str, str]]:
         token_map[key] = match.group(0)
         idx += 1
         return key
-    return PLACEHOLDER_RE.sub(repl, text), token_map
+    return PROTECTION_RE.sub(repl, text), token_map
 
 def unprotect_tokens(text: str, token_map: Dict[str, str]) -> str:
     for key, value in token_map.items():
