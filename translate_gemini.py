@@ -307,6 +307,35 @@ def clean_json_response(text: str) -> str:
         text = text[:-3]
     return text.strip()
 
+
+def reconcile_batch_length(batch: Sequence[str], translations: Sequence[str]) -> List[str]:
+    """Force the translations list to match the batch size.
+
+    When the model returns a JSON array with missing or extra items, we repair it
+    instead of failing the entire batch. Missing entries fall back to the source
+    text to keep alignment stable; extra entries are truncated.
+    """
+
+    if len(translations) == len(batch):
+        return list(translations)
+
+    logging.warning(
+        "Length mismatch: Sent %s, Received %s. Repairing response.",
+        len(batch),
+        len(translations),
+    )
+
+    if len(translations) < len(batch):
+        missing = len(batch) - len(translations)
+        logging.warning("Padding %s missing item(s) with original text.", missing)
+        patched = list(translations) + list(batch[len(translations):])
+        return patched
+
+    # len(translations) > len(batch)
+    extra = len(translations) - len(batch)
+    logging.warning("Truncating %s extra item(s) from model response.", extra)
+    return list(translations[: len(batch)])
+
 def translate_batch_gemini(
     client: genai.Client,
     batch: Sequence[str],
@@ -365,14 +394,7 @@ def translate_batch_gemini(
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid JSON: {exc}. Received text: {cleaned_text[:120]}")
 
-    if len(translations) != len(batch):
-        err = ValueError(
-            f"Length mismatch: Sent {len(batch)}, Received {len(translations)}"
-        )
-        setattr(err, "partial_translations", translations)
-        raise err
-
-    return translations
+    return reconcile_batch_length(batch, translations)
 
 
 def is_retryable_error(exc: Exception) -> bool:
