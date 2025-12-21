@@ -307,6 +307,25 @@ def clean_json_response(text: str) -> str:
         text = text[:-3]
     return text.strip()
 
+
+def encode_patchnote_tokens(text: str) -> Tuple[str, Tuple[int, int]]:
+    """Replace patch-note formatting markers with temporary tokens and record counts."""
+    return (
+        text.replace("\\n", "__NL__").replace("•", "__BUL__"),
+        (text.count("\\n"), text.count("•")),
+    )
+
+
+def decode_patchnote_tokens(text: str) -> str:
+    """Restore patch-note formatting tokens back to their original characters."""
+    return text.replace("__NL__", "\\n").replace("__BUL__", "•")
+
+
+def validate_patchnote_tokens(text: str, expected_counts: Tuple[int, int]) -> bool:
+    """Validate that restored text preserved escaped newlines and bullets."""
+    nl_count, bullet_count = expected_counts
+    return text.count("\\n") == nl_count and text.count("•") == bullet_count
+
 def translate_batch_gemini(
     client: genai.Client,
     batch: Sequence[str],
@@ -407,21 +426,59 @@ def translate_batch_with_retry(
 ) -> List[str]:
     attempt = 0
     last_partial: Optional[List[str]] = None
+    tokenized_batch: List[str] = []
+    formatting_signatures: List[Tuple[int, int]] = []
+    for item in batch:
+        encoded, signature = encode_patchnote_tokens(item)
+        tokenized_batch.append(encoded)
+        formatting_signatures.append(signature)
+
+    strict_prompt_used = False
+    selected_compact_prompt = compact_prompt
+
     while True:
         try:
-            return translate_batch_gemini(
+            translated_batch = translate_batch_gemini(
                 client,
-                batch,
+                tokenized_batch,
                 source,
                 target,
-                compact_prompt,
+                selected_compact_prompt,
                 prompt_config=prompt_config,
             )
+
+            restored_batch = [decode_patchnote_tokens(item) for item in translated_batch]
+
+            validation_failed = any(
+                not validate_patchnote_tokens(restored, signature)
+                for restored, signature in zip(restored_batch, formatting_signatures)
+            )
+            unchanged_problem = any(
+                restored.strip() == original.strip()
+                and bool(re.search(r"[A-Za-z]", original))
+                for restored, original in zip(restored_batch, batch)
+            )
+
+            if (validation_failed or unchanged_problem) and not strict_prompt_used:
+                logging.warning(
+                    "Validation failed or unchanged translation detected; retrying with stricter prompt."
+                )
+                strict_prompt_used = True
+                selected_compact_prompt = False
+                continue
+
+            if validation_failed or unchanged_problem:
+                logging.error(
+                    "Validation failed after strict prompt; returning original batch without translation."
+                )
+                return list(batch)
+
+            return restored_batch
         except Exception as exc:
             attempt += 1
             partial = getattr(exc, "partial_translations", None)
             if partial:
-                last_partial = partial
+                last_partial = [decode_patchnote_tokens(item) for item in partial]
             retryable = is_retryable_error(exc)
             logging.warning(
                 "Batch error (attempt %s/%s, retry=%s): %s",
