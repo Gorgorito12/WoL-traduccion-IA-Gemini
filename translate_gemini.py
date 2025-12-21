@@ -69,25 +69,29 @@ class PromptConfig:
         )
 
 
+COMMON_PROMPT_RULES = (
+    "Use historically appropriate terminology from the late 18th to early 20th century, "
+    "avoid modern slang, and keep the language clear and playable. "
+    "Keep globally recognized gaming abbreviations (XP, HP, MP, DPS, PvP, PvE, GG, MVP) unchanged. "
+    "DO NOT modernize or embellish the text. "
+    "Keep all placeholders (__TOK#, %s, %1$s, %d, \\n, \\t) unchanged and in the same position. "
+    "Treat any __PROTECT_x__ tokens as immutable placeholders. "
+    "If a string contains escaped newlines (\\n) or bullet characters (•), keep them exactly as written (do not convert \\n to real newlines). "
+    "Do NOT merge, split, rephrase, or reorder strings. "
+    "Ensure identical source strings receive identical translations. "
+    "Return ONLY a valid JSON array of translated strings, "
+    "with the exact same number of elements and order as the input. "
+    "If a string is empty or contains only placeholders, return it unchanged. "
+    "If any rule cannot be followed, return the original string unchanged. "
+)
+
 DEFAULT_PROMPT_CONFIG = PromptConfig(
     compact_template=(
         "You are a professional video game localization specialist. "
         "Translate the provided list from {source_lang} to {target_lang} "
         "for a historical video game set between 1789 and 1916 "
         "(Age of Empires III: Wars of Liberty). "
-        "Use historically appropriate terminology from the late 18th to early 20th century, "
-        "avoid modern slang, and keep the language clear and playable. "
-        "Keep globally recognized gaming abbreviations (XP, HP, MP, DPS, PvP, PvE, GG, MVP) unchanged. "
-        "DO NOT modernize or embellish the text. "
-        "Keep all placeholders (__TOK#, %s, %1$s, %d, \n, \t) unchanged and in the same position. "
-        "Treat any __PROTECT_x__ tokens as immutable placeholders. "
-        "If a string contains escaped newlines (\\n) or bullet characters (•), keep them exactly as written (do not convert \\n to real newlines). "
-        "Do NOT merge, split, rephrase, or reorder strings. "
-        "Ensure identical source strings receive identical translations. "
-        "Return ONLY a valid JSON array of translated strings, "
-        "with the exact same number of elements and order as the input. "
-        "If a string is empty or contains only placeholders, return it unchanged. "
-        "If any rule cannot be followed, return the original string unchanged. "
+        f"{COMMON_PROMPT_RULES}"
         "Input list: {input_list}"
     ),
     detailed_template=f"""
@@ -110,21 +114,13 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
     - Leave globally recognized gaming abbreviations (XP, HP, MP, DPS, PvP, PvE, GG, MVP) unchanged.
 
     TECHNICAL RULES (STRICT)
-    1. Do NOT translate, modify, reorder, or remove placeholders such as:
-       __TOK#, %s, %1$s, %d, \n, \t, and __PROTECT_x__ tokens.
-    2. Preserve literal escape sequences: keep \\n and similar sequences as-is (do NOT convert them to real newlines).
-       Maintain bullet characters (•) and surrounding spacing exactly.
-    3. Do NOT merge, split, expand, or rephrase strings.
-    4. Preserve the original order and number of strings.
-    5. Output ONLY a valid JSON array of strings.
-    6. The output array MUST have the exact same length and order as the input array.
-    7. If a string is empty or contains only placeholders, return it unchanged.
-    8. If any rule cannot be followed or the translation is uncertain, return the original string unchanged.
+    {COMMON_PROMPT_RULES}
 
     Input List:
     {{input_list}}
     """,
 )
+
 
 
 
@@ -152,6 +148,30 @@ class SkipRules:
     symbol_regex: Sequence[re.Pattern[str]]
     text_regex: Sequence[re.Pattern[str]]
     enable_path_heuristic: bool = True
+
+
+@dataclass
+class PreparedTranslationState:
+    protected: List[str]
+    translations: List[str]
+    token_maps: List[Dict[str, str]]
+    phrase_maps: List[Dict[str, str]]
+    original_texts: List[str]
+    indexes_by_protected: Dict[str, List[int]]
+    unique_to_translate: List[str]
+    cache: Dict[str, str]
+
+
+@dataclass
+class PreparedTranslationState:
+    protected: List[str]
+    translations: List[str]
+    token_maps: List[Dict[str, str]]
+    phrase_maps: List[Dict[str, str]]
+    original_texts: List[str]
+    indexes_by_protected: Dict[str, List[int]]
+    unique_to_translate: List[str]
+    cache: Dict[str, str]
 
 def setup_gemini(api_key: str) -> genai.Client:
     """Create a Google GenAI client (google-genai SDK)."""
@@ -394,6 +414,12 @@ def reconcile_batch_length(batch: Sequence[str], translations: Sequence[str]) ->
     logging.warning("Truncating %s extra item(s) from model response.", extra)
     return list(translations[: len(batch)])
 
+
+def compute_backoff(attempt: int) -> float:
+    base = BACKOFF_SECONDS * (2 ** (attempt - 1))
+    backoff = min(base, BACKOFF_MAX_SECONDS)
+    return backoff + random.uniform(0, BACKOFF_SECONDS)
+
 def translate_batch_gemini(
     client: genai.Client,
     batch: Sequence[str],
@@ -527,9 +553,7 @@ def translate_batch_with_retry(
                     return last_partial
                 return list(batch)
 
-            backoff = min(BACKOFF_SECONDS * (2 ** (attempt - 1)), BACKOFF_MAX_SECONDS)
-            backoff += random.uniform(0, BACKOFF_SECONDS)
-            time.sleep(backoff)
+            time.sleep(compute_backoff(attempt))
 
 def translate_strings(
     inners: Iterable[str],
@@ -547,78 +571,17 @@ def translate_strings(
     protected_terms: Optional[Sequence[str]] = None,
     protected_regex: Optional[Sequence[re.Pattern[str]]] = None,
 ) -> List[str]:
-    
     client = setup_gemini(api_key)
-
-    protected_terms = protected_terms or []
-    protected_regex = protected_regex or []
-
-    protected: List[str] = []
-    token_maps: List[Dict[str, str]] = []
-    phrase_maps: List[Dict[str, str]] = []
-    original_texts: List[str] = []
-    translations: List[str] = []
-    indexes_by_protected: Dict[str, List[int]] = {}
-
-    cache: Dict[str, str] = {}
-    if cache_path and cache_path.exists():
-        try:
-            cache = json.loads(cache_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logging.warning("Unable to load previous cache (%s): %s", cache_path, exc)
-            cache = {}
-
-    for idx, inner in enumerate(inners):
-        phrase_protected, phrase_map = protect_phrases(inner, protected_terms, protected_regex)
-        protected_text, token_map = protect_tokens(phrase_protected)
-        protected.append(protected_text)
-        token_maps.append(token_map)
-        phrase_maps.append(phrase_map)
-        original_texts.append(inner)
-
-        initial_translation = inner
-        if existing_translations and idx < len(existing_translations):
-            candidate = existing_translations[idx]
-            if candidate and candidate.strip():
-                initial_translation = candidate
-                if candidate != inner:
-                    cache.setdefault(protected_text, candidate)
-
-        translations.append(initial_translation)
-        indexes_by_protected.setdefault(protected_text, []).append(idx)
-    unique_to_translate: List[str] = []
-    already_enqueued: set[str] = set()
-
-    for text in protected:
-        if not text.strip():
-            cache[text] = text
-            # Propagate empty text as-is to every position.
-            for idx in indexes_by_protected.get(text, []):
-                translations[idx] = restore_all_tokens(
-                    text, token_maps[idx], phrase_maps[idx], original_texts[idx]
-                )
-            continue
-
-        cached_value = cache.get(text)
-
-        if cached_value and cached_value.strip():
-            # We already had a cached translation: reuse it everywhere and skip re-translation.
-            for idx in indexes_by_protected.get(text, []):
-                translations[idx] = restore_all_tokens(
-                    cached_value, token_maps[idx], phrase_maps[idx], original_texts[idx]
-                )
-            continue
-
-        # If there is no cache (or it is empty), register an entry and queue it for translation,
-        # avoiding duplicates.
-        if text not in cache:
-            cache[text] = ""
-        if text not in already_enqueued:
-            already_enqueued.add(text)
-            unique_to_translate.append(text)
+    state = prepare_translation_state(
+        inners=inners,
+        protected_terms=protected_terms,
+        protected_regex=protected_regex,
+        existing_translations=existing_translations,
+        cache_path=cache_path,
+    )
 
     # Build all batches
-    batches = list(yield_batches(unique_to_translate, max_budget_bytes))
+    batches = list(yield_batches(state.unique_to_translate, max_budget_bytes))
 
     # Map to sort results: {batch_index: [original_texts]}
     batch_map = {i: batch for i, batch in enumerate(batches)}
@@ -666,26 +629,26 @@ def translate_strings(
 
             # Store in cache and update main list
             for original, translated_item in zip(original_batch, translated_batch):
-                cache[original] = translated_item
-                for idx in indexes_by_protected.get(original, []):
-                    translations[idx] = restore_all_tokens(
+                state.cache[original] = translated_item
+                for idx in state.indexes_by_protected.get(original, []):
+                    state.translations[idx] = restore_all_tokens(
                         translated_item,
-                        token_maps[idx],
-                        phrase_maps[idx],
-                        original_texts[idx],
+                        state.token_maps[idx],
+                        state.phrase_maps[idx],
+                        state.original_texts[idx],
                     )
 
             # Save partial progress (thread-safe because we are on the main thread)
             if cache_path:
                 try:
-                    cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+                    cache_path.write_text(json.dumps(state.cache, ensure_ascii=False, indent=2), encoding="utf-8")
                 except Exception as exc:
                     logging.warning("Could not persist cache for batch %s: %s", batch_idx, exc)
 
             if progress_callback:
-                progress_callback(list(translations))
+                progress_callback(list(state.translations))
 
-    return translations
+    return state.translations
 
 # --- XML Utils ---
 class CommentedTreeBuilder(ET.TreeBuilder):
@@ -938,6 +901,86 @@ def build_skip_rules(args: argparse.Namespace) -> SkipRules:
         symbol_regex=compile_regex_list(args.skip_symbol_regex),
         text_regex=compile_regex_list(args.skip_text_regex),
         enable_path_heuristic=not args.no_path_heuristic,
+    )
+
+
+def prepare_translation_state(
+    inners: Iterable[str],
+    protected_terms: Optional[Sequence[str]],
+    protected_regex: Optional[Sequence[re.Pattern[str]]],
+    existing_translations: Optional[Sequence[str]],
+    cache_path: Optional[Path],
+) -> PreparedTranslationState:
+    protected_terms = protected_terms or []
+    protected_regex = protected_regex or []
+
+    protected: List[str] = []
+    token_maps: List[Dict[str, str]] = []
+    phrase_maps: List[Dict[str, str]] = []
+    original_texts: List[str] = []
+    translations: List[str] = []
+    indexes_by_protected: Dict[str, List[int]] = {}
+
+    cache: Dict[str, str] = {}
+    if cache_path and cache_path.exists():
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logging.warning("Unable to load previous cache (%s): %s", cache_path, exc)
+            cache = {}
+
+    for idx, inner in enumerate(inners):
+        phrase_protected, phrase_map = protect_phrases(inner, protected_terms, protected_regex)
+        protected_text, token_map = protect_tokens(phrase_protected)
+        protected.append(protected_text)
+        token_maps.append(token_map)
+        phrase_maps.append(phrase_map)
+        original_texts.append(inner)
+
+        initial_translation = inner
+        if existing_translations and idx < len(existing_translations):
+            candidate = existing_translations[idx]
+            if candidate and candidate.strip():
+                initial_translation = candidate
+                if candidate != inner:
+                    cache.setdefault(protected_text, candidate)
+
+        translations.append(initial_translation)
+        indexes_by_protected.setdefault(protected_text, []).append(idx)
+
+    unique_to_translate: List[str] = []
+    already_enqueued: set[str] = set()
+
+    for text in protected:
+        if not text.strip():
+            cache[text] = text
+            for idx in indexes_by_protected.get(text, []):
+                translations[idx] = restore_all_tokens(text, token_maps[idx], phrase_maps[idx], original_texts[idx])
+            continue
+
+        cached_value = cache.get(text)
+        if cached_value and cached_value.strip():
+            for idx in indexes_by_protected.get(text, []):
+                translations[idx] = restore_all_tokens(
+                    cached_value, token_maps[idx], phrase_maps[idx], original_texts[idx]
+                )
+            continue
+
+        if text not in cache:
+            cache[text] = ""
+        if text not in already_enqueued:
+            already_enqueued.add(text)
+            unique_to_translate.append(text)
+
+    return PreparedTranslationState(
+        protected=protected,
+        translations=translations,
+        token_maps=token_maps,
+        phrase_maps=phrase_maps,
+        original_texts=original_texts,
+        indexes_by_protected=indexes_by_protected,
+        unique_to_translate=unique_to_translate,
+        cache=cache,
     )
 
 
