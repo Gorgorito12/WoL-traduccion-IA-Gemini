@@ -109,9 +109,17 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
     - Keep sentences concise; do not add explanations or extra words.
     - Leave globally recognized gaming abbreviations (XP, HP, MP, DPS, PvP, PvE, GG, MVP) unchanged.
 
+    TERMINOLOGY (STRICT)
+    - Translate the game term “Home City” / “Home Cities” using the standard in-game equivalent for the TARGET language.
+      - If {{target_lang}} is Spanish (Latin America) / Español (LatAm), enforce:
+        * "Home City"  -> "Metrópoli"
+        * "Home Cities" -> "Metrópolis"
+      - For any other target language, do NOT use Spanish terms; use that language’s standard equivalent consistently.
+    - Keep proper nouns, product names, and brand names unchanged unless the official localized form exists.
+
     TECHNICAL RULES (STRICT)
     1. Do NOT translate, modify, reorder, or remove placeholders such as:
-       __TOK#, %s, %1$s, %d, \n, \t, and __PROTECT_x__ tokens.
+       __TOK#, %s, %1$s, %d, \\n, \\t, and __PROTECT_x__ tokens.
     2. Preserve literal escape sequences: keep \\n and similar sequences as-is (do NOT convert them to real newlines).
        Maintain bullet characters (•) and surrounding spacing exactly.
     3. Do NOT merge, split, expand, or rephrase strings.
