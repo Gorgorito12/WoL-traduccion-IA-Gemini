@@ -15,7 +15,7 @@ A **compact prompt is enabled by default** to reduce token usage without losing 
 - Strict protection of **tokens/placeholders** (e.g., `__TOK#__`, `%s`, `%1$s`, `\n`, `\t`, etc.).
 - **Multithreading** for faster processing.
 - **Automatic cache**: detects previously translated strings and skips them to save time and API cost.
-- Built-in glossary entry: **“Home City” → “Metrópoli”** for consistent localization.
+- Target-aware glossary: defaults to **“Home City” → “Metrópoli”** when translating to Spanish, and can be extended/overridden for any language with CLI options.
 - **Compact** (default) and **Detailed** (optional) prompt modes.
 
 ---
@@ -112,6 +112,17 @@ This reduces both runtime and cost when rerunning the script after new mod patch
 
 ---
 
+## Glossary (optional)
+
+- Default: When the target language is Spanish (including “Latin American Spanish”), the term **“Home City”** is forced to **“Metrópoli”** to keep the game’s terminology consistent.
+- Custom glossary entries:
+  - Inline: `--glossary "Home City=Metrópoli"`
+  - From JSON file (object mapping source → translation): `--glossary-json glossary.json`
+
+Combine multiple `--glossary` flags or mix them with `--glossary-json` to support any target language.
+
+---
+
 ## Quick Troubleshooting
 
 * **`ModuleNotFoundError: google.genai` / `No module named ...`**
@@ -141,4 +152,3 @@ Use a safer approach (like environment variables) if you plan to automate runs.
 Review Google Gemini’s policies/terms for API usage (including commercial use and rate limits).
 
 ---
-

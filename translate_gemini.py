@@ -51,8 +51,12 @@ DEFAULT_PROTECTED_REGEX = [
     r"\bGG\b",
     r"\bMVP\b",
 ]
-DEFAULT_GLOSSARY_TRANSLATIONS: Dict[str, str] = {
-    "Home City": "Metrópoli",
+DEFAULT_GLOSSARY_TRANSLATIONS: Dict[str, Dict[str, str]] = {
+    "Home City": {
+        "spanish": "Metrópoli",
+        "latin american spanish": "Metrópoli",
+        "es": "Metrópoli",
+    },
 }
 
 
@@ -248,6 +252,69 @@ def compile_regex_list(patterns: Optional[Sequence[str]]) -> List[re.Pattern[str
         except re.error as exc:
             logging.warning("Invalid regex skipped (%s): %s", pattern, exc)
     return compiled
+
+def normalize_lang_label(label: str) -> str:
+    return re.sub(r"\s+", " ", label.strip().lower())
+
+def glossary_for_target_lang(target_lang: str) -> Dict[str, str]:
+    normalized_target = normalize_lang_label(target_lang)
+    glossary: Dict[str, str] = {}
+    for source_text, translations in DEFAULT_GLOSSARY_TRANSLATIONS.items():
+        for lang_label, translated_value in translations.items():
+            if normalize_lang_label(lang_label) == normalized_target:
+                glossary[source_text] = translated_value
+                break
+    return glossary
+
+def parse_glossary_entries(entries: Sequence[str]) -> Dict[str, str]:
+    glossary: Dict[str, str] = {}
+    for entry in entries:
+        if "=" not in entry:
+            logging.warning('Invalid glossary entry (missing "="): %s', entry)
+            continue
+        source, translated = entry.split("=", 1)
+        source = source.strip()
+        translated = translated.strip()
+        if not source or not translated:
+            logging.warning("Glossary entry has empty source or translation: %s", entry)
+            continue
+        glossary[source] = translated
+    return glossary
+
+def load_glossary_file(path: Path) -> Dict[str, str]:
+    try:
+        content = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(content, dict):
+            logging.warning("Glossary JSON must be an object mapping source->translation: %s", path)
+            return {}
+        result: Dict[str, str] = {}
+        for key, value in content.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                logging.warning("Glossary JSON contains non-string pair (%s: %s); skipping.", key, value)
+                continue
+            result[key] = value
+        return result
+    except Exception as exc:
+        logging.warning("Unable to load glossary file %s: %s", path, exc)
+        return {}
+
+def build_glossary(
+    target_lang: str,
+    glossary_entries: Optional[Sequence[str]] = None,
+    glossary_file: Optional[Path] = None,
+) -> Dict[str, str]:
+    glossary: Dict[str, str] = {}
+    # Target-specific defaults (e.g., Spanish only).
+    glossary.update(glossary_for_target_lang(target_lang))
+
+    if glossary_file:
+        glossary.update(load_glossary_file(glossary_file))
+
+    if glossary_entries:
+        glossary.update(parse_glossary_entries(glossary_entries))
+
+    # Drop empty translations if any slipped in.
+    return {src: tgt for src, tgt in glossary.items() if src and tgt}
 
 def decode_auto(path: Path) -> Tuple[str, str, Optional[bytes]]:
     raw = path.read_bytes()
@@ -549,6 +616,7 @@ def translate_strings(
     prompt_config: PromptConfig = DEFAULT_PROMPT_CONFIG,
     protected_terms: Optional[Sequence[str]] = None,
     protected_regex: Optional[Sequence[re.Pattern[str]]] = None,
+    glossary: Optional[Dict[str, str]] = None,
 ) -> List[str]:
 
     client = setup_gemini(api_key)
@@ -572,7 +640,8 @@ def translate_strings(
             cache = {}
 
     # Seed glossary translations so that critical terms stay consistent across runs.
-    cache.update(DEFAULT_GLOSSARY_TRANSLATIONS)
+    if glossary:
+        cache.update(glossary)
 
     for idx, inner in enumerate(inners):
         phrase_protected, phrase_map = protect_phrases(inner, protected_terms, protected_regex)
@@ -1011,6 +1080,18 @@ def parse_args() -> argparse.Namespace:
         help="Regular expressions for phrases to protect from translation (repeatable).",
     )
     parser.add_argument(
+        "--glossary",
+        action="append",
+        default=[],
+        help='Glossary override in the form "source=translation" (repeatable).',
+    )
+    parser.add_argument(
+        "--glossary-json",
+        type=Path,
+        default=None,
+        help="Path to a JSON file mapping source strings to translations.",
+    )
+    parser.add_argument(
         "--diagnostic",
         action="store_true",
         help="Print encoding/BOM diagnostics after each write.",
@@ -1025,6 +1106,11 @@ def main() -> None:
     if args.protect:
         protected_terms.extend(args.protect)
     protected_regex = compile_regex_list(DEFAULT_PROTECTED_REGEX + (args.protect_regex or []))
+    glossary = build_glossary(
+        target_lang=args.target,
+        glossary_entries=args.glossary,
+        glossary_file=args.glossary_json,
+    )
 
     if not args.input.exists():
         raise SystemExit(f"File does not exist: {args.input}")
@@ -1095,6 +1181,7 @@ def main() -> None:
             progress_callback=progress_callback,
             protected_terms=protected_terms,
             protected_regex=protected_regex,
+            glossary=glossary,
         )
         final_texts = assemble_full_texts(
             targets, translated_subset, enforce_skip_integrity=True
