@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import io
 import logging
+import os
 import re
 import time
 import json
@@ -120,6 +121,7 @@ class DocumentFormat:
     encoding: str
     newline: str
     xml_declaration: bool
+    bom: Optional[bytes]
 
 
 @dataclass(frozen=True)
@@ -232,13 +234,19 @@ def compile_regex_list(patterns: Optional[Sequence[str]]) -> List[re.Pattern[str
             logging.warning("Invalid regex skipped (%s): %s", pattern, exc)
     return compiled
 
-def decode_auto(path: Path) -> Tuple[str, str]:
+def decode_auto(path: Path) -> Tuple[str, str, Optional[bytes]]:
     raw = path.read_bytes()
+    bom: Optional[bytes] = None
     if raw.startswith(b"\xff\xfe"):
-        return raw.decode("utf-16"), "utf-16-le"
+        bom = b"\xff\xfe"
+        return raw[len(bom):].decode("utf-16-le"), "utf-16-le", bom
     if raw.startswith(b"\xfe\xff"):
-        return raw.decode("utf-16"), "utf-16-be"
-    return raw.decode("utf-8"), "utf-8"
+        bom = b"\xfe\xff"
+        return raw[len(bom):].decode("utf-16-be"), "utf-16-be", bom
+    if raw.startswith(b"\xef\xbb\xbf"):
+        bom = b"\xef\xbb\xbf"
+        return raw[len(bom):].decode("utf-8"), "utf-8", bom
+    return raw.decode("utf-8"), "utf-8", bom
 
 
 def detect_declared_encoding(content: str) -> Optional[str]:
@@ -599,16 +607,20 @@ class CommentedTreeBuilder(ET.TreeBuilder):
 
 
 def parse_strings_xml(path: Path) -> Tuple[ET.ElementTree, DocumentFormat]:
-    content, encoding = decode_auto(path)
+    content, detected_encoding, bom = decode_auto(path)
     declared = detect_declared_encoding(content)
-    if declared:
-        encoding = declared
+    encoding = declared if declared else detected_encoding
     xml_decl = has_xml_declaration(content)
     newline = detect_newline(content)
     parser = ET.XMLParser(target=CommentedTreeBuilder())
     return (
         ET.ElementTree(ET.fromstring(content, parser=parser)),
-        DocumentFormat(encoding=encoding, newline=newline, xml_declaration=xml_decl),
+        DocumentFormat(
+            encoding=encoding,
+            newline=newline,
+            xml_declaration=xml_decl,
+            bom=bom,
+        ),
     )
 
 
@@ -691,9 +703,32 @@ def update_elements_text(elements: Iterable[ET.Element], texts: Sequence[str]) -
     for elem, text in zip(elements, texts):
         elem.text = text
 
-def write_output_snapshot(tree, elements, texts, output, fmt: DocumentFormat):
+def strip_known_bom(data: bytes) -> Tuple[bytes, Optional[bytes]]:
+    for bom in (b"\xff\xfe", b"\xfe\xff", b"\xef\xbb\xbf"):
+        if data.startswith(bom):
+            return data[len(bom):], bom
+    return data, None
+
+
+def resolve_write_encoding(fmt: DocumentFormat) -> str:
+    encoding_lower = fmt.encoding.lower()
+    if fmt.bom == b"\xff\xfe":
+        return "utf-16-le"
+    if fmt.bom == b"\xfe\xff":
+        return "utf-16-be"
+    if fmt.bom == b"\xef\xbb\xbf":
+        return "utf-8"
+    if encoding_lower == "utf-8-sig":
+        return "utf-8"
+    if encoding_lower == "utf-16":
+        return "utf-16-le"
+    return fmt.encoding
+
+
+def serialize_tree(tree: ET.ElementTree, elements, texts, fmt: DocumentFormat) -> bytes:
     update_elements_text(elements, texts)
     indent(tree.getroot())
+
     buffer = io.BytesIO()
     tree.write(
         buffer,
@@ -701,11 +736,51 @@ def write_output_snapshot(tree, elements, texts, output, fmt: DocumentFormat):
         xml_declaration=fmt.xml_declaration,
         short_empty_elements=False,
     )
-    serialized = buffer.getvalue().decode(fmt.encoding)
+
+    serialized_bytes, _ = strip_known_bom(buffer.getvalue())
+    serialized_text = serialized_bytes.decode(resolve_write_encoding(fmt), errors="replace")
     if fmt.newline != "\n":
-        serialized = serialized.replace("\n", fmt.newline)
-    with output.open("w", encoding=fmt.encoding, newline="") as fp:
-        fp.write(serialized)
+        serialized_text = serialized_text.replace("\n", fmt.newline)
+
+    encoded = serialized_text.encode(resolve_write_encoding(fmt))
+    if fmt.bom:
+        encoded = fmt.bom + encoded
+    return encoded
+
+
+def atomic_write(data: bytes, output: Path) -> None:
+    temp_path = output.with_name(output.name + ".tmp")
+    with temp_path.open("wb") as fp:
+        fp.write(data)
+        fp.flush()
+        os.fsync(fp.fileno())
+    os.replace(temp_path, output)
+
+
+def print_diagnostics(path: Path, fmt: DocumentFormat) -> None:
+    try:
+        raw = path.read_bytes()
+    except Exception as exc:
+        logging.warning("Diagnostic read failed for %s: %s", path, exc)
+        return
+    first_bytes = " ".join(f"{b:02x}" for b in raw[:16])
+    bom_label = "none"
+    for label, bom in (("FF FE", b"\xff\xfe"), ("FE FF", b"\xfe\xff"), ("UTF-8 BOM", b"\xef\xbb\xbf")):
+        if raw.startswith(bom):
+            bom_label = label
+            break
+    encoding_used = resolve_write_encoding(fmt)
+    print(
+        f"🔍 Diagnostics -> encoding={encoding_used}, bom={bom_label}, "
+        f"first16={first_bytes}, size={len(raw)} bytes"
+    )
+
+
+def write_output_snapshot(tree, elements, texts, output: Path, fmt: DocumentFormat, diagnostic: bool = False):
+    serialized = serialize_tree(tree, elements, texts, fmt)
+    atomic_write(serialized, output)
+    if diagnostic:
+        print_diagnostics(output, fmt)
 
 
 def assemble_full_texts(
@@ -838,6 +913,11 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Regular expressions for phrases to protect from translation (repeatable).",
     )
+    parser.add_argument(
+        "--diagnostic",
+        action="store_true",
+        help="Print encoding/BOM diagnostics after each write.",
+    )
     return parser.parse_args()
 
 def main() -> None:
@@ -888,7 +968,7 @@ def main() -> None:
     else:
         starting_texts = [target.text for target in targets]
 
-    write_output_snapshot(tree, elements, starting_texts, args.output, doc_format)
+    write_output_snapshot(tree, elements, starting_texts, args.output, doc_format, diagnostic=args.diagnostic)
 
     if not translatable_texts:
         print("🔒 No elements eligible for translation. Output snapshot written.")
@@ -899,7 +979,9 @@ def main() -> None:
 
     def progress_callback(current_subset: Sequence[str]) -> None:
         merged = assemble_full_texts(targets, current_subset, enforce_skip_integrity=True)
-        write_output_snapshot(tree, elements, merged, args.output, doc_format)
+        write_output_snapshot(
+            tree, elements, merged, args.output, doc_format, diagnostic=args.diagnostic
+        )
 
     try:
         translated_subset = translate_strings(
@@ -920,7 +1002,7 @@ def main() -> None:
         final_texts = assemble_full_texts(
             targets, translated_subset, enforce_skip_integrity=True
         )
-        write_output_snapshot(tree, elements, final_texts, args.output, doc_format)
+        write_output_snapshot(tree, elements, final_texts, args.output, doc_format, diagnostic=args.diagnostic)
         print(f"\n✅ Completed: {args.output}")
 
     except Exception as e:
