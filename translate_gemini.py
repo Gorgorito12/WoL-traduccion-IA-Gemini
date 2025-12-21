@@ -41,6 +41,16 @@ DEFAULT_MAX_WORKERS = 8
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
 DEFAULT_SKIP_SYMBOL_CONTAINS = ["folder", "path", "dir", "directory"]
 DEFAULT_PROTECTED_TERMS = ["Age of Empires III: Wars of Liberty"]
+DEFAULT_PROTECTED_REGEX = [
+    r"\bXP\b",
+    r"\bHP\b",
+    r"\bMP\b",
+    r"\bDPS\b",
+    r"\bPvP\b",
+    r"\bPvE\b",
+    r"\bGG\b",
+    r"\bMVP\b",
+]
 
 
 @dataclass(frozen=True)
@@ -67,6 +77,7 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
         "(Age of Empires III: Wars of Liberty). "
         "Use historically appropriate terminology from the late 18th to early 20th century, "
         "avoid modern slang, and keep the language clear and playable. "
+        "Keep globally recognized gaming abbreviations (XP, HP, MP, DPS, PvP, PvE, GG, MVP) unchanged. "
         "DO NOT modernize or embellish the text. "
         "Keep all placeholders (__TOK#, %s, %1$s, %d, \n, \t) unchanged and in the same position. "
         "Treat any __PROTECT_x__ tokens as immutable placeholders. "
@@ -96,6 +107,7 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
     CONSISTENCY
     - If the same source string appears multiple times, translate it exactly the same way each time.
     - Keep sentences concise; do not add explanations or extra words.
+    - Leave globally recognized gaming abbreviations (XP, HP, MP, DPS, PvP, PvE, GG, MVP) unchanged.
 
     TECHNICAL RULES (STRICT)
     1. Do NOT translate, modify, reorder, or remove placeholders such as:
@@ -1006,7 +1018,7 @@ def main() -> None:
     protected_terms = list(DEFAULT_PROTECTED_TERMS)
     if args.protect:
         protected_terms.extend(args.protect)
-    protected_regex = compile_regex_list(args.protect_regex)
+    protected_regex = compile_regex_list(DEFAULT_PROTECTED_REGEX + (args.protect_regex or []))
 
     if not args.input.exists():
         raise SystemExit(f"File does not exist: {args.input}")
