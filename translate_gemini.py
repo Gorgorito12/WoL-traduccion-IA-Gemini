@@ -136,6 +136,7 @@ class TranslationTarget:
     element: ET.Element
     text: str
     symbol: Optional[str]
+    locid: Optional[str]
     skip: bool
     reason: Optional[str] = None
 
@@ -272,23 +273,30 @@ def detect_newline(content: str) -> str:
     return "\r\n" if "\r\n" in content else "\n"
 
 
+def neutralize_escape_sequences(text: str) -> str:
+    return (
+        text.replace("\\n", "__NL__")
+        .replace("\\t", "__TAB__")
+        .replace("\\r", "__CR__")
+    )
+
+
 def is_path_like_text(text: str) -> bool:
     if not text:
         return False
-    stripped = text.strip()
+    stripped = neutralize_escape_sequences(text).strip()
     if not stripped:
         return False
-    # Drive letter prefix (e.g., C:\ or D:/)
-    if re.match(r"^[a-zA-Z]:[\\/]", stripped):
+    windows_drive = re.compile(r"^[A-Za-z]:[\\/](?:[^\\/\r\n]+[\\/])*[^\\/\r\n]+[\\/]?$")
+    if windows_drive.match(stripped):
         return True
-    has_slash = ("\\" in stripped) or ("/" in stripped)
-    trailing_sep = stripped.endswith("\\") or stripped.endswith("/")
-    if has_slash and trailing_sep:
+
+    unc_path = re.compile(r"^\\\\[^\\/\r\n]+[\\/][^\\/\r\n]+(?:[\\/][^\\/\r\n]+)*[\\/]?$")
+    if unc_path.match(stripped):
         return True
-    # Folder-like sequences such as \User\Documents\ or /home/user/
-    if re.search(r"[\\/][^\\/]+[\\/]", stripped):
-        return True
-    return False
+
+    folder_segments = re.compile(r"(?:[\\/][A-Za-z0-9][^\\/\r\n]*){2,}[\\/]?")
+    return bool(folder_segments.search(stripped))
 
 def yield_batches(strings: Iterable[str], max_budget_bytes: int, max_items: int = 50) -> Iterator[List[str]]:
     batch: List[str] = []
@@ -795,10 +803,22 @@ def iter_translatable_elements(root: ET.Element, skip_rules: SkipRules) -> Itera
 
     def build_target(elem: ET.Element) -> TranslationTarget:
         skip, reason = should_skip_element(elem, skip_rules)
+        locid = elem.attrib.get("locid")
+        symbol = elem.attrib.get("symbol")
+        if skip:
+            preview = (elem.text or "")[:80]
+            logging.debug(
+                "Skipping element locid=%s symbol=%s reason=%s preview=%s",
+                locid,
+                symbol,
+                reason,
+                preview,
+            )
         return TranslationTarget(
             element=elem,
             text=elem.text or "",
-            symbol=elem.attrib.get("symbol"),
+            symbol=symbol,
+            locid=locid,
             skip=skip,
             reason=reason,
         )
