@@ -370,8 +370,9 @@ def is_path_like_text(text: str) -> bool:
     if cleaned.endswith("\\") or cleaned.endswith("/"):
         return True
 
-    # Minimal path pattern like: "My Games\Wars of Liberty" (may contain spaces).
-    if re.match(r"^[\w\s\-\.\(\)]+[\\/][\w\s\-\.\(\)]+(?:[\\/][\w\s\-\.\(\)]+)*[\\/]?$", cleaned):
+    # For a single separator, require a filename-like suffix to treat it as a path.
+    # This avoids misclassifying UI toggles such as "Show/Hide ..." as filesystem paths.
+    if sep_count == 1 and re.search(r"[\\/][^\\/\s]+\.[A-Za-z0-9]{1,6}$", cleaned):
         return True
 
     return False
