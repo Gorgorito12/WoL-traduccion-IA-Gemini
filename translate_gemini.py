@@ -75,9 +75,12 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
         "Use historically appropriate terminology from the late 18th to early 20th century, "
         "avoid modern slang, and keep the language clear and playable. "
         "DO NOT modernize or embellish the text. "
+        "Preserve the sentence type and punctuation: do not add leading or trailing question/exclamation marks "
+        "unless the source already uses them. "
         "Keep all placeholders (__TOK#, %s, %1$s, %d, \n, \t) unchanged and in the same position. "
         "Treat any __PROTECT_x__ tokens as immutable placeholders. "
         "If a string contains escaped newlines (\\n) or bullet characters (•), keep them exactly as written (do not convert \\n to real newlines). "
+        "If the text contains XML/HTML-like tags (including escaped tags such as &lt;color=...&gt;), keep the tags unchanged and translate only the surrounding text. "
         "Do NOT merge, split, rephrase, or reorder strings. "
         "Ensure identical source strings receive identical translations. "
         "Return ONLY a valid JSON array of translated strings, "
@@ -99,6 +102,7 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
     - Avoid modern slang, contemporary expressions, or anachronistic terms.
     - Do NOT use archaic or literary language; the translation must remain clear, concise, and suitable for gameplay.
     - Maintain a neutral, professional tone appropriate for UI and in-game text.
+    - Preserve the sentence type and punctuation: do not convert statements into questions/exclamations or add inverted ¿? or ¡! unless they exist in the source.
 
     CONSISTENCY
     - If the same source string appears multiple times, translate it exactly the same way each time.
@@ -109,6 +113,7 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
        __TOK#, %s, %1$s, %d, \n, \t, and __PROTECT_x__ tokens.
     2. Preserve literal escape sequences: keep \\n and similar sequences as-is (do NOT convert them to real newlines).
        Maintain bullet characters (•) and surrounding spacing exactly.
+    2b. Preserve any XML/HTML-like tags (including escaped forms such as &lt;color=...&gt;); translate only the human-readable text.
     3. Do NOT merge, split, expand, or rephrase strings.
     4. Preserve the original order and number of strings.
     5. Output ONLY a valid JSON array of strings.
