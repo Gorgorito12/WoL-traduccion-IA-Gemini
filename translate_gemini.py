@@ -39,6 +39,7 @@ DEFAULT_COMPACT_PROMPT = True
 DEFAULT_MAX_WORKERS = 8
 
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
+ALPHABETIC_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ]")
 DEFAULT_SKIP_SYMBOL_CONTAINS = ["folder", "path", "dir", "directory"]
 DEFAULT_PROTECTED_TERMS = ["Age of Empires III: Wars of Liberty"]
 
@@ -49,13 +50,24 @@ class PromptConfig:
 
     compact_template: str
     detailed_template: str
+    force_suffix_compact: str
+    force_suffix_detailed: str
 
-    def build(self, batch: Sequence[str], source_lang: str, target_lang: str, compact: bool) -> str:
+    def build(
+        self,
+        batch: Sequence[str],
+        source_lang: str,
+        target_lang: str,
+        compact: bool,
+        force_translate: bool = False,
+    ) -> str:
         template = self.compact_template if compact else self.detailed_template
+        force_suffix = self.force_suffix_compact if compact else self.force_suffix_detailed
         return template.format(
             source_lang=source_lang,
             target_lang=target_lang,
             input_list=json.dumps(batch, ensure_ascii=False),
+            force_suffix=force_suffix if force_translate else "",
         )
 
 
@@ -68,7 +80,7 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
         "Use historically appropriate terminology from the late 18th to early 20th century, "
         "avoid modern slang, and keep the language clear and playable. "
         "DO NOT modernize or embellish the text. "
-        "Keep all placeholders (__TOK#, %s, %1$s, %d, \n, \t) unchanged and in the same position. "
+        "Keep all placeholders (__TOK#, %s, %1$s, %d, \\n, \\t, \\r) unchanged and in the same position. "
         "Treat any __PROTECT_x__ tokens as immutable placeholders. "
         "If a string contains escaped newlines (\\n) or bullet characters (•), keep them exactly as written (do not convert \\n to real newlines). "
         "Do NOT merge, split, rephrase, or reorder strings. "
@@ -77,6 +89,7 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
         "with the exact same number of elements and order as the input. "
         "If a string is empty or contains only placeholders, return it unchanged. "
         "If any rule cannot be followed, return the original string unchanged. "
+        "{force_suffix}"
         "Input list: {input_list}"
     ),
     detailed_template=f"""
@@ -99,7 +112,7 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
 
     TECHNICAL RULES (STRICT)
     1. Do NOT translate, modify, reorder, or remove placeholders such as:
-       __TOK#, %s, %1$s, %d, \n, \t, and __PROTECT_x__ tokens.
+       __TOK#, %s, %1$s, %d, \\n, \\t, and __PROTECT_x__ tokens.
     2. Preserve literal escape sequences: keep \\n and similar sequences as-is (do NOT convert them to real newlines).
        Maintain bullet characters (•) and surrounding spacing exactly.
     3. Do NOT merge, split, expand, or rephrase strings.
@@ -109,9 +122,20 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
     7. If a string is empty or contains only placeholders, return it unchanged.
     8. If any rule cannot be followed or the translation is uncertain, return the original string unchanged.
 
+    {force_suffix}
     Input List:
     {{input_list}}
     """,
+    force_suffix_compact=(
+        "CRITICAL: If any string contains alphabetic characters, you MUST translate it. "
+        "Never return the source text unchanged unless it is empty or only placeholders. "
+        "Always preserve placeholders (__TOK#, %s, %1$s, %d, \\n, \\t, \\r), bullet characters (•), and their exact positions. "
+    ),
+    force_suffix_detailed=(
+        "FORCE TRANSLATION RULE: Strings containing alphabetic characters must be translated. "
+        "Do not return the source text unchanged unless it is empty or only placeholders. "
+        "Preserve every placeholder (__TOK#, %s, %1$s, %d, \\n, \\t, \\r), bullet character (•), and their spacing exactly as provided. "
+    ),
 )
 
 
@@ -314,9 +338,12 @@ def translate_batch_gemini(
     target_lang: str,
     compact_prompt: bool,
     prompt_config: PromptConfig = DEFAULT_PROMPT_CONFIG,
+    force_translate: bool = False,
 ) -> List[str]:
 
-    prompt = prompt_config.build(batch, source_lang, target_lang, compact_prompt)
+    prompt = prompt_config.build(
+        batch, source_lang, target_lang, compact_prompt, force_translate=force_translate
+    )
 
     response = client.models.generate_content(
         model=DEFAULT_MODEL,
@@ -407,16 +434,39 @@ def translate_batch_with_retry(
 ) -> List[str]:
     attempt = 0
     last_partial: Optional[List[str]] = None
+    forced_once = False
+    force_translate = False
     while True:
         try:
-            return translate_batch_gemini(
+            translations = translate_batch_gemini(
                 client,
                 batch,
                 source,
                 target,
                 compact_prompt,
                 prompt_config=prompt_config,
+                force_translate=force_translate,
             )
+            unchanged = [
+                idx
+                for idx, (original, translated) in enumerate(zip(batch, translations))
+                if translated == original and ALPHABETIC_RE.search(original)
+            ]
+            if unchanged:
+                if forced_once:
+                    logging.warning(
+                        "Force translate prompt still returned %s unchanged item(s); accepting fallback.",
+                        len(unchanged),
+                    )
+                    return translations
+                logging.warning(
+                    "Detected %s untranslated item(s); retrying with force translate prompt.",
+                    len(unchanged),
+                )
+                forced_once = True
+                force_translate = True
+                continue
+            return translations
         except Exception as exc:
             attempt += 1
             partial = getattr(exc, "partial_translations", None)
@@ -511,12 +561,15 @@ def translate_strings(
         cached_value = cache.get(text)
 
         if cached_value and cached_value.strip():
-            # We already had a cached translation: reuse it everywhere and skip re-translation.
-            for idx in indexes_by_protected.get(text, []):
-                translations[idx] = restore_all_tokens(
-                    cached_value, token_maps[idx], phrase_maps[idx], original_texts[idx]
-                )
-            continue
+            if cached_value == text and ALPHABETIC_RE.search(text):
+                cached_value = None
+            else:
+                # We already had a cached translation: reuse it everywhere and skip re-translation.
+                for idx in indexes_by_protected.get(text, []):
+                    translations[idx] = restore_all_tokens(
+                        cached_value, token_maps[idx], phrase_maps[idx], original_texts[idx]
+                    )
+                continue
 
         # If there is no cache (or it is empty), register an entry and queue it for translation,
         # avoiding duplicates.
@@ -575,7 +628,14 @@ def translate_strings(
 
             # Store in cache and update main list
             for original, translated_item in zip(original_batch, translated_batch):
-                cache[original] = translated_item
+                is_noop_translation = (
+                    translated_item == original and ALPHABETIC_RE.search(original)
+                )
+                if is_noop_translation:
+                    logging.warning(
+                        "Translation identical to source; skipping cache for: %r", original
+                    )
+                cache[original] = "" if is_noop_translation else translated_item
                 for idx in indexes_by_protected.get(original, []):
                     translations[idx] = restore_all_tokens(
                         translated_item,
