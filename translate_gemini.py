@@ -401,7 +401,18 @@ def translate_batch_gemini(
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid JSON: {exc}. Received text: {cleaned_text[:120]}")
 
-    return reconcile_batch_length(batch, translations)
+    if not isinstance(translations, list):
+        raise ValueError(f"Non-list translation payload received: {type(translations)!r}")
+
+    if len(translations) != len(batch):
+        repaired = reconcile_batch_length(batch, translations)
+        mismatch_error = ValueError(
+            f"Length mismatch: Sent {len(batch)}, Received {len(translations)}"
+        )
+        setattr(mismatch_error, "partial_translations", repaired)
+        raise mismatch_error
+
+    return translations
 
 
 def is_retryable_error(exc: Exception) -> bool:
