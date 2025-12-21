@@ -41,6 +41,8 @@ DEFAULT_MAX_WORKERS = 8
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
 DEFAULT_SKIP_SYMBOL_CONTAINS = ["folder", "path", "dir", "directory"]
 DEFAULT_PROTECTED_TERMS = ["Age of Empires III: Wars of Liberty"]
+DEFAULT_ACRONYM_REGEX = re.compile(r"(?<!__)(XP)(?![A-Za-z])", re.IGNORECASE)
+DEFAULT_PROTECTED_REGEX = [DEFAULT_ACRONYM_REGEX]
 
 def target_is_spanish(target_lang: str) -> bool:
     tl = (target_lang or "").lower()
@@ -118,6 +120,8 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
         "DO NOT modernize or embellish the text. "
         "Keep all placeholders (__TOK#, %s, %1$s, %d, \n, \t) unchanged and in the same position. "
         "Treat any __PROTECT_x__ tokens as immutable placeholders. "
+        "Treat the gaming abbreviation \"XP\" as non-translatable; "
+        "it must remain exactly the same even when adjacent to numbers or symbols. "
         "If a string contains escaped newlines (\\n) or bullet characters (•), keep them exactly as written (do not convert \\n to real newlines). "
         "Do NOT merge, split, rephrase, or reorder strings. "
         "Ensure identical source strings receive identical translations. "
@@ -148,6 +152,7 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
     TECHNICAL RULES (STRICT)
     1. Do NOT translate, modify, reorder, or remove placeholders such as:
        __TOK#, %s, %1$s, %d, \n, \t, and __PROTECT_x__ tokens.
+    1.1 Treat the gaming abbreviation \"XP\" as immutable terminology. Do NOT translate or change its characters, even when it appears next to numbers or symbols or embedded inside longer words.
     2. Preserve literal escape sequences: keep \\n and similar sequences as-is (do NOT convert them to real newlines).
        Maintain bullet characters (•) and surrounding spacing exactly.
     3. Do NOT merge, split, expand, or rephrase strings.
@@ -258,6 +263,24 @@ def restore_protected_terms(
             return original_text
 
     return restored
+
+
+def enforce_acronym_integrity(original_text: str, candidate_text: str) -> str:
+    """Ensure the XP term stays exactly as in the source."""
+
+    matches = list(DEFAULT_ACRONYM_REGEX.finditer(original_text))
+    if not matches:
+        return candidate_text
+
+    for match in matches:
+        token = match.group(0)
+        expected = len(re.findall(re.escape(token), original_text, flags=re.IGNORECASE))
+        actual = len(re.findall(re.escape(token), candidate_text, flags=re.IGNORECASE))
+        if actual < expected:
+            logging.warning("Acronym '%s' missing or altered; restoring source text.", token)
+            return original_text
+
+    return candidate_text
 
 
 def restore_all_tokens(
@@ -594,7 +617,7 @@ def translate_strings(
     client = setup_gemini(api_key)
 
     protected_terms = protected_terms or []
-    protected_regex = protected_regex or []
+    protected_regex = list(DEFAULT_PROTECTED_REGEX) + (list(protected_regex) if protected_regex else [])
 
     protected: List[str] = []
     token_maps: List[Dict[str, str]] = []
@@ -651,6 +674,7 @@ def translate_strings(
                     cached_value, token_maps[idx], phrase_maps[idx], original_texts[idx]
                 )
                 restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
+                restored = enforce_acronym_integrity(original_texts[idx], restored)
                 translations[idx] = restored
             continue
 
@@ -728,6 +752,7 @@ def translate_strings(
                         original_texts[idx],
                     )
                     restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
+                    restored = enforce_acronym_integrity(original_texts[idx], restored)
                     translations[idx] = restored
 
             # Save partial progress (thread-safe because we are on the main thread)
