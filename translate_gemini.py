@@ -14,12 +14,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
-from concurrent.futures import (
-    FIRST_COMPLETED,
-    ThreadPoolExecutor,
-    TimeoutError,
-    wait,
-)
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from google import genai
 from google.genai import types
@@ -30,8 +25,8 @@ DEFAULT_MODEL = "gemini-2.5-flash"
 DEFAULT_SOURCE_LANG = "English"
 DEFAULT_TARGET_LANG = "Latin American Spanish"
 
-# Keep medium-size batches for speed while avoiding oversized responses.
-MAX_BUDGET_BYTES = 3500
+# Keep medium-size batches for speed
+MAX_BUDGET_BYTES = 4500
 
 # Number of batches that will be translated concurrently.
 # Eight workers are fast and safe for paid accounts.
@@ -42,8 +37,6 @@ BACKOFF_MAX_SECONDS = 30.0
 # Use the compact prompt by default to reduce tokens without losing core rules.
 DEFAULT_COMPACT_PROMPT = True
 DEFAULT_MAX_WORKERS = 8
-BATCH_HEARTBEAT_SECONDS = 20.0
-BATCH_TIMEOUT_SECONDS = 120.0
 
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
 DEFAULT_SKIP_SYMBOL_CONTAINS = ["folder", "path", "dir", "directory"]
@@ -136,7 +129,6 @@ class TranslationTarget:
     element: ET.Element
     text: str
     symbol: Optional[str]
-    locid: Optional[str]
     skip: bool
     reason: Optional[str] = None
 
@@ -273,30 +265,69 @@ def detect_newline(content: str) -> str:
     return "\r\n" if "\r\n" in content else "\n"
 
 
-def neutralize_escape_sequences(text: str) -> str:
-    return (
-        text.replace("\\n", "__NL__")
-        .replace("\\t", "__TAB__")
-        .replace("\\r", "__CR__")
-    )
-
-
 def is_path_like_text(text: str) -> bool:
+    """Heuristic: detect strings that are *primarily* filesystem paths.
+
+    Important: Many WoL strings contain literal escape sequences (\n, \t, ...),
+    and/or escaped UI markup like &lt;icon="(58)(WoL\\ui\\...)"&gt; which includes
+    backslashes. Those must NOT trigger the path heuristic, or we'd incorrectly
+    skip real translatable text.
+    """
     if not text:
         return False
-    stripped = neutralize_escape_sequences(text).strip()
+
+    stripped = text.strip()
     if not stripped:
         return False
-    windows_drive = re.compile(r"^[A-Za-z]:[\\/](?:[^\\/\r\n]+[\\/])*[^\\/\r\n]+[\\/]?$")
-    if windows_drive.match(stripped):
+
+    # Remove escaped markup blocks (common in WoL UI strings).
+    # Example: &lt;icon="(58)(WoL\\ui\\...)"&gt; ... &lt;/font&gt;
+    cleaned = re.sub(r"&lt;.*?&gt;", "", stripped)
+
+    # Neutralize common escape sequences so they don't look like backslash paths.
+    cleaned = cleaned.replace("\n", " ").replace("\t", " ").replace("\r", " ").strip()
+    if not cleaned:
+        return False
+
+    # Drive letter / UNC paths.
+    if re.match(r"^[a-zA-Z]:[\\/]", cleaned):
+        return True
+    if cleaned.startswith("\\"):
         return True
 
-    unc_path = re.compile(r"^\\\\[^\\/\r\n]+[\\/][^\\/\r\n]+(?:[\\/][^\\/\r\n]+)*[\\/]?$")
-    if unc_path.match(stripped):
+    # If it looks like a sentence, it's not a path.
+    # (Paths usually don't contain sentence punctuation.)
+    if re.search(r"[.;!?]", cleaned):
+        return False
+
+    # If it contains printf-style placeholders, it is likely gameplay text, not a path.
+    if re.search(r"%\d*\$?[sdif]", cleaned):
+        return False
+
+    # Must contain a separator to be considered a path.
+    if ("\\" not in cleaned) and ("/" not in cleaned):
+        return False
+
+    # If it's extremely long, it's almost certainly UI/help text with embedded markup.
+    if len(cleaned) > 160:
+        return False
+
+    # Disallow characters that are very uncommon in paths and common in markup/text.
+    if re.search(r'[<>"|?*]', cleaned):
+        return False
+
+    sep_count = cleaned.count("\\") + cleaned.count("/")
+    if sep_count >= 2:
+        return True
+    if cleaned.endswith("\\") or cleaned.endswith("/"):
         return True
 
-    folder_segments = re.compile(r"(?:[\\/][A-Za-z0-9][^\\/\r\n]*){2,}[\\/]?")
-    return bool(folder_segments.search(stripped))
+    # Minimal path pattern like: "My Games\Wars of Liberty" (may contain spaces).
+    if re.match(r"^[\w\s\-\.\(\)]+[\\/][\w\s\-\.\(\)]+(?:[\\/][\w\s\-\.\(\)]+)*[\\/]?$", cleaned):
+        return True
+
+    return False
+
 
 def yield_batches(strings: Iterable[str], max_budget_bytes: int, max_items: int = 50) -> Iterator[List[str]]:
     batch: List[str] = []
@@ -321,14 +352,6 @@ def clean_json_response(text: str) -> str:
     if text.endswith("```"):
         text = text[:-3]
     return text.strip()
-
-
-class LengthMismatchError(ValueError):
-    """Raised when the model returns a JSON list with an unexpected length."""
-
-    def __init__(self, message: str, partial_translations: Sequence[str]):
-        super().__init__(message)
-        self.partial_translations = list(partial_translations)
 
 
 def reconcile_batch_length(batch: Sequence[str], translations: Sequence[str]) -> List[str]:
@@ -417,19 +440,7 @@ def translate_batch_gemini(
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid JSON: {exc}. Received text: {cleaned_text[:120]}")
 
-    if not isinstance(translations, list):
-        raise ValueError(f"Non-list translation payload received: {type(translations)!r}")
-
-    if len(translations) != len(batch):
-        repaired = reconcile_batch_length(batch, translations)
-        logging.warning(
-            "Length mismatch repaired inline: Sent %s, Received %s",
-            len(batch),
-            len(translations),
-        )
-        raise LengthMismatchError("Length mismatch", repaired)
-
-    return translations
+    return reconcile_batch_length(batch, translations)
 
 
 def is_retryable_error(exc: Exception) -> bool:
@@ -606,10 +617,8 @@ def translate_strings(
     # --- PARALLEL PROCESSING ---
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Launch all tasks
-        future_to_batch_idx = {}
-        start_times: Dict[object, float] = {}
-        for idx, batch in batch_map.items():
-            future = executor.submit(
+        future_to_batch_idx = {
+            executor.submit(
                 translate_batch_with_retry,
                 client,
                 batch,
@@ -618,118 +627,51 @@ def translate_strings(
                 max_retries,
                 compact_prompt,
                 prompt_config,
-            )
-            future_to_batch_idx[future] = idx
-            start_times[future] = time.time()
+            ): idx
+            for idx, batch in batch_map.items()
+        }
 
-        pending = set(future_to_batch_idx.keys())
-        progress_bar = tqdm(
+        # Process tasks as they complete
+        for future in tqdm(
+            as_completed(future_to_batch_idx),
             total=total_batches,
             desc="Translating in Parallel",
             unit="batch",
-        )
+        ):
+            batch_idx = future_to_batch_idx[future]
+            original_batch = batch_map[batch_idx]
 
-        while pending:
-            done, pending = wait(
-                pending,
-                timeout=BATCH_HEARTBEAT_SECONDS,
-                return_when=FIRST_COMPLETED,
-            )
-
-            if not done:
-                logging.warning(
-                    "Heartbeat: %s batch(es) still running without new completions.",
-                    len(pending),
+            try:
+                translated_batch = future.result()
+            except Exception as exc:
+                logging.error(
+                    "Unhandled thread exception (batch %s, %s items): %s",
+                    batch_idx,
+                    len(original_batch),
+                    exc,
                 )
-                now = time.time()
-                for future in list(pending):
-                    elapsed = now - start_times.get(future, now)
-                    if elapsed > BATCH_TIMEOUT_SECONDS:
-                        batch_idx = future_to_batch_idx.get(future, -1)
-                        logging.error(
-                            "Batch %s stalled for %.1f seconds; cancelling and retrying.",
-                            batch_idx,
-                            elapsed,
-                        )
-                        future.cancel()
-                        future_to_batch_idx.pop(future, None)
-                        start_times.pop(future, None)
-                        pending.discard(future)
-                        new_future = executor.submit(
-                            translate_batch_with_retry,
-                            client,
-                            batch_map[batch_idx],
-                            source_lang,
-                            target_lang,
-                            max_retries,
-                            compact_prompt,
-                            prompt_config,
-                        )
-                        future_to_batch_idx[new_future] = batch_idx
-                        start_times[new_future] = time.time()
-                        pending.add(new_future)
-                continue
+                translated_batch = original_batch  # Fallback
 
-            for future in done:
-                batch_idx = future_to_batch_idx.pop(future)
-                start_times.pop(future, None)
-                original_batch = batch_map[batch_idx]
+            # Store in cache and update main list
+            for original, translated_item in zip(original_batch, translated_batch):
+                cache[original] = translated_item
+                for idx in indexes_by_protected.get(original, []):
+                    translations[idx] = restore_all_tokens(
+                        translated_item,
+                        token_maps[idx],
+                        phrase_maps[idx],
+                        original_texts[idx],
+                    )
 
+            # Save partial progress (thread-safe because we are on the main thread)
+            if cache_path:
                 try:
-                    translated_batch = future.result(timeout=BATCH_TIMEOUT_SECONDS)
-                except TimeoutError:
-                    logging.error(
-                        "Batch %s exceeded timeout of %.1f seconds; retrying.",
-                        batch_idx,
-                        BATCH_TIMEOUT_SECONDS,
-                    )
-                    new_future = executor.submit(
-                        translate_batch_with_retry,
-                        client,
-                        original_batch,
-                        source_lang,
-                        target_lang,
-                        max_retries,
-                        compact_prompt,
-                        prompt_config,
-                    )
-                    future_to_batch_idx[new_future] = batch_idx
-                    start_times[new_future] = time.time()
-                    pending.add(new_future)
-                    continue
+                    cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
                 except Exception as exc:
-                    logging.error(
-                        "Unhandled thread exception (batch %s, %s items): %s",
-                        batch_idx,
-                        len(original_batch),
-                        exc,
-                    )
-                    translated_batch = original_batch  # Fallback
+                    logging.warning("Could not persist cache for batch %s: %s", batch_idx, exc)
 
-                # Store in cache and update main list
-                for original, translated_item in zip(original_batch, translated_batch):
-                    cache[original] = translated_item
-                    for idx in indexes_by_protected.get(original, []):
-                        translations[idx] = restore_all_tokens(
-                            translated_item,
-                            token_maps[idx],
-                            phrase_maps[idx],
-                            original_texts[idx],
-                        )
-
-                # Save partial progress (thread-safe because we are on the main thread)
-                if cache_path:
-                    try:
-                        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-                    except Exception as exc:
-                        logging.warning("Could not persist cache for batch %s: %s", batch_idx, exc)
-
-                if progress_callback:
-                    progress_callback(list(translations))
-
-                progress_bar.update(1)
-
-        progress_bar.close()
+            if progress_callback:
+                progress_callback(list(translations))
 
     return translations
 
@@ -803,22 +745,10 @@ def iter_translatable_elements(root: ET.Element, skip_rules: SkipRules) -> Itera
 
     def build_target(elem: ET.Element) -> TranslationTarget:
         skip, reason = should_skip_element(elem, skip_rules)
-        locid = elem.attrib.get("locid")
-        symbol = elem.attrib.get("symbol")
-        if skip:
-            preview = (elem.text or "")[:80]
-            logging.debug(
-                "Skipping element locid=%s symbol=%s reason=%s preview=%s",
-                locid,
-                symbol,
-                reason,
-                preview,
-            )
         return TranslationTarget(
             element=elem,
             text=elem.text or "",
-            symbol=symbol,
-            locid=locid,
+            symbol=elem.attrib.get("symbol"),
             skip=skip,
             reason=reason,
         )
