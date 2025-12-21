@@ -406,11 +406,12 @@ def translate_batch_gemini(
 
     if len(translations) != len(batch):
         repaired = reconcile_batch_length(batch, translations)
-        mismatch_error = ValueError(
-            f"Length mismatch: Sent {len(batch)}, Received {len(translations)}"
+        logging.warning(
+            "Length mismatch repaired inline: Sent %s, Received %s",
+            len(batch),
+            len(translations),
         )
-        setattr(mismatch_error, "partial_translations", repaired)
-        raise mismatch_error
+        return repaired
 
     return translations
 
