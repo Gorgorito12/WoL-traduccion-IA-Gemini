@@ -48,6 +48,7 @@ BATCH_TIMEOUT_SECONDS = 120.0
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
 DEFAULT_SKIP_SYMBOL_CONTAINS = ["folder", "path", "dir", "directory"]
 DEFAULT_PROTECTED_TERMS = ["Age of Empires III: Wars of Liberty"]
+DEFAULT_PROTECTED_REGEX_PATTERNS = [r"<[^>]+>"]
 
 
 @dataclass(frozen=True)
@@ -287,6 +288,31 @@ def is_path_like_text(text: str) -> bool:
     stripped = neutralize_escape_sequences(text).strip()
     if not stripped:
         return False
+
+    if "<" in stripped or ">" in stripped or "&lt;" in stripped.lower() or "&gt;" in stripped.lower():
+        return False
+
+    def _trim_wrappers(value: str) -> str:
+        cleaned = value.strip().rstrip(".;,")
+        wrappers = [("(", ")"), ("[", "]"), ("{", "}")]
+        changed = True
+        while changed and len(cleaned) >= 2:
+            changed = False
+            if cleaned[0] == cleaned[-1] and cleaned[0] in "\"'`":
+                cleaned = cleaned[1:-1].strip().rstrip(".;,")
+                changed = True
+                continue
+            for start, end in wrappers:
+                if cleaned.startswith(start) and cleaned.endswith(end):
+                    cleaned = cleaned[1:-1].strip().rstrip(".;,")
+                    changed = True
+                    break
+        return cleaned
+
+    stripped = _trim_wrappers(stripped)
+    if not stripped:
+        return False
+
     windows_drive = re.compile(r"^[A-Za-z]:[\\/](?:[^\\/\r\n]+[\\/])*[^\\/\r\n]+[\\/]?$")
     if windows_drive.match(stripped):
         return True
@@ -295,8 +321,26 @@ def is_path_like_text(text: str) -> bool:
     if unc_path.match(stripped):
         return True
 
-    folder_segments = re.compile(r"(?:[\\/][A-Za-z0-9][^\\/\r\n]*){2,}[\\/]?")
-    return bool(folder_segments.search(stripped))
+    # Reject obvious non-path sentences that merely contain slashes.
+    path_characters_only = re.compile(r"^[A-Za-z0-9 _\-./\\]+$")
+    if not path_characters_only.match(stripped):
+        return False
+
+    unix_absolute = re.compile(r"^/(?:[^\\/\r\n]+/)+[^\\/\r\n]*$")
+    if unix_absolute.match(stripped):
+        return True
+
+    relative_with_prefix = re.compile(r"^(?:\.{1,2}[\\/]|~?/)(?:[^\\/\r\n]+[\\/])+[^\\/\r\n]*$")
+    if relative_with_prefix.match(stripped):
+        return True
+
+    segments = [segment for segment in re.split(r"[\\/]+", stripped) if segment]
+    if len(segments) < 2 or " " in stripped:
+        return False
+
+    has_extension = "." in segments[-1] and not segments[-1].startswith(".")
+    multiple_separators = len(re.findall(r"[\\/]+", stripped)) >= 2
+    return bool(has_extension or multiple_separators)
 
 def yield_batches(strings: Iterable[str], max_budget_bytes: int, max_items: int = 50) -> Iterator[List[str]]:
     batch: List[str] = []
@@ -1076,7 +1120,10 @@ def main() -> None:
     protected_terms = list(DEFAULT_PROTECTED_TERMS)
     if args.protect:
         protected_terms.extend(args.protect)
-    protected_regex = compile_regex_list(args.protect_regex)
+    regex_patterns = list(DEFAULT_PROTECTED_REGEX_PATTERNS)
+    if args.protect_regex:
+        regex_patterns.extend(args.protect_regex)
+    protected_regex = compile_regex_list(regex_patterns)
 
     if not args.input.exists():
         raise SystemExit(f"File does not exist: {args.input}")
