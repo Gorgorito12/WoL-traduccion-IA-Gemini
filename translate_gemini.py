@@ -38,9 +38,15 @@ BACKOFF_MAX_SECONDS = 30.0
 DEFAULT_COMPACT_PROMPT = True
 DEFAULT_MAX_WORKERS = 8
 
-PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
+PLACEHOLDER_RE = re.compile(r"(?:%%|%(?:\d+\$)?[sdif]|%\d+[sdif]|\\[ntr])")
 DEFAULT_SKIP_SYMBOL_CONTAINS = ["folder", "path", "dir", "directory"]
-DEFAULT_PROTECTED_TERMS = ["Age of Empires III: Wars of Liberty"]
+DEFAULT_PROTECTED_TERMS = [
+    "Age of Empires III: Wars of Liberty",
+    "My Games",
+]
+DEFAULT_PROTECTED_REGEX_PATTERNS = [
+    r"(?i)^current\s+version\s*:\s*\d+(?:\.\d+)+(?:[a-z])?\b",
+]
 
 
 @dataclass(frozen=True)
@@ -114,6 +120,16 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
     """,
 )
 
+STRICT_ESCAPE_PROMPT_CONFIG = PromptConfig(
+    compact_template=(
+        DEFAULT_PROMPT_CONFIG.compact_template
+        + " Ensure escaped sequences (\\n, \\t, \\r) remain escaped text, never real newlines. Preserve bullet characters (•) verbatim."
+    ),
+    detailed_template=(
+        DEFAULT_PROMPT_CONFIG.detailed_template
+        + "\nADDITIONAL STRICTNESS:\n- Do not change the count or position of escaped sequences (\\n, \\t, \\r).\n- Do not remove or add bullet characters (•). Keep spacing identical around them.\n"
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -221,6 +237,48 @@ def restore_all_tokens(
     restored = unprotect_tokens(text, placeholder_map)
     restored = restore_protected_terms(restored, protected_map, original_text)
     return restored
+
+def extract_token_sequence(text: str) -> List[str]:
+    return re.findall(r"__TOK\d+__|__PROTECT_\d+__", text)
+
+def validate_translation_output(
+    original_protected: str,
+    translated_protected: str,
+    original_text: str,
+    placeholder_map: Dict[str, str],
+    phrase_map: Dict[str, str],
+) -> Tuple[bool, str, str]:
+    orig_tokens = extract_token_sequence(original_protected)
+    translated_tokens = extract_token_sequence(translated_protected)
+    if orig_tokens != translated_tokens:
+        return False, original_text, "token-order-mismatch"
+
+    restored = restore_all_tokens(
+        translated_protected, placeholder_map, phrase_map, original_text
+    )
+
+    def count_literal_newlines(text: str) -> int:
+        return text.count("\\n")
+
+    orig_literal_newlines = count_literal_newlines(original_text)
+    translated_literal_newlines = count_literal_newlines(restored)
+    if orig_literal_newlines != translated_literal_newlines:
+        return False, restored, "escaped-newline-mismatch"
+
+    orig_real_newlines = original_text.count("\n")
+    translated_real_newlines = restored.count("\n")
+    if orig_literal_newlines > 0 and orig_real_newlines == 0 and translated_real_newlines > 0:
+        return False, restored, "real-newline-introduced"
+
+    orig_bullets = original_text.count("•")
+    translated_bullets = restored.count("•")
+    if orig_bullets != translated_bullets:
+        return False, restored, "bullet-mismatch"
+
+    if restored == original_text and re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", original_text):
+        return False, restored, "unchanged-with-letters"
+
+    return True, restored, "ok"
 
 
 def compile_regex_list(patterns: Optional[Sequence[str]]) -> List[re.Pattern[str]]:
@@ -461,6 +519,7 @@ def translate_strings(
 
     protected_terms = protected_terms or []
     protected_regex = protected_regex or []
+    retry_log: List[Dict[str, str]] = []
 
     protected: List[str] = []
     token_maps: List[Dict[str, str]] = []
@@ -468,6 +527,7 @@ def translate_strings(
     original_texts: List[str] = []
     translations: List[str] = []
     indexes_by_protected: Dict[str, List[int]] = {}
+    meta_by_protected: Dict[str, Dict[str, object]] = {}
 
     cache: Dict[str, str] = {}
     if cache_path and cache_path.exists():
@@ -484,6 +544,14 @@ def translate_strings(
         token_maps.append(token_map)
         phrase_maps.append(phrase_map)
         original_texts.append(inner)
+        meta_by_protected.setdefault(
+            protected_text,
+            {
+                "placeholder_map": token_map,
+                "phrase_map": phrase_map,
+                "original_text": inner,
+            },
+        )
 
         initial_translation = inner
         if existing_translations and idx < len(existing_translations):
@@ -511,12 +579,29 @@ def translate_strings(
         cached_value = cache.get(text)
 
         if cached_value and cached_value.strip():
-            # We already had a cached translation: reuse it everywhere and skip re-translation.
-            for idx in indexes_by_protected.get(text, []):
-                translations[idx] = restore_all_tokens(
-                    cached_value, token_maps[idx], phrase_maps[idx], original_texts[idx]
+            meta = meta_by_protected[text]
+            valid, restored_cache, reason = validate_translation_output(
+                text,
+                cached_value,
+                meta["original_text"],  # type: ignore[arg-type]
+                meta["placeholder_map"],  # type: ignore[arg-type]
+                meta["phrase_map"],  # type: ignore[arg-type]
+            )
+            if valid:
+                for idx in indexes_by_protected.get(text, []):
+                    translations[idx] = restore_all_tokens(
+                        cached_value, token_maps[idx], phrase_maps[idx], original_texts[idx]
+                    )
+                continue
+            else:
+                retry_log.append(
+                    {
+                        "text": meta["original_text"],  # type: ignore[assignment]
+                        "reason": f"invalid-cache-{reason}",
+                        "outcome": "retry",
+                    }
                 )
-            continue
+                cache[text] = ""
 
         # If there is no cache (or it is empty), register an entry and queue it for translation,
         # avoiding duplicates.
@@ -526,73 +611,128 @@ def translate_strings(
             already_enqueued.add(text)
             unique_to_translate.append(text)
 
-    # Build all batches
-    batches = list(yield_batches(unique_to_translate, max_budget_bytes))
-
-    # Map to sort results: {batch_index: [original_texts]}
-    batch_map = {i: batch for i, batch in enumerate(batches)}
-    total_batches = len(batches)
-
-    print(f"🚀 Starting MULTITHREAD engine: {max_workers} concurrent workers...")
-
-    # --- PARALLEL PROCESSING ---
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Launch all tasks
-        future_to_batch_idx = {
-            executor.submit(
-                translate_batch_with_retry,
-                client,
-                batch,
-                source_lang,
-                target_lang,
-                max_retries,
-                compact_prompt,
-                prompt_config,
-            ): idx
-            for idx, batch in batch_map.items()
-        }
-
-        # Process tasks as they complete
-        for future in tqdm(
-            as_completed(future_to_batch_idx),
-            total=total_batches,
-            desc="Translating in Parallel",
-            unit="batch",
-        ):
-            batch_idx = future_to_batch_idx[future]
-            original_batch = batch_map[batch_idx]
-
+    def persist_cache() -> None:
+        if cache_path:
             try:
-                translated_batch = future.result()
+                cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
             except Exception as exc:
-                logging.error(
-                    "Unhandled thread exception (batch %s, %s items): %s",
-                    batch_idx,
-                    len(original_batch),
-                    exc,
-                )
-                translated_batch = original_batch  # Fallback
+                logging.warning("Could not persist cache: %s", exc)
 
-            # Store in cache and update main list
-            for original, translated_item in zip(original_batch, translated_batch):
-                cache[original] = translated_item
-                for idx in indexes_by_protected.get(original, []):
-                    translations[idx] = restore_all_tokens(
-                        translated_item,
-                        token_maps[idx],
-                        phrase_maps[idx],
-                        original_texts[idx],
-                    )
+    def apply_validated_translation(protected_key: str, translated_protected: str) -> None:
+        cache[protected_key] = translated_protected
+        for idx in indexes_by_protected.get(protected_key, []):
+            translations[idx] = restore_all_tokens(
+                translated_protected,
+                token_maps[idx],
+                phrase_maps[idx],
+                original_texts[idx],
+            )
 
-            # Save partial progress (thread-safe because we are on the main thread)
-            if cache_path:
+    def run_stage(pending: List[str], compact: bool, cfg: PromptConfig, stage_name: str) -> List[str]:
+        if not pending:
+            return []
+        batches = list(yield_batches(pending, max_budget_bytes))
+        batch_map = {i: batch for i, batch in enumerate(batches)}
+        total_batches = len(batches)
+
+        failures: List[str] = []
+        print(f"🚀 Starting MULTITHREAD engine ({stage_name}): {max_workers} concurrent workers...")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_batch_idx = {
+                executor.submit(
+                    translate_batch_with_retry,
+                    client,
+                    batch,
+                    source_lang,
+                    target_lang,
+                    max_retries,
+                    compact,
+                    cfg,
+                ): idx
+                for idx, batch in batch_map.items()
+            }
+
+            for future in tqdm(
+                as_completed(future_to_batch_idx),
+                total=total_batches,
+                desc=f"Translating ({stage_name})",
+                unit="batch",
+            ):
+                batch_idx = future_to_batch_idx[future]
+                original_batch = batch_map[batch_idx]
                 try:
-                    cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+                    translated_batch = future.result()
                 except Exception as exc:
-                    logging.warning("Could not persist cache for batch %s: %s", batch_idx, exc)
+                    logging.error(
+                        "Unhandled thread exception (batch %s, %s items): %s",
+                        batch_idx,
+                        len(original_batch),
+                        exc,
+                    )
+                    translated_batch = original_batch
 
-            if progress_callback:
-                progress_callback(list(translations))
+                for original, translated_item in zip(original_batch, translated_batch):
+                    meta = meta_by_protected[original]
+                    success, restored, reason = validate_translation_output(
+                        original,
+                        translated_item,
+                        meta["original_text"],  # type: ignore[arg-type]
+                        meta["placeholder_map"],  # type: ignore[arg-type]
+                        meta["phrase_map"],  # type: ignore[arg-type]
+                    )
+                    if success:
+                        apply_validated_translation(original, translated_item)
+                    else:
+                        failures.append(original)
+                        retry_log.append(
+                            {
+                                "text": meta["original_text"],  # type: ignore[assignment]
+                                "reason": reason,
+                                "stage": stage_name,
+                                "attempted": restored,
+                                "outcome": "retry",
+                            }
+                        )
+                persist_cache()
+                if progress_callback:
+                    progress_callback(list(translations))
+        return failures
+
+    prompt_plan: List[Tuple[str, bool, PromptConfig]] = [("primary", compact_prompt, prompt_config)]
+    if compact_prompt:
+        prompt_plan.append(("strict", False, STRICT_ESCAPE_PROMPT_CONFIG))
+    else:
+        prompt_plan.append(("strict", False, STRICT_ESCAPE_PROMPT_CONFIG))
+
+    pending_items = list(unique_to_translate)
+    for stage_name, compact_flag, cfg in prompt_plan:
+        pending_items = run_stage(pending_items, compact_flag, cfg, stage_name)
+        if not pending_items:
+            break
+
+    if pending_items:
+        for original in pending_items:
+            meta = meta_by_protected[original]
+            retry_log.append(
+                {
+                    "text": meta["original_text"],  # type: ignore[assignment]
+                    "reason": "exhausted-retries",
+                    "stage": "fallback",
+                    "outcome": "fallback-original",
+                }
+            )
+            cache[original] = ""
+            for idx in indexes_by_protected.get(original, []):
+                translations[idx] = original_texts[idx]
+        persist_cache()
+        if progress_callback:
+            progress_callback(list(translations))
+
+    if retry_log:
+        try:
+            print("🧪 Retry report:", json.dumps(retry_log, ensure_ascii=False, indent=2))
+        except Exception as exc:
+            logging.warning("Could not print retry report: %s", exc)
 
     return translations
 
@@ -927,7 +1067,9 @@ def main() -> None:
     protected_terms = list(DEFAULT_PROTECTED_TERMS)
     if args.protect:
         protected_terms.extend(args.protect)
-    protected_regex = compile_regex_list(args.protect_regex)
+    protected_regex = compile_regex_list(
+        list(DEFAULT_PROTECTED_REGEX_PATTERNS) + args.protect_regex
+    )
 
     if not args.input.exists():
         raise SystemExit(f"File does not exist: {args.input}")
