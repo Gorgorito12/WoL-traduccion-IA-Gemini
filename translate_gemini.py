@@ -14,7 +14,12 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ThreadPoolExecutor,
+    TimeoutError,
+    wait,
+)
 
 from google import genai
 from google.genai import types
@@ -37,6 +42,8 @@ BACKOFF_MAX_SECONDS = 30.0
 # Use the compact prompt by default to reduce tokens without losing core rules.
 DEFAULT_COMPACT_PROMPT = True
 DEFAULT_MAX_WORKERS = 8
+BATCH_HEARTBEAT_SECONDS = 20.0
+BATCH_TIMEOUT_SECONDS = 120.0
 
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
 DEFAULT_SKIP_SYMBOL_CONTAINS = ["folder", "path", "dir", "directory"]
@@ -571,8 +578,10 @@ def translate_strings(
     # --- PARALLEL PROCESSING ---
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Launch all tasks
-        future_to_batch_idx = {
-            executor.submit(
+        future_to_batch_idx = {}
+        start_times: Dict[object, float] = {}
+        for idx, batch in batch_map.items():
+            future = executor.submit(
                 translate_batch_with_retry,
                 client,
                 batch,
@@ -581,51 +590,118 @@ def translate_strings(
                 max_retries,
                 compact_prompt,
                 prompt_config,
-            ): idx
-            for idx, batch in batch_map.items()
-        }
+            )
+            future_to_batch_idx[future] = idx
+            start_times[future] = time.time()
 
-        # Process tasks as they complete
-        for future in tqdm(
-            as_completed(future_to_batch_idx),
+        pending = set(future_to_batch_idx.keys())
+        progress_bar = tqdm(
             total=total_batches,
             desc="Translating in Parallel",
             unit="batch",
-        ):
-            batch_idx = future_to_batch_idx[future]
-            original_batch = batch_map[batch_idx]
+        )
 
-            try:
-                translated_batch = future.result()
-            except Exception as exc:
-                logging.error(
-                    "Unhandled thread exception (batch %s, %s items): %s",
-                    batch_idx,
-                    len(original_batch),
-                    exc,
+        while pending:
+            done, pending = wait(
+                pending,
+                timeout=BATCH_HEARTBEAT_SECONDS,
+                return_when=FIRST_COMPLETED,
+            )
+
+            if not done:
+                logging.warning(
+                    "Heartbeat: %s batch(es) still running without new completions.",
+                    len(pending),
                 )
-                translated_batch = original_batch  # Fallback
+                now = time.time()
+                for future in list(pending):
+                    elapsed = now - start_times.get(future, now)
+                    if elapsed > BATCH_TIMEOUT_SECONDS:
+                        batch_idx = future_to_batch_idx.get(future, -1)
+                        logging.error(
+                            "Batch %s stalled for %.1f seconds; cancelling and retrying.",
+                            batch_idx,
+                            elapsed,
+                        )
+                        future.cancel()
+                        future_to_batch_idx.pop(future, None)
+                        start_times.pop(future, None)
+                        pending.discard(future)
+                        new_future = executor.submit(
+                            translate_batch_with_retry,
+                            client,
+                            batch_map[batch_idx],
+                            source_lang,
+                            target_lang,
+                            max_retries,
+                            compact_prompt,
+                            prompt_config,
+                        )
+                        future_to_batch_idx[new_future] = batch_idx
+                        start_times[new_future] = time.time()
+                        pending.add(new_future)
+                continue
 
-            # Store in cache and update main list
-            for original, translated_item in zip(original_batch, translated_batch):
-                cache[original] = translated_item
-                for idx in indexes_by_protected.get(original, []):
-                    translations[idx] = restore_all_tokens(
-                        translated_item,
-                        token_maps[idx],
-                        phrase_maps[idx],
-                        original_texts[idx],
-                    )
+            for future in done:
+                batch_idx = future_to_batch_idx.pop(future)
+                start_times.pop(future, None)
+                original_batch = batch_map[batch_idx]
 
-            # Save partial progress (thread-safe because we are on the main thread)
-            if cache_path:
                 try:
-                    cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+                    translated_batch = future.result(timeout=BATCH_TIMEOUT_SECONDS)
+                except TimeoutError:
+                    logging.error(
+                        "Batch %s exceeded timeout of %.1f seconds; retrying.",
+                        batch_idx,
+                        BATCH_TIMEOUT_SECONDS,
+                    )
+                    new_future = executor.submit(
+                        translate_batch_with_retry,
+                        client,
+                        original_batch,
+                        source_lang,
+                        target_lang,
+                        max_retries,
+                        compact_prompt,
+                        prompt_config,
+                    )
+                    future_to_batch_idx[new_future] = batch_idx
+                    start_times[new_future] = time.time()
+                    pending.add(new_future)
+                    continue
                 except Exception as exc:
-                    logging.warning("Could not persist cache for batch %s: %s", batch_idx, exc)
+                    logging.error(
+                        "Unhandled thread exception (batch %s, %s items): %s",
+                        batch_idx,
+                        len(original_batch),
+                        exc,
+                    )
+                    translated_batch = original_batch  # Fallback
 
-            if progress_callback:
-                progress_callback(list(translations))
+                # Store in cache and update main list
+                for original, translated_item in zip(original_batch, translated_batch):
+                    cache[original] = translated_item
+                    for idx in indexes_by_protected.get(original, []):
+                        translations[idx] = restore_all_tokens(
+                            translated_item,
+                            token_maps[idx],
+                            phrase_maps[idx],
+                            original_texts[idx],
+                        )
+
+                # Save partial progress (thread-safe because we are on the main thread)
+                if cache_path:
+                    try:
+                        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+                    except Exception as exc:
+                        logging.warning("Could not persist cache for batch %s: %s", batch_idx, exc)
+
+                if progress_callback:
+                    progress_callback(list(translations))
+
+                progress_bar.update(1)
+
+        progress_bar.close()
 
     return translations
 
