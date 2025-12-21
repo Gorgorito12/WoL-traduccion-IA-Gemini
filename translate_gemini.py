@@ -30,8 +30,8 @@ DEFAULT_MODEL = "gemini-2.5-flash"
 DEFAULT_SOURCE_LANG = "English"
 DEFAULT_TARGET_LANG = "Latin American Spanish"
 
-# Keep medium-size batches for speed
-MAX_BUDGET_BYTES = 4500
+# Keep medium-size batches for speed while avoiding oversized responses.
+MAX_BUDGET_BYTES = 3500
 
 # Number of batches that will be translated concurrently.
 # Eight workers are fast and safe for paid accounts.
@@ -315,6 +315,14 @@ def clean_json_response(text: str) -> str:
     return text.strip()
 
 
+class LengthMismatchError(ValueError):
+    """Raised when the model returns a JSON list with an unexpected length."""
+
+    def __init__(self, message: str, partial_translations: Sequence[str]):
+        super().__init__(message)
+        self.partial_translations = list(partial_translations)
+
+
 def reconcile_batch_length(batch: Sequence[str], translations: Sequence[str]) -> List[str]:
     """Force the translations list to match the batch size.
 
@@ -411,7 +419,7 @@ def translate_batch_gemini(
             len(batch),
             len(translations),
         )
-        return repaired
+        raise LengthMismatchError("Length mismatch", repaired)
 
     return translations
 
