@@ -41,16 +41,50 @@ DEFAULT_MAX_WORKERS = 8
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
 DEFAULT_SKIP_SYMBOL_CONTAINS = ["folder", "path", "dir", "directory"]
 DEFAULT_PROTECTED_TERMS = ["Age of Empires III: Wars of Liberty"]
-DEFAULT_PROTECTED_REGEX = [
-    r"\bXP\b",
-    r"\bHP\b",
-    r"\bMP\b",
-    r"\bDPS\b",
-    r"\bPvP\b",
-    r"\bPvE\b",
-    r"\bGG\b",
-    r"\bMVP\b",
-]
+
+def target_is_spanish(target_lang: str) -> bool:
+    tl = (target_lang or "").lower()
+    return ("spanish" in tl) or ("español" in tl) or ("espanol" in tl)
+
+def terminology_overrides_for_target(target_lang: str) -> str:
+    """Extra instructions appended to the prompt, only when needed.
+
+    Keep this language-conditional so the script remains global (multi-language).
+    """
+    if target_is_spanish(target_lang):
+        return (
+            "TERMINOLOGY OVERRIDES (apply ONLY when target language is Spanish)\n"
+            "- Translate 'Home City' as 'Metrópoli'.\n"
+            "- Translate 'Home Cities' as 'Metrópolis'.\n"
+            "- If 'Home City' appears inside a longer sentence, still render it as 'Metrópoli/Metrópolis'.\n"
+        )
+    return ""
+
+def apply_postprocess_overrides(original_text: str, translated_text: str, target_lang: str) -> str:
+    """Last-mile fixes that must be *conditional on the target language*.
+
+    This prevents Spanish-specific decisions from leaking into other targets like Portuguese.
+    """
+    if not target_is_spanish(target_lang):
+        return translated_text
+
+    # Only enforce if the SOURCE contains the Home City term(s) (so we don't break unrelated 'ciudad natal').
+    src_has_plural = re.search(r"\bHome\s+Cities\b", original_text, re.IGNORECASE) is not None
+    src_has_singular = re.search(r"\bHome\s+City\b", original_text, re.IGNORECASE) is not None
+
+    if not (src_has_plural or src_has_singular):
+        return translated_text
+
+    out = translated_text
+
+    # Replace any leftover English occurrences.
+    out = re.sub(r"\bHome\s+Cities\b", "Metrópolis", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bHome\s+City\b", "Metrópoli", out, flags=re.IGNORECASE)
+
+    # Replace the common (but unwanted in WoL Spanish) translation 'ciudad natal'.
+    out = re.sub(r"\bciudades?\s+natales?\b", "Metrópolis" if src_has_plural else "Metrópoli", out, flags=re.IGNORECASE)
+
+    return out
 
 
 @dataclass(frozen=True)
@@ -62,11 +96,15 @@ class PromptConfig:
 
     def build(self, batch: Sequence[str], source_lang: str, target_lang: str, compact: bool) -> str:
         template = self.compact_template if compact else self.detailed_template
-        return template.format(
+        prompt = template.format(
             source_lang=source_lang,
             target_lang=target_lang,
             input_list=json.dumps(batch, ensure_ascii=False),
         )
+        overrides = terminology_overrides_for_target(target_lang)
+        if overrides:
+            prompt = prompt + "\n\n" + overrides
+        return prompt
 
 
 DEFAULT_PROMPT_CONFIG = PromptConfig(
@@ -77,7 +115,6 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
         "(Age of Empires III: Wars of Liberty). "
         "Use historically appropriate terminology from the late 18th to early 20th century, "
         "avoid modern slang, and keep the language clear and playable. "
-        "Keep globally recognized gaming abbreviations (XP, HP, MP, DPS, PvP, PvE, GG, MVP) unchanged. "
         "DO NOT modernize or embellish the text. "
         "Keep all placeholders (__TOK#, %s, %1$s, %d, \n, \t) unchanged and in the same position. "
         "Treat any __PROTECT_x__ tokens as immutable placeholders. "
@@ -107,7 +144,6 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
     CONSISTENCY
     - If the same source string appears multiple times, translate it exactly the same way each time.
     - Keep sentences concise; do not add explanations or extra words.
-    - Leave globally recognized gaming abbreviations (XP, HP, MP, DPS, PvP, PvE, GG, MVP) unchanged.
 
     TECHNICAL RULES (STRICT)
     1. Do NOT translate, modify, reorder, or remove placeholders such as:
@@ -462,6 +498,9 @@ def is_retryable_error(exc: Exception) -> bool:
         "try again",
         "deadline exceeded",
         "overloaded",
+        "server disconnected",
+        "connection reset",
+        "connection aborted",
     )
     value_error_retryables = (
         "response without candidates",
@@ -522,10 +561,13 @@ def translate_batch_with_retry(
                 exc,
             )
             if (not retryable) or attempt > max_retries:
-                logging.error("Critical failure in worker. Skipping batch.")
-                if last_partial:
-                    return last_partial
-                return list(batch)
+                logging.error("Critical failure in worker. Giving up on this batch for now.")
+                if last_partial and len(last_partial) == len(batch):
+                    return list(last_partial)
+                # Raise so the caller can avoid caching a fallback result.
+                err = RuntimeError(f"Batch failed after {attempt} attempt(s): {exc}")
+                setattr(err, "failed_batch", list(batch))
+                raise err
 
             backoff = min(BACKOFF_SECONDS * (2 ** (attempt - 1)), BACKOFF_MAX_SECONDS)
             backoff += random.uniform(0, BACKOFF_SECONDS)
@@ -604,9 +646,11 @@ def translate_strings(
         if cached_value and cached_value.strip():
             # We already had a cached translation: reuse it everywhere and skip re-translation.
             for idx in indexes_by_protected.get(text, []):
-                translations[idx] = restore_all_tokens(
+                restored = restore_all_tokens(
                     cached_value, token_maps[idx], phrase_maps[idx], original_texts[idx]
                 )
+                restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
+                translations[idx] = restored
             continue
 
         # If there is no cache (or it is empty), register an entry and queue it for translation,
@@ -662,18 +706,28 @@ def translate_strings(
                     len(original_batch),
                     exc,
                 )
-                translated_batch = original_batch  # Fallback
+                # Do NOT poison the cache with fallback originals; keep them retryable on the next run.
+                translated_batch = None
 
             # Store in cache and update main list
+            if translated_batch is None:
+                # Mark these items as not-yet-translated (empty cache) so a rerun will retry them.
+                for original in original_batch:
+                    cache[original] = ""
+                # Skip updating translations from this batch.
+                continue
+
             for original, translated_item in zip(original_batch, translated_batch):
                 cache[original] = translated_item
                 for idx in indexes_by_protected.get(original, []):
-                    translations[idx] = restore_all_tokens(
+                    restored = restore_all_tokens(
                         translated_item,
                         token_maps[idx],
                         phrase_maps[idx],
                         original_texts[idx],
                     )
+                    restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
+                    translations[idx] = restored
 
             # Save partial progress (thread-safe because we are on the main thread)
             if cache_path:
@@ -1018,7 +1072,7 @@ def main() -> None:
     protected_terms = list(DEFAULT_PROTECTED_TERMS)
     if args.protect:
         protected_terms.extend(args.protect)
-    protected_regex = compile_regex_list(DEFAULT_PROTECTED_REGEX + (args.protect_regex or []))
+    protected_regex = compile_regex_list(args.protect_regex)
 
     if not args.input.exists():
         raise SystemExit(f"File does not exist: {args.input}")
