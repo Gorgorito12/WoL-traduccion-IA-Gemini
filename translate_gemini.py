@@ -51,6 +51,9 @@ DEFAULT_PROTECTED_REGEX = [
     r"\bGG\b",
     r"\bMVP\b",
 ]
+DEFAULT_GLOSSARY_TRANSLATIONS: Dict[str, str] = {
+    "Home City": "Metrópoli",
+}
 
 
 @dataclass(frozen=True)
@@ -547,7 +550,7 @@ def translate_strings(
     protected_terms: Optional[Sequence[str]] = None,
     protected_regex: Optional[Sequence[re.Pattern[str]]] = None,
 ) -> List[str]:
-    
+
     client = setup_gemini(api_key)
 
     protected_terms = protected_terms or []
@@ -567,6 +570,9 @@ def translate_strings(
         except Exception as exc:
             logging.warning("Unable to load previous cache (%s): %s", cache_path, exc)
             cache = {}
+
+    # Seed glossary translations so that critical terms stay consistent across runs.
+    cache.update(DEFAULT_GLOSSARY_TRANSLATIONS)
 
     for idx, inner in enumerate(inners):
         phrase_protected, phrase_map = protect_phrases(inner, protected_terms, protected_regex)

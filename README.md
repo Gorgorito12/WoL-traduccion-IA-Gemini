@@ -15,6 +15,7 @@ A **compact prompt is enabled by default** to reduce token usage without losing 
 - Strict protection of **tokens/placeholders** (e.g., `__TOK#__`, `%s`, `%1$s`, `\n`, `\t`, etc.).
 - **Multithreading** for faster processing.
 - **Automatic cache**: detects previously translated strings and skips them to save time and API cost.
+- Built-in glossary entry: **“Home City” → “Metrópoli”** for consistent localization.
 - **Compact** (default) and **Detailed** (optional) prompt modes.
 
 ---
@@ -140,5 +141,4 @@ Use a safer approach (like environment variables) if you plan to automate runs.
 Review Google Gemini’s policies/terms for API usage (including commercial use and rate limits).
 
 ---
-
 
