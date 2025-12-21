@@ -333,12 +333,23 @@ def translate_batch_gemini(
     if candidates is not None and not candidates:
         raise ValueError("Response without candidates.")
 
+    def _normalized_finish_reason(value: object) -> str:
+        if value is None:
+            return ""
+        name = getattr(value, "name", None)
+        if isinstance(name, str):
+            return name.lower()
+        raw_value = getattr(value, "value", None)
+        if isinstance(raw_value, str):
+            return raw_value.lower()
+        return str(value).lower()
+
     finish_reason = None
     if candidates:
         first_candidate = candidates[0]
         finish_reason = getattr(first_candidate, "finish_reason", None)
-        normalized_finish = str(finish_reason).lower() if finish_reason else ""
-        if finish_reason and normalized_finish != "stop":
+        normalized_finish = _normalized_finish_reason(finish_reason)
+        if normalized_finish and not ("stop" in normalized_finish or "unspecified" in normalized_finish):
             logging.warning(
                 "Unexpected finish_reason (%s) but text was returned; continuing.",
                 finish_reason,
