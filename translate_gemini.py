@@ -76,7 +76,6 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
         "Return ONLY a valid JSON array of translated strings, "
         "with the exact same number of elements and order as the input. "
         "If a string is empty or contains only placeholders, return it unchanged. "
-        "If any rule cannot be followed, return the original string unchanged. "
         "Input list: {input_list}"
     ),
     detailed_template=f"""
@@ -314,9 +313,12 @@ def translate_batch_gemini(
     target_lang: str,
     compact_prompt: bool,
     prompt_config: PromptConfig = DEFAULT_PROMPT_CONFIG,
+    extra_instruction: Optional[str] = None,
 ) -> List[str]:
 
     prompt = prompt_config.build(batch, source_lang, target_lang, compact_prompt)
+    if extra_instruction:
+        prompt = f"{prompt}\n\n{extra_instruction}"
 
     response = client.models.generate_content(
         model=DEFAULT_MODEL,
@@ -404,6 +406,7 @@ def translate_batch_with_retry(
     max_retries,
     compact_prompt: bool,
     prompt_config: PromptConfig,
+    extra_instruction: Optional[str] = None,
 ) -> List[str]:
     attempt = 0
     last_partial: Optional[List[str]] = None
@@ -416,6 +419,7 @@ def translate_batch_with_retry(
                 target,
                 compact_prompt,
                 prompt_config=prompt_config,
+                extra_instruction=extra_instruction,
             )
         except Exception as exc:
             attempt += 1
@@ -535,6 +539,40 @@ def translate_strings(
 
     print(f"🚀 Starting MULTITHREAD engine: {max_workers} concurrent workers...")
 
+    retry_queue: List[Tuple[str, bool]] = []
+    retry_seen: set[str] = set()
+
+    def mark_for_retry(original: str, sample_text: str) -> None:
+        if original in retry_seen:
+            return
+        retry_seen.add(original)
+        retry_queue.append((original, ("\\n" in sample_text) or ("•" in sample_text)))
+
+    def apply_translation(original: str, translated_item: str) -> None:
+        for idx in indexes_by_protected.get(original, []):
+            translations[idx] = restore_all_tokens(
+                translated_item,
+                token_maps[idx],
+                phrase_maps[idx],
+                original_texts[idx],
+            )
+
+    def handle_result(original: str, translated_item: str, allow_retry: bool) -> None:
+        sample_idx = indexes_by_protected.get(original, [None])[0]
+        sample_text = original if sample_idx is None else original_texts[sample_idx]
+        unchanged = (translated_item == original) or (
+            translated_item.strip() == original.strip()
+        )
+        stripped_sample = PLACEHOLDER_RE.sub("", sample_text)
+        has_letters = bool(re.search(r"[A-Za-z]", stripped_sample))
+        if unchanged and has_letters:
+            apply_translation(original, translated_item)
+            if allow_retry:
+                mark_for_retry(original, sample_text)
+            return
+        cache[original] = translated_item
+        apply_translation(original, translated_item)
+
     # --- PARALLEL PROCESSING ---
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Launch all tasks
@@ -575,14 +613,7 @@ def translate_strings(
 
             # Store in cache and update main list
             for original, translated_item in zip(original_batch, translated_batch):
-                cache[original] = translated_item
-                for idx in indexes_by_protected.get(original, []):
-                    translations[idx] = restore_all_tokens(
-                        translated_item,
-                        token_maps[idx],
-                        phrase_maps[idx],
-                        original_texts[idx],
-                    )
+                handle_result(original, translated_item, allow_retry=True)
 
             # Save partial progress (thread-safe because we are on the main thread)
             if cache_path:
@@ -593,6 +624,40 @@ def translate_strings(
 
             if progress_callback:
                 progress_callback(list(translations))
+
+    # Retry any unchanged translations (e.g., changelog-style strings).
+    for original, is_changelog_like in retry_queue:
+        instruction = None
+        retry_compact = compact_prompt
+        if is_changelog_like:
+            retry_compact = False
+            instruction = (
+                "You MUST translate; do NOT return the original unchanged; preserve \\n and • exactly."
+            )
+        try:
+            retried = translate_batch_with_retry(
+                client,
+                [original],
+                source_lang,
+                target_lang,
+                max_retries,
+                retry_compact,
+                prompt_config,
+                extra_instruction=instruction,
+            )
+        except Exception as exc:
+            logging.error("Retry failed for item: %s", exc)
+            retried = [original]
+        handle_result(original, retried[0], allow_retry=False)
+
+        if cache_path:
+            try:
+                cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as exc:
+                logging.warning("Could not persist cache during retry: %s", exc)
+
+        if progress_callback:
+            progress_callback(list(translations))
 
     return translations
 
