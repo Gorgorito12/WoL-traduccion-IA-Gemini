@@ -1029,12 +1029,16 @@ def load_existing_translations(path: Path, reference_count: int, skip_rules: Ski
         existing_elements = list(iter_translatable_elements(existing_tree.getroot(), skip_rules))
         if len(existing_elements) != reference_count:
             logging.warning(
-                "Existing output file (%s) length mismatch (expected %s, found %s). Ignoring.",
+                "Existing output file (%s) length mismatch (expected %s, found %s). Attempting partial reuse.",
                 path,
                 reference_count,
                 len(existing_elements),
             )
-            return None
+            salvage_count = min(len(existing_elements), reference_count)
+            salvaged = extract_texts(existing_elements[:salvage_count])
+            # Pad missing entries so the caller can still reuse what matches and retranslate the rest.
+            salvaged.extend([""] * (reference_count - salvage_count))
+            return salvaged
         return extract_texts(existing_elements)
     except Exception as exc:
         logging.warning("Could not load previous translations from %s: %s", path, exc)
