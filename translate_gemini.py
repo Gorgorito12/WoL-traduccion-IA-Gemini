@@ -44,6 +44,10 @@ DEFAULT_PROTECTED_TERMS = ["Age of Empires III: Wars of Liberty"]
 DEFAULT_ACRONYM_REGEX = re.compile(r"(?<!__)([A-Z]{2,5}(?:\d+)?)(?![a-z])")
 DEFAULT_PROTECTED_REGEX = [DEFAULT_ACRONYM_REGEX]
 
+# ALL-CAPS tokens that should be allowed to translate (e.g., English number words).
+# These sometimes appear in legacy/localized strings and should NOT be treated as acronyms.
+DEFAULT_ACRONYM_EXCLUDE = ["ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN", "EIGHT", "NINE", "TEN", "ZERO"]
+
 def target_is_spanish(target_lang: str) -> bool:
     tl = (target_lang or "").lower()
     return ("spanish" in tl) or ("español" in tl) or ("espanol" in tl)
@@ -120,8 +124,8 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
         "DO NOT modernize or embellish the text. "
         "Keep all placeholders (__TOK#, %s, %1$s, %d, \n, \t) unchanged and in the same position. "
         "Treat any __PROTECT_x__ tokens as immutable placeholders. "
-        "Treat short ALL-CAPS gaming abbreviations (XP, HP, MP, DPS, AOE, UI, etc.) as non-translatable; "
-        "they must remain exactly the same even when adjacent to numbers or symbols. "
+        "Treat common gaming acronyms (XP, HP, MP, DPS, AOE, UI, etc.) as non-translatable; "
+        "they must remain exactly the same even when adjacent to numbers or symbols. Do NOT treat English number words like ONE/TWO/THREE as acronyms; translate them normally when used as words. "
         "If a string contains escaped newlines (\\n) or bullet characters (•), keep them exactly as written (do not convert \\n to real newlines). "
         "Do NOT merge, split, rephrase, or reorder strings. "
         "Ensure identical source strings receive identical translations. "
@@ -152,7 +156,8 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
     TECHNICAL RULES (STRICT)
     1. Do NOT translate, modify, reorder, or remove placeholders such as:
        __TOK#, %s, %1$s, %d, \n, \t, and __PROTECT_x__ tokens.
-    1.1 Treat short ALL-CAPS gaming abbreviations (XP, HP, MP, DPS, AOE, UI, etc.) as immutable terminology. Do NOT translate or change their character order, even when they appear next to numbers or symbols or embedded inside longer words.
+    1.1 Treat common gaming acronyms (XP, HP, MP, DPS, AOE, UI, etc.) as immutable terminology. Do NOT translate or change their character order, even when they appear next to numbers or symbols.
+    1.2 Do NOT treat English number words like ONE/TWO/THREE as acronyms; translate them normally when used as words.
     2. Preserve literal escape sequences: keep \\n and similar sequences as-is (do NOT convert them to real newlines).
        Maintain bullet characters (•) and surrounding spacing exactly.
     3. Do NOT merge, split, expand, or rephrase strings.
@@ -218,10 +223,12 @@ def protect_phrases(
     text: str,
     phrases: Sequence[str],
     regex_patterns: Sequence[re.Pattern[str]],
+    regex_exclude: Optional[Sequence[str]] = None,
 ) -> Tuple[str, Dict[str, str]]:
     token_map: Dict[str, str] = {}
     protected = text
     idx = 0
+    exclude_set = {t.upper() for t in (regex_exclude or [])}
 
     for phrase in phrases:
         if not phrase:
@@ -235,8 +242,11 @@ def protect_phrases(
     for pattern in regex_patterns:
         def repl(match: re.Match[str]) -> str:
             nonlocal idx
+            token_text = match.group(0)
+            if token_text.upper() in exclude_set:
+                return token_text
             token = f"__PROTECT_{idx}__"
-            token_map[token] = match.group(0)
+            token_map[token] = token_text
             idx += 1
             return token
 
@@ -265,19 +275,28 @@ def restore_protected_terms(
     return restored
 
 
-def enforce_acronym_integrity(original_text: str, candidate_text: str) -> str:
+def enforce_acronym_integrity(
+    original_text: str,
+    candidate_text: str,
+    acronym_regex: Optional[re.Pattern[str]] = DEFAULT_ACRONYM_REGEX,
+    exclude: Optional[Sequence[str]] = None,
+) -> str:
     """Ensure gaming-style acronyms stay exactly as in the source.
 
     If any acronym detected in the source is missing or altered in the candidate,
     return the original source string to avoid leaking a bad translation.
     """
 
-    matches = list(DEFAULT_ACRONYM_REGEX.finditer(original_text))
+    exclude_set = {t.upper() for t in (exclude or [])}
+
+    matches = list(acronym_regex.finditer(original_text)) if acronym_regex else []
     if not matches:
         return candidate_text
 
     for match in matches:
         token = match.group(0)
+        if token.upper() in exclude_set:
+            continue
         expected = original_text.count(token)
         actual = candidate_text.count(token)
         if actual < expected:
@@ -616,12 +635,14 @@ def translate_strings(
     prompt_config: PromptConfig = DEFAULT_PROMPT_CONFIG,
     protected_terms: Optional[Sequence[str]] = None,
     protected_regex: Optional[Sequence[re.Pattern[str]]] = None,
+    acronym_exclude: Optional[Sequence[str]] = None,
 ) -> List[str]:
     
     client = setup_gemini(api_key)
 
     protected_terms = protected_terms or []
     protected_regex = list(DEFAULT_PROTECTED_REGEX) + (list(protected_regex) if protected_regex else [])
+    acronym_exclude = list(DEFAULT_ACRONYM_EXCLUDE) + (list(acronym_exclude) if acronym_exclude else [])
 
     protected: List[str] = []
     token_maps: List[Dict[str, str]] = []
@@ -639,7 +660,12 @@ def translate_strings(
             cache = {}
 
     for idx, inner in enumerate(inners):
-        phrase_protected, phrase_map = protect_phrases(inner, protected_terms, protected_regex)
+        phrase_protected, phrase_map = protect_phrases(
+            inner,
+            protected_terms,
+            protected_regex,
+            regex_exclude=acronym_exclude,
+        )
         protected_text, token_map = protect_tokens(phrase_protected)
         protected.append(protected_text)
         token_maps.append(token_map)
@@ -678,7 +704,7 @@ def translate_strings(
                     cached_value, token_maps[idx], phrase_maps[idx], original_texts[idx]
                 )
                 restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
-                restored = enforce_acronym_integrity(original_texts[idx], restored)
+                restored = enforce_acronym_integrity(original_texts[idx], restored, exclude=acronym_exclude)
                 translations[idx] = restored
             continue
 
@@ -756,7 +782,7 @@ def translate_strings(
                         original_texts[idx],
                     )
                     restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
-                    restored = enforce_acronym_integrity(original_texts[idx], restored)
+                    restored = enforce_acronym_integrity(original_texts[idx], restored, exclude=acronym_exclude)
                     translations[idx] = restored
 
             # Save partial progress (thread-safe because we are on the main thread)
@@ -1089,6 +1115,12 @@ def parse_args() -> argparse.Namespace:
         help="Regular expressions for phrases to protect from translation (repeatable).",
     )
     parser.add_argument(
+        "--acronym-exclude",
+        action="append",
+        default=[],
+        help="ALL-CAPS tokens that should be allowed to translate (repeatable). Example: --acronym-exclude ONE",
+    )
+    parser.add_argument(
         "--diagnostic",
         action="store_true",
         help="Print encoding/BOM diagnostics after each write.",
@@ -1103,6 +1135,9 @@ def main() -> None:
     if args.protect:
         protected_terms.extend(args.protect)
     protected_regex = compile_regex_list(args.protect_regex)
+    acronym_exclude = list(DEFAULT_ACRONYM_EXCLUDE)
+    if args.acronym_exclude:
+        acronym_exclude.extend([t.strip() for t in args.acronym_exclude if t and t.strip()])
 
     if not args.input.exists():
         raise SystemExit(f"File does not exist: {args.input}")
@@ -1173,6 +1208,7 @@ def main() -> None:
             progress_callback=progress_callback,
             protected_terms=protected_terms,
             protected_regex=protected_regex,
+            acronym_exclude=acronym_exclude,
         )
         final_texts = assemble_full_texts(
             targets, translated_subset, enforce_skip_integrity=True
