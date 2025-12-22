@@ -678,8 +678,10 @@ def translate_strings(
             candidate = existing_translations[idx]
             if candidate and candidate.strip():
                 initial_translation = candidate
-                if candidate != inner:
-                    cache.setdefault(protected_text, candidate)
+                # Seed the cache even when the existing translation is identical to the
+                # current text. This prevents unnecessary re-translation when rerunning
+                # the script on an already-translated file after deleting the cache.
+                cache.setdefault(protected_text, candidate)
 
         translations.append(initial_translation)
         indexes_by_protected.setdefault(protected_text, []).append(idx)
