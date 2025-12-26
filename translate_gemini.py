@@ -42,11 +42,8 @@ PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
 DEFAULT_SKIP_SYMBOL_CONTAINS = ["folder", "path", "dir", "directory"]
 DEFAULT_PROTECTED_TERMS = ["Age of Empires III: Wars of Liberty", "My Games"]
 DEFAULT_ACRONYM_REGEX = re.compile(r"(?<!__)([A-Z]{2,5}(?:\d+)?)(?![a-z])")
-DEFAULT_PROTECTED_REGEX = [
-    DEFAULT_ACRONYM_REGEX,
-    re.compile(r"\bMy\s+Games\b", re.IGNORECASE),
-    re.compile(r"\bIndios?\b", re.IGNORECASE),
-]
+DEFAULT_PROTECTED_REGEX = [DEFAULT_ACRONYM_REGEX,
+    re.compile(r"\bMy\s+Games\b", re.IGNORECASE)]
 
 # ALL-CAPS tokens that should be allowed to translate (e.g., English number words).
 # These sometimes appear in legacy/localized strings and should NOT be treated as acronyms.
