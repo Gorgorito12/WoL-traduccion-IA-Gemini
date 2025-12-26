@@ -133,7 +133,9 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
         "Return ONLY a valid JSON array of translated strings, "
         "with the exact same number of elements and order as the input. "
         "If a string is empty or contains only placeholders, return it unchanged. "
-        "If any rule cannot be followed, return the original string unchanged. "
+        "If any rule cannot be followed for only part of a string or a specific token is uncertain, "
+        "leave just that token unchanged and translate the rest. "
+        "Return the original string unchanged only if the entire string is uncertain. "
         "Input list: {input_list}"
     ),
     detailed_template=f"""
@@ -166,7 +168,9 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
     5. Output ONLY a valid JSON array of strings.
     6. The output array MUST have the exact same length and order as the input array.
     7. If a string is empty or contains only placeholders, return it unchanged.
-    8. If any rule cannot be followed or the translation is uncertain, return the original string unchanged.
+    8. If any rule cannot be followed for part of a string or a specific token is uncertain,
+       leave just that token unchanged and translate the rest.
+       Return the original string unchanged only if the entire string is uncertain.
 
     Input List:
     {{input_list}}
@@ -269,7 +273,8 @@ def restore_protected_terms(
         orig_count = original_text.count(phrase)
         if orig_count and restored.count(phrase) < orig_count:
             logging.warning(
-                "Protected phrase missing or altered; restoring from source text."
+                "Post-restore fallback (protected phrase mismatch); restoring source text: %s",
+                original_text,
             )
             return original_text
 
@@ -301,7 +306,11 @@ def enforce_acronym_integrity(
         expected = original_text.count(token)
         actual = candidate_text.count(token)
         if actual < expected:
-            logging.warning("Acronym '%s' missing or altered; restoring source text.", token)
+            logging.warning(
+                "Post-restore fallback (acronym mismatch '%s'); restoring source text: %s",
+                token,
+                original_text,
+            )
             return original_text
 
     return candidate_text
@@ -328,6 +337,10 @@ def compile_regex_list(patterns: Optional[Sequence[str]]) -> List[re.Pattern[str
         except re.error as exc:
             logging.warning("Invalid regex skipped (%s): %s", pattern, exc)
     return compiled
+
+def log_untranslated(reason: str, text: str, symbol: Optional[str] = None) -> None:
+    symbol_info = f", symbol={symbol}" if symbol else ""
+    logging.warning("Untranslated (%s%s): %s", reason, symbol_info, text)
 
 def decode_auto(path: Path) -> Tuple[str, str, Optional[bytes]]:
     raw = path.read_bytes()
@@ -707,6 +720,8 @@ def translate_strings(
                 restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
                 restored = enforce_acronym_integrity(original_texts[idx], restored, exclude=acronym_exclude)
                 translations[idx] = restored
+                if restored == original_texts[idx]:
+                    log_untranslated("cache-hit", original_texts[idx])
             continue
 
         # If there is no cache (or it is empty), register an entry and queue it for translation,
@@ -1145,6 +1160,15 @@ def main() -> None:
 
     tree, doc_format = parse_strings_xml(args.input)
     targets = list(iter_translatable_elements(tree.getroot(), skip_rules))
+    for target in targets:
+        if not target.skip:
+            continue
+        reason = target.reason or "unknown-skip"
+        if reason == "path-like-text":
+            reason_label = "path-like-heuristic"
+        else:
+            reason_label = f"skip:{reason}"
+        log_untranslated(reason_label, target.text, symbol=target.symbol)
     elements = [target.element for target in targets]
     translatable_targets = [target for target in targets if not target.skip]
     translatable_texts = [target.text for target in translatable_targets]
