@@ -626,6 +626,7 @@ def translate_strings(
     api_key: Optional[str],
     source_lang: str,
     target_lang: str,
+    cache_only: bool = False,
     max_budget_bytes: int = MAX_BUDGET_BYTES,
     max_retries: int = DEFAULT_MAX_RETRIES,
     max_workers: int = DEFAULT_MAX_WORKERS,
@@ -716,6 +717,17 @@ def translate_strings(
             unique_to_translate.append(text)
 
     if not unique_to_translate:
+        return translations
+
+    if cache_only:
+        missing_count = sum(
+            len(indexes_by_protected.get(text, [])) for text in unique_to_translate
+        )
+        if missing_count:
+            logging.warning(
+                "Cache-only mode: %s text(s) could not be translated due to missing cache.",
+                missing_count,
+            )
         return translations
 
     if not api_key:
@@ -1134,6 +1146,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print encoding/BOM diagnostics after each write.",
     )
+    parser.add_argument(
+        "--cache-only",
+        action="store_true",
+        help="Only use cached translations; do not call the API.",
+    )
     return parser.parse_args()
 
 def main() -> None:
@@ -1208,6 +1225,7 @@ def main() -> None:
             api_key=args.api_key,
             source_lang=args.source,
             target_lang=args.target,
+            cache_only=args.cache_only,
             cache_path=cache_file,
             existing_translations=existing_translations_subset,
             max_workers=args.max_workers,
