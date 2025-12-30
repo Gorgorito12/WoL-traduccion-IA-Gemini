@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import io
 import logging
 import os
@@ -37,6 +38,7 @@ BACKOFF_MAX_SECONDS = 30.0
 # Use the compact prompt by default to reduce tokens without losing core rules.
 DEFAULT_COMPACT_PROMPT = True
 DEFAULT_MAX_WORKERS = 8
+DEFAULT_CACHE_FUZZY_THRESHOLD = 0.95
 
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
 DEFAULT_SKIP_SYMBOL_CONTAINS = ["folder", "path", "dir", "directory"]
@@ -328,6 +330,29 @@ def compile_regex_list(patterns: Optional[Sequence[str]]) -> List[re.Pattern[str
         except re.error as exc:
             logging.warning("Invalid regex skipped (%s): %s", pattern, exc)
     return compiled
+
+def find_fuzzy_cache_hit(
+    text: str,
+    cache_keys: Sequence[str],
+    threshold: float,
+) -> Optional[Tuple[str, float]]:
+    if threshold <= 0 or not cache_keys:
+        return None
+
+    best_key: Optional[str] = None
+    best_ratio = 0.0
+
+    for key in cache_keys:
+        if not key:
+            continue
+        ratio = difflib.SequenceMatcher(None, text, key).ratio()
+        if ratio >= threshold and ratio > best_ratio:
+            best_ratio = ratio
+            best_key = key
+
+    if best_key is None:
+        return None
+    return best_key, best_ratio
 
 def decode_auto(path: Path) -> Tuple[str, str, Optional[bytes]]:
     raw = path.read_bytes()
@@ -630,6 +655,7 @@ def translate_strings(
     max_retries: int = DEFAULT_MAX_RETRIES,
     max_workers: int = DEFAULT_MAX_WORKERS,
     compact_prompt: bool = DEFAULT_COMPACT_PROMPT,
+    cache_fuzzy_threshold: float = DEFAULT_CACHE_FUZZY_THRESHOLD,
     progress_callback: Optional[Callable[[Sequence[str]], None]] = None,
     cache_path: Optional[Path] = None,
     existing_translations: Optional[Sequence[str]] = None,
@@ -706,6 +732,30 @@ def translate_strings(
                 restored = enforce_acronym_integrity(original_texts[idx], restored, exclude=acronym_exclude)
                 translations[idx] = restored
             continue
+
+        if cache_fuzzy_threshold > 0:
+            cache_keys = [key for key, value in cache.items() if value and value.strip()]
+            fuzzy_hit = find_fuzzy_cache_hit(text, cache_keys, cache_fuzzy_threshold)
+            if fuzzy_hit:
+                hit_key, hit_ratio = fuzzy_hit
+                cached_value = cache.get(hit_key)
+                if cached_value and cached_value.strip():
+                    logging.warning(
+                        "Fuzzy cache hit (ratio=%.3f). Reusing translation from '%s'.",
+                        hit_ratio,
+                        hit_key,
+                    )
+                    cache[text] = cached_value
+                    for idx in indexes_by_protected.get(text, []):
+                        restored = restore_all_tokens(
+                            cached_value, token_maps[idx], phrase_maps[idx], original_texts[idx]
+                        )
+                        restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
+                        restored = enforce_acronym_integrity(
+                            original_texts[idx], restored, exclude=acronym_exclude
+                        )
+                        translations[idx] = restored
+                    continue
 
         # If there is no cache (or it is empty), register an entry and queue it for translation,
         # avoiding duplicates.
@@ -1134,6 +1184,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print encoding/BOM diagnostics after each write.",
     )
+    parser.add_argument(
+        "--cache-fuzzy-threshold",
+        type=float,
+        default=DEFAULT_CACHE_FUZZY_THRESHOLD,
+        help="Similarity threshold (0-1) to reuse fuzzy cache matches.",
+    )
     return parser.parse_args()
 
 def main() -> None:
@@ -1213,6 +1269,7 @@ def main() -> None:
             max_workers=args.max_workers,
             max_budget_bytes=args.max_budget_bytes,
             compact_prompt=args.compact_prompt,
+            cache_fuzzy_threshold=args.cache_fuzzy_threshold,
             prompt_config=DEFAULT_PROMPT_CONFIG,
             progress_callback=progress_callback,
             protected_terms=protected_terms,
