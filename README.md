@@ -81,11 +81,18 @@ python translate_gemini.py "unithelpstringsy.xml" "unithelpstringsy_es_latam.xml
 * **Compact mode** is enabled by default.
 * To use a more detailed prompt (higher token usage), add `--detailed-prompt`.
 * If you want to explicitly force compact mode, use `--compact-prompt`.
+* If **all strings are already in the cache**, you can omit `--api-key` and the script will reuse cached translations only.
 
 Example (detailed prompt):
 
 ```bat
 python translate_gemini.py "stringtabley.xml" "stringtabley_es_latam.xml" --api-key "YOUR_API_KEY_HERE" --source "English" --target "Latin American Spanish" --detailed-prompt
+```
+
+Example (cache-only, no API key needed if cache is complete; `--source`/`--target` are optional because defaults are used):
+
+```bat
+python translate_gemini.py "stringtabley.xml" "stringtabley_es_latam.xml"
 ```
 
 ---
@@ -96,7 +103,7 @@ python translate_gemini.py "stringtabley.xml" "stringtabley_es_latam.xml" --api-
 | ------------------- | ----------------------------------------------------- |
 | `input.xml`         | Source XML file (e.g., English)                       |
 | `output.xml`        | Translated output XML file                            |
-| `--api-key`         | **Required.** Google Gemini API key                   |
+| `--api-key`         | Google Gemini API key (**required only for uncached strings**) |
 | `--source`          | Source language (default: `English`)                  |
 | `--target`          | Target language (default: `Latin American Spanish`)   |
 | `--compact-prompt`  | Forces the compact prompt (default)                   |
@@ -140,5 +147,3 @@ Use a safer approach (like environment variables) if you plan to automate runs.
 Review Google Gemini’s policies/terms for API usage (including commercial use and rate limits).
 
 ---
-
-
