@@ -623,7 +623,7 @@ def translate_batch_with_retry(
 
 def translate_strings(
     inners: Iterable[str],
-    api_key: str,
+    api_key: Optional[str],
     source_lang: str,
     target_lang: str,
     max_budget_bytes: int = MAX_BUDGET_BYTES,
@@ -639,8 +639,6 @@ def translate_strings(
     acronym_exclude: Optional[Sequence[str]] = None,
 ) -> List[str]:
     
-    client = setup_gemini(api_key)
-
     protected_terms = protected_terms or []
     protected_regex = list(DEFAULT_PROTECTED_REGEX) + (list(protected_regex) if protected_regex else [])
     acronym_exclude = list(DEFAULT_ACRONYM_EXCLUDE) + (list(acronym_exclude) if acronym_exclude else [])
@@ -716,6 +714,16 @@ def translate_strings(
         if text not in already_enqueued:
             already_enqueued.add(text)
             unique_to_translate.append(text)
+
+    if not unique_to_translate:
+        return translations
+
+    if not api_key:
+        raise RuntimeError(
+            "Missing --api-key: translation required for uncached strings."
+        )
+
+    client = setup_gemini(api_key)
 
     # Build all batches
     batches = list(yield_batches(unique_to_translate, max_budget_bytes))
@@ -1056,7 +1064,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--api-key", type=str, required=True)
+    parser.add_argument("--api-key", type=str)
     parser.add_argument("--source", default=DEFAULT_SOURCE_LANG)
     parser.add_argument("--target", default=DEFAULT_TARGET_LANG)
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
