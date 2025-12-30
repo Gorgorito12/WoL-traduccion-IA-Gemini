@@ -92,7 +92,7 @@ python translate_gemini.py "stringtabley.xml" "stringtabley_es_latam.xml" --api-
 Example (cache-only, no API key needed if cache is complete):
 
 ```bat
-python translate_gemini.py "stringtabley.xml" "stringtabley_es_latam.xml" --source "English" --target "Latin American Spanish"
+python translate_gemini.py "stringtabley.xml" "stringtabley_es_latam.xml"
 ```
 
 ---
