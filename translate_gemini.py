@@ -39,6 +39,7 @@ DEFAULT_COMPACT_PROMPT = True
 DEFAULT_MAX_WORKERS = 8
 
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
+PROTECT_TOKEN_RE = re.compile(r"__PROTECT_\d+__")
 DEFAULT_SKIP_SYMBOL_CONTAINS = ["folder", "path", "dir", "directory"]
 DEFAULT_PROTECTED_TERMS = ["Age of Empires III: Wars of Liberty", "My Games"]
 DEFAULT_ACRONYM_REGEX = re.compile(r"(?<!__)([A-Z]{2,5}(?:\d+)?)(?![a-z])")
@@ -272,6 +273,19 @@ def restore_protected_terms(
                 "Protected phrase missing or altered; restoring from source text."
             )
             return original_text
+
+    if "__PROTECT_" in restored:
+        unexpected_tokens = [
+            token for token in PROTECT_TOKEN_RE.findall(restored)
+            if token not in original_text
+        ]
+        if unexpected_tokens:
+            logging.warning(
+                "Unexpected protect tokens found in translation; removing: %s",
+                ", ".join(sorted(set(unexpected_tokens))),
+            )
+            restored = PROTECT_TOKEN_RE.sub("", restored)
+            restored = re.sub(r" {2,}", " ", restored).strip()
 
     return restored
 
