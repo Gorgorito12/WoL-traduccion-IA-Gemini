@@ -452,6 +452,22 @@ def restore_all_tokens(
     restored = restore_protected_terms(restored, protected_map, original_text)
     return restored
 
+def is_all_caps_source(text: str) -> bool:
+    if not text:
+        return False
+    cleaned = QUALITY_TOKEN_RE.sub("", text)
+    cleaned = PROTECT_TOKEN_RE.sub("", cleaned)
+    cleaned = PLACEHOLDER_RE.sub("", cleaned)
+    letters = [ch for ch in cleaned if ch.isalpha()]
+    if not letters:
+        return False
+    return all(ch.isupper() for ch in letters)
+
+def apply_source_casing(source: str, translated: str) -> str:
+    if is_all_caps_source(source):
+        return translated.upper()
+    return translated
+
 
 def compile_regex_list(patterns: Optional[Sequence[str]]) -> List[re.Pattern[str]]:
     if not patterns:
@@ -883,6 +899,7 @@ def translate_strings(
                 )
                 restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
                 restored = enforce_acronym_integrity(original_texts[idx], restored, exclude=acronym_exclude)
+                restored = apply_source_casing(original_texts[idx], restored)
                 translations[idx] = restored
             continue
 
@@ -980,6 +997,7 @@ def translate_strings(
                     )
                     restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
                     restored = enforce_acronym_integrity(original_texts[idx], restored, exclude=acronym_exclude)
+                    restored = apply_source_casing(original_texts[idx], restored)
                     translations[idx] = restored
 
             # Save partial progress (thread-safe because we are on the main thread)
@@ -1268,6 +1286,25 @@ def self_test_quality_gate() -> None:
 
     print("✅ Quality gate self-test passed.")
 
+def self_test_source_casing() -> None:
+    def _assert(condition: bool, message: str) -> None:
+        if not condition:
+            raise SystemExit(f"Source casing self-test failed: {message}")
+
+    _assert(
+        apply_source_casing("TEAM", "EQUIPO") == "EQUIPO",
+        "TEAM should keep translated output in uppercase",
+    )
+    _assert(
+        apply_source_casing("Team", "Equipo") == "Equipo",
+        "Team should not force uppercase in translated output",
+    )
+    upper_ip = apply_source_casing("ENTER THE IP ADDRESS", "Ingrese la dirección IP")
+    _assert(upper_ip == upper_ip.upper(), "ENTER THE IP ADDRESS should force uppercase output")
+    _assert("IP" in upper_ip, "Acronym IP should remain intact")
+
+    print("✅ Source casing self-test passed.")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -1367,6 +1404,7 @@ def main() -> None:
     args = parse_args()
     if args.self_test_quality_gate:
         self_test_quality_gate()
+        self_test_source_casing()
         return
     skip_rules = build_skip_rules(args)
     protected_terms = list(DEFAULT_PROTECTED_TERMS)
