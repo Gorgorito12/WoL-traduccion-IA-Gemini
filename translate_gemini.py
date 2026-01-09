@@ -37,9 +37,12 @@ BACKOFF_MAX_SECONDS = 30.0
 # Use the compact prompt by default to reduce tokens without losing core rules.
 DEFAULT_COMPACT_PROMPT = True
 DEFAULT_MAX_WORKERS = 8
+DEFAULT_MAX_QUALITY_RETRIES = 2
+STRICT_NO_ENGLISH_RESIDUE = True
 
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
 PROTECT_TOKEN_RE = re.compile(r"__PROTECT_\d+__")
+QUALITY_TOKEN_RE = re.compile(r"__TOK\d+__")
 DEFAULT_SKIP_SYMBOL_CONTAINS = ["folder", "path", "dir", "directory"]
 DEFAULT_PROTECTED_TERMS = ["Age of Empires III: Wars of Liberty", "My Games"]
 DEFAULT_ACRONYM_TERMS = [
@@ -84,9 +87,68 @@ DEFAULT_ACRONYM_EXCLUDE = [
     "TEAM",
 ]
 
+ENGLISH_RESIDUE_STOPWORDS = {
+    "the",
+    "of",
+    "to",
+    "through",
+    "enter",
+    "address",
+    "host",
+    "connect",
+    "original",
+    "version",
+    "new",
+    "world",
+    "trade",
+    "center",
+}
+ENGLISH_RESIDUE_PHRASES = {
+    "of the",
+    "new world trade center",
+}
+STRICT_QUALITY_RULES = (
+    "STRICT QUALITY RULE\n"
+    "Do not leave ANY English articles/prepositions (the/of/to/through/enter/address/host/connect/original/version) "
+    "in the output. Translate them to Spanish.\n"
+    "Keep names/acronyms and protected tokens unchanged."
+)
+
 def target_is_spanish(target_lang: str) -> bool:
     tl = (target_lang or "").lower()
     return ("spanish" in tl) or ("español" in tl) or ("espanol" in tl)
+
+def _strip_quality_tokens(text: str) -> str:
+    cleaned = PROTECT_TOKEN_RE.sub(" ", text)
+    cleaned = QUALITY_TOKEN_RE.sub(" ", cleaned)
+    cleaned = PLACEHOLDER_RE.sub(" ", cleaned)
+    return cleaned
+
+def has_english_residue(src: str, out: str, target_lang: str) -> bool:
+    if not target_is_spanish(target_lang):
+        return False
+
+    cleaned_out = _strip_quality_tokens(out or "")
+    lowered = cleaned_out.lower().strip()
+    if not lowered:
+        return False
+
+    if lowered.startswith("the "):
+        return True
+
+    if re.search(r"\bof\s+the\b", lowered):
+        return True
+
+    for phrase in ENGLISH_RESIDUE_PHRASES:
+        if phrase in lowered:
+            return True
+
+    tokens = re.findall(r"\b[a-zA-Z]+\b", cleaned_out)
+    for token in tokens:
+        if token.lower() in ENGLISH_RESIDUE_STOPWORDS:
+            return True
+
+    return False
 
 def terminology_overrides_for_target(target_lang: str) -> str:
     """Extra instructions appended to the prompt, only when needed.
@@ -150,7 +212,14 @@ class PromptConfig:
     compact_template: str
     detailed_template: str
 
-    def build(self, batch: Sequence[str], source_lang: str, target_lang: str, compact: bool) -> str:
+    def build(
+        self,
+        batch: Sequence[str],
+        source_lang: str,
+        target_lang: str,
+        compact: bool,
+        extra_rules: str = "",
+    ) -> str:
         template = self.compact_template if compact else self.detailed_template
         prompt = template.format(
             source_lang=source_lang,
@@ -160,6 +229,8 @@ class PromptConfig:
         overrides = terminology_overrides_for_target(target_lang)
         if overrides:
             prompt = prompt + "\n\n" + overrides
+        if extra_rules:
+            prompt = prompt + "\n\n" + extra_rules
         return prompt
 
 
@@ -550,10 +621,17 @@ def translate_batch_gemini(
     source_lang: str,
     target_lang: str,
     compact_prompt: bool,
+    extra_rules: str = "",
     prompt_config: PromptConfig = DEFAULT_PROMPT_CONFIG,
 ) -> List[str]:
 
-    prompt = prompt_config.build(batch, source_lang, target_lang, compact_prompt)
+    prompt = prompt_config.build(
+        batch,
+        source_lang,
+        target_lang,
+        compact_prompt,
+        extra_rules=extra_rules,
+    )
 
     response = client.models.generate_content(
         model=DEFAULT_MODEL,
@@ -648,19 +726,48 @@ def translate_batch_with_retry(
     max_retries,
     compact_prompt: bool,
     prompt_config: PromptConfig,
+    strict_no_english_residue: bool,
+    max_quality_retries: int = DEFAULT_MAX_QUALITY_RETRIES,
 ) -> List[str]:
     attempt = 0
+    quality_attempt = 0
     last_partial: Optional[List[str]] = None
+    quality_prompt_compact = compact_prompt
+    extra_rules = ""
     while True:
         try:
-            return translate_batch_gemini(
+            translations = translate_batch_gemini(
                 client,
                 batch,
                 source,
                 target,
-                compact_prompt,
+                quality_prompt_compact,
+                extra_rules=extra_rules,
                 prompt_config=prompt_config,
             )
+            if strict_no_english_residue and target_is_spanish(target):
+                residue = None
+                for src_text, out_text in zip(batch, translations):
+                    if has_english_residue(src_text, out_text, target):
+                        residue = (src_text, out_text)
+                        break
+                if residue:
+                    if quality_attempt < max_quality_retries:
+                        quality_attempt += 1
+                        quality_prompt_compact = False
+                        extra_rules = STRICT_QUALITY_RULES
+                        logging.warning(
+                            "Quality retry: English residue detected. src=%s out=%s",
+                            residue[0],
+                            residue[1],
+                        )
+                        continue
+                    logging.warning(
+                        "Quality retries exhausted; English residue remains. src=%s out=%s",
+                        residue[0],
+                        residue[1],
+                    )
+            return translations
         except Exception as exc:
             attempt += 1
             partial = getattr(exc, "partial_translations", None)
@@ -703,11 +810,17 @@ def translate_strings(
     protected_terms: Optional[Sequence[str]] = None,
     protected_regex: Optional[Sequence[re.Pattern[str]]] = None,
     acronym_exclude: Optional[Sequence[str]] = None,
+    strict_no_english_residue: Optional[bool] = None,
 ) -> List[str]:
     
     protected_terms = protected_terms or []
     protected_regex = list(DEFAULT_PROTECTED_REGEX) + (list(protected_regex) if protected_regex else [])
     acronym_exclude = list(DEFAULT_ACRONYM_EXCLUDE) + (list(acronym_exclude) if acronym_exclude else [])
+    strict_no_english_residue = (
+        STRICT_NO_ENGLISH_RESIDUE and target_is_spanish(target_lang)
+        if strict_no_english_residue is None
+        else strict_no_english_residue
+    )
 
     protected: List[str] = []
     token_maps: List[Dict[str, str]] = []
@@ -813,6 +926,7 @@ def translate_strings(
                 max_retries,
                 compact_prompt,
                 prompt_config,
+                strict_no_english_residue,
             ): idx
             for idx, batch in batch_map.items()
         }
@@ -848,6 +962,14 @@ def translate_strings(
                 continue
 
             for original, translated_item in zip(original_batch, translated_batch):
+                if strict_no_english_residue and has_english_residue(original, translated_item, target_lang):
+                    logging.warning(
+                        "Skipping cache/write due to English residue. src=%s out=%s",
+                        original,
+                        translated_item,
+                    )
+                    cache[original] = ""
+                    continue
                 cache[original] = translated_item
                 for idx in indexes_by_protected.get(original, []):
                     restored = restore_all_tokens(
@@ -1125,6 +1247,27 @@ def build_skip_rules(args: argparse.Namespace) -> SkipRules:
         enable_path_heuristic=not args.no_path_heuristic,
     )
 
+def self_test_quality_gate() -> None:
+    target_lang = "Spanish"
+    def _assert(condition: bool, message: str) -> None:
+        if not condition:
+            raise SystemExit(f"Quality gate self-test failed: {message}")
+
+    src1 = "The Torre del Oro"
+    out1_bad = "The Torre del Oro"
+    out1_good = "La Torre del Oro"
+    _assert(has_english_residue(src1, out1_bad, target_lang), "expected residue for 'The Torre del Oro'")
+    _assert(not has_english_residue(src1, out1_good, target_lang), "expected no residue for 'La Torre del Oro'")
+
+    src2 = "Enter the IP address of the host to connect through direct IP."
+    out2_bad = "Enter the IP address of the host to connect through direct IP."
+    out2_good = "Introduce la dirección IP del host para conectar mediante IP directa."
+    _assert(has_english_residue(src2, out2_bad, target_lang), "expected residue for IP address prompt")
+    _assert("IP" in out2_good, "expected IP to remain unchanged")
+    _assert(not has_english_residue(src2, out2_good, target_lang), "expected no residue in Spanish translation")
+
+    print("✅ Quality gate self-test passed.")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -1200,11 +1343,31 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print encoding/BOM diagnostics after each write.",
     )
+    parser.add_argument(
+        "--strict-no-english-residue",
+        action="store_true",
+        default=None,
+        help="Enable strict English residue detection for Spanish targets.",
+    )
+    parser.add_argument(
+        "--no-strict-no-english-residue",
+        action="store_true",
+        default=False,
+        help="Disable English residue detection even for Spanish targets.",
+    )
+    parser.add_argument(
+        "--self-test-quality-gate",
+        action="store_true",
+        help="Run quick quality gate tests and exit.",
+    )
     return parser.parse_args()
 
 def main() -> None:
     logging.basicConfig(level=logging.WARNING)
     args = parse_args()
+    if args.self_test_quality_gate:
+        self_test_quality_gate()
+        return
     skip_rules = build_skip_rules(args)
     protected_terms = list(DEFAULT_PROTECTED_TERMS)
     if args.protect:
@@ -1261,6 +1424,11 @@ def main() -> None:
         return
 
     cache_file = args.output.with_suffix(args.output.suffix + ".cache.json")
+    strict_no_english_residue = STRICT_NO_ENGLISH_RESIDUE and target_is_spanish(args.target)
+    if args.strict_no_english_residue is True:
+        strict_no_english_residue = True
+    if args.no_strict_no_english_residue:
+        strict_no_english_residue = False
 
     def progress_callback(current_subset: Sequence[str]) -> None:
         merged = assemble_full_texts(targets, current_subset, enforce_skip_integrity=True)
@@ -1284,6 +1452,7 @@ def main() -> None:
             protected_terms=protected_terms,
             protected_regex=protected_regex,
             acronym_exclude=acronym_exclude,
+            strict_no_english_residue=strict_no_english_residue,
         )
         final_texts = assemble_full_texts(
             targets, translated_subset, enforce_skip_integrity=True
