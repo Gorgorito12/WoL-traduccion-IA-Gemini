@@ -48,7 +48,20 @@ DEFAULT_PROTECTED_REGEX = [DEFAULT_ACRONYM_REGEX,
 
 # ALL-CAPS tokens that should be allowed to translate (e.g., English number words).
 # These sometimes appear in legacy/localized strings and should NOT be treated as acronyms.
-DEFAULT_ACRONYM_EXCLUDE = ["ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN", "EIGHT", "NINE", "TEN", "ZERO"]
+DEFAULT_ACRONYM_EXCLUDE = [
+    "ONE",
+    "TWO",
+    "THREE",
+    "FOUR",
+    "FIVE",
+    "SIX",
+    "SEVEN",
+    "EIGHT",
+    "NINE",
+    "TEN",
+    "ZERO",
+    "TEAM",
+]
 
 def target_is_spanish(target_lang: str) -> bool:
     tl = (target_lang or "").lower()
