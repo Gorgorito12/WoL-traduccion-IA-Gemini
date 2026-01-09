@@ -162,6 +162,7 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
         "Treat any __PROTECT_x__ tokens as immutable placeholders. "
         "Treat common gaming acronyms (XP, HP, MP, DPS, AOE, UI, etc.) as non-translatable; "
         "they must remain exactly the same even when adjacent to numbers or symbols. Do NOT treat English number words like ONE/TWO/THREE as acronyms; translate them normally when used as words. "
+        "Translate emphasized ALL-CAPS words (e.g., YOU, THEY, THESE) into the target language and keep them in ALL-CAPS, unless they are in the acronym list. "
         "If a string contains escaped newlines (\\n) or bullet characters (•), keep them exactly as written (do not convert \\n to real newlines). "
         "Do NOT merge, split, rephrase, or reorder strings. "
         "Ensure identical source strings receive identical translations. "
@@ -194,6 +195,7 @@ DEFAULT_PROMPT_CONFIG = PromptConfig(
        __TOK#, %s, %1$s, %d, \n, \t, and __PROTECT_x__ tokens.
     1.1 Treat common gaming acronyms (XP, HP, MP, DPS, AOE, UI, etc.) as immutable terminology. Do NOT translate or change their character order, even when they appear next to numbers or symbols.
     1.2 Do NOT treat English number words like ONE/TWO/THREE as acronyms; translate them normally when used as words.
+    1.3 Translate emphasized ALL-CAPS words (e.g., YOU, THEY, THESE) into the target language and keep them in ALL-CAPS, unless they are in the acronym list.
     2. Preserve literal escape sequences: keep \\n and similar sequences as-is (do NOT convert them to real newlines).
        Maintain bullet characters (•) and surrounding spacing exactly.
     3. Do NOT merge, split, expand, or rephrase strings.
