@@ -116,7 +116,12 @@ STRICT_QUALITY_RULES = (
 
 def target_is_spanish(target_lang: str) -> bool:
     tl = (target_lang or "").lower()
-    return ("spanish" in tl) or ("español" in tl) or ("espanol" in tl)
+    return (
+        ("spanish" in tl)
+        or ("español" in tl)
+        or ("espanol" in tl)
+        or re.match(r"^es([_-]|$)", tl) is not None
+    )
 
 def _strip_quality_tokens(text: str) -> str:
     cleaned = PROTECT_TOKEN_RE.sub(" ", text)
@@ -191,18 +196,31 @@ def apply_postprocess_overrides(original_text: str, translated_text: str, target
             flags=re.IGNORECASE,
         )
 
-    if re.search(r"\bteam\b", original_text, re.IGNORECASE):
-        def repl(match: re.Match[str]) -> str:
-            word = match.group(0)
-            if word.isupper():
-                return "EQUIPO"
-            if word.islower():
-                return "equipo"
-            return "Equipo"
-
-        out = re.sub(r"\bteam\b", repl, out, flags=re.IGNORECASE)
-
     return out
+
+
+def enforce_team_card_prefix(source: str, translated: str, target_lang: str) -> str:
+    if not target_is_spanish(target_lang):
+        return translated
+    if not re.match(r"^\s*TEAM\b", source):
+        return translated
+    if re.match(r"^\s*EQUIPO:\s*", translated):
+        return translated
+
+    updated = re.sub(r"^\s*TEAM\b:?[\s-]*", "EQUIPO: ", translated)
+    if updated != translated:
+        return updated
+
+    updated = re.sub(
+        r"^\s*EQUIPO\b(?!:)\s*",
+        "EQUIPO: ",
+        translated,
+        flags=re.IGNORECASE,
+    )
+    if updated != translated:
+        return updated
+
+    return "EQUIPO: " + translated.lstrip()
 
 
 @dataclass(frozen=True)
@@ -899,6 +917,7 @@ def translate_strings(
                 )
                 restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
                 restored = enforce_acronym_integrity(original_texts[idx], restored, exclude=acronym_exclude)
+                restored = enforce_team_card_prefix(original_texts[idx], restored, target_lang)
                 restored = apply_source_casing(original_texts[idx], restored)
                 translations[idx] = restored
             continue
@@ -997,6 +1016,7 @@ def translate_strings(
                     )
                     restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
                     restored = enforce_acronym_integrity(original_texts[idx], restored, exclude=acronym_exclude)
+                    restored = enforce_team_card_prefix(original_texts[idx], restored, target_lang)
                     restored = apply_source_casing(original_texts[idx], restored)
                     translations[idx] = restored
 
