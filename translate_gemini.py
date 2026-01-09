@@ -161,6 +161,9 @@ def terminology_overrides_for_target(target_lang: str) -> str:
             "- Translate 'Home City' as 'Metrópoli'.\n"
             "- Translate 'Home Cities' as 'Metrópolis'.\n"
             "- If 'Home City' appears inside a longer sentence, still render it as 'Metrópoli/Metrópolis'.\n"
+            "- If a sentence starts with 'TEAM', do NOT translate 'TEAM' literally. Rephrase naturally so it"
+            " conveys the effect applies to the whole team (e.g., 'Todo el equipo recibe...',"
+            " 'Se envió ... para todo el equipo', '... son más baratos para todo el equipo').\n"
         )
     return ""
 
@@ -191,6 +194,7 @@ def apply_postprocess_overrides(original_text: str, translated_text: str, target
             flags=re.IGNORECASE,
         )
 
+    team_prefix = re.match(r"^\s*team\b", original_text, re.IGNORECASE) is not None
     if re.search(r"\bteam\b", original_text, re.IGNORECASE):
         def repl(match: re.Match[str]) -> str:
             word = match.group(0)
@@ -200,7 +204,10 @@ def apply_postprocess_overrides(original_text: str, translated_text: str, target
                 return "equipo"
             return "Equipo"
 
-        out = re.sub(r"\bteam\b", repl, out, flags=re.IGNORECASE)
+        if team_prefix:
+            out = re.sub(r"^\s*team\b[:\s]*", "Todo el equipo ", out, flags=re.IGNORECASE)
+        else:
+            out = re.sub(r"\bteam\b", repl, out, flags=re.IGNORECASE)
 
     return out
 
