@@ -114,17 +114,31 @@ def apply_postprocess_overrides(original_text: str, translated_text: str, target
     src_has_plural = re.search(r"\bHome\s+Cities\b", original_text, re.IGNORECASE) is not None
     src_has_singular = re.search(r"\bHome\s+City\b", original_text, re.IGNORECASE) is not None
 
-    if not (src_has_plural or src_has_singular):
-        return translated_text
-
     out = translated_text
 
-    # Replace any leftover English occurrences.
-    out = re.sub(r"\bHome\s+Cities\b", "Metrópolis", out, flags=re.IGNORECASE)
-    out = re.sub(r"\bHome\s+City\b", "Metrópoli", out, flags=re.IGNORECASE)
+    if src_has_plural or src_has_singular:
+        # Replace any leftover English occurrences.
+        out = re.sub(r"\bHome\s+Cities\b", "Metrópolis", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bHome\s+City\b", "Metrópoli", out, flags=re.IGNORECASE)
 
-    # Replace the common (but unwanted in WoL Spanish) translation 'ciudad natal'.
-    out = re.sub(r"\bciudades?\s+natales?\b", "Metrópolis" if src_has_plural else "Metrópoli", out, flags=re.IGNORECASE)
+        # Replace the common (but unwanted in WoL Spanish) translation 'ciudad natal'.
+        out = re.sub(
+            r"\bciudades?\s+natales?\b",
+            "Metrópolis" if src_has_plural else "Metrópoli",
+            out,
+            flags=re.IGNORECASE,
+        )
+
+    if re.search(r"\bteam\b", original_text, re.IGNORECASE):
+        def repl(match: re.Match[str]) -> str:
+            word = match.group(0)
+            if word.isupper():
+                return "EQUIPO"
+            if word.islower():
+                return "equipo"
+            return "Equipo"
+
+        out = re.sub(r"\bteam\b", repl, out, flags=re.IGNORECASE)
 
     return out
 
