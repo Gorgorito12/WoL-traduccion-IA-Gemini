@@ -407,7 +407,9 @@ def is_path_like_text(text: str) -> bool:
     cleaned = re.sub(r"&lt;.*?&gt;", "", stripped)
 
     # Neutralize common escape sequences so they don't look like backslash paths.
-    cleaned = cleaned.replace("\n", " ").replace("\t", " ").replace("\r", " ").strip()
+    cleaned = cleaned.replace("\n", " ").replace("\t", " ").replace("\r", " ")
+    cleaned = re.sub(r"\\[ntr]", " ", cleaned)
+    cleaned = cleaned.strip()
     if not cleaned:
         return False
 
