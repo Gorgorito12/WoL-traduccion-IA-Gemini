@@ -39,6 +39,8 @@ DEFAULT_COMPACT_PROMPT = True
 DEFAULT_MAX_WORKERS = 8
 DEFAULT_MAX_QUALITY_RETRIES = 2
 STRICT_NO_ENGLISH_RESIDUE = True
+DEFAULT_TODO_TRANSLATE_PREFIX = "TODO_TRANSLATE: "
+NEW_UNTRANSLATED_MARKER = "NEW_UNTRANSLATED"
 
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
 PROTECT_TOKEN_RE = re.compile(r"__PROTECT_\d+__")
@@ -1203,6 +1205,7 @@ def assemble_full_texts(
     targets: Sequence[TranslationTarget],
     translated: Sequence[str],
     enforce_skip_integrity: bool = True,
+    todo_prefix: str = DEFAULT_TODO_TRANSLATE_PREFIX,
 ) -> List[str]:
     merged: List[str] = []
     translated_iter = iter(translated)
@@ -1211,7 +1214,11 @@ def assemble_full_texts(
             merged.append(target.text)
             continue
         try:
-            merged.append(next(translated_iter))
+            candidate = next(translated_iter)
+            if candidate == NEW_UNTRANSLATED_MARKER:
+                prefix = todo_prefix or ""
+                candidate = f"{prefix}{target.text}"
+            merged.append(candidate)
         except StopIteration:
             raise ValueError("Not enough translated items to map back to elements.")
     try:
@@ -1397,6 +1404,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run quick quality gate tests and exit.",
     )
+    parser.add_argument(
+        "--todo-prefix",
+        default=DEFAULT_TODO_TRANSLATE_PREFIX,
+        help="Prefix to mark untranslated entries when NEW_UNTRANSLATED is encountered.",
+    )
     return parser.parse_args()
 
 def main() -> None:
@@ -1449,12 +1461,17 @@ def main() -> None:
                     target.reason,
                 )
         starting_texts = assemble_full_texts(
-            targets, existing_translations_subset, enforce_skip_integrity=True
+            targets,
+            existing_translations_subset,
+            enforce_skip_integrity=True,
+            todo_prefix=args.todo_prefix,
         )
     else:
         starting_texts = [target.text for target in targets]
 
-    write_output_snapshot(tree, elements, starting_texts, args.output, doc_format, diagnostic=args.diagnostic)
+    write_output_snapshot(
+        tree, elements, starting_texts, args.output, doc_format, diagnostic=args.diagnostic
+    )
 
     if not translatable_texts:
         print("🔒 No elements eligible for translation. Output snapshot written.")
@@ -1469,7 +1486,12 @@ def main() -> None:
         strict_no_english_residue = False
 
     def progress_callback(current_subset: Sequence[str]) -> None:
-        merged = assemble_full_texts(targets, current_subset, enforce_skip_integrity=True)
+        merged = assemble_full_texts(
+            targets,
+            current_subset,
+            enforce_skip_integrity=True,
+            todo_prefix=args.todo_prefix,
+        )
         write_output_snapshot(
             tree, elements, merged, args.output, doc_format, diagnostic=args.diagnostic
         )
@@ -1493,7 +1515,10 @@ def main() -> None:
             strict_no_english_residue=strict_no_english_residue,
         )
         final_texts = assemble_full_texts(
-            targets, translated_subset, enforce_skip_integrity=True
+            targets,
+            translated_subset,
+            enforce_skip_integrity=True,
+            todo_prefix=args.todo_prefix,
         )
         write_output_snapshot(tree, elements, final_texts, args.output, doc_format, diagnostic=args.diagnostic)
         print(f"\n✅ Completed: {args.output}")
