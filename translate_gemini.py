@@ -1363,6 +1363,7 @@ def self_test_source_casing() -> None:
 def format_translation_report(
     report: Dict[str, object],
     max_misses: int = 100,
+    max_changes: int = 100,
 ) -> str:
     lines = ["🧾 Reporte de traducción"]
     total = report.get("total_translatable", 0)
@@ -1390,7 +1391,47 @@ def format_translation_report(
     omitted = len(misses) - len(shown)
     if omitted > 0:
         lines.append(f"... {omitted} more omitted")
+
+    changes = report.get("changes", [])
+    lines.append("")
+    lines.append("Cambios detectados (input vs output, tipo WinMerge):")
+    if not changes:
+        lines.append("  (ninguno)")
+        return "\n".join(lines)
+    shown_changes = changes[:max_changes]
+    for change in shown_changes:
+        symbol = change.get("symbol") or "N/A"
+        loc_id = change.get("loc_id")
+        loc_label = f" loc_id={loc_id}" if loc_id else ""
+        source_text = change.get("source_text") or ""
+        previous_text = change.get("previous_text") or ""
+        lines.append(f"- symbol={symbol}{loc_label}")
+        lines.append(f"  source: {source_text}")
+        lines.append(f"  previous: {previous_text}")
+    omitted_changes = len(changes) - len(shown_changes)
+    if omitted_changes > 0:
+        lines.append(f"... {omitted_changes} more omitted")
     return "\n".join(lines)
+
+def build_change_report(
+    targets: Sequence[TranslationTarget],
+    existing_translations: Sequence[str],
+) -> List[Dict[str, Optional[str]]]:
+    changes: List[Dict[str, Optional[str]]] = []
+    for target, previous_text in zip(targets, existing_translations):
+        if target.skip:
+            continue
+        if not previous_text or previous_text == target.text:
+            continue
+        changes.append(
+            {
+                "symbol": target.symbol,
+                "loc_id": extract_loc_id(target.text),
+                "source_text": target.text,
+                "previous_text": previous_text,
+            }
+        )
+    return changes
 
 
 def parse_args() -> argparse.Namespace:
@@ -1616,6 +1657,11 @@ def main() -> None:
         print(f"\n✅ Completed: {args.output}")
         if report_data is not None:
             report_data["skipped"] = skipped_count
+            if existing_translations_full:
+                report_data["changes"] = build_change_report(
+                    targets,
+                    existing_translations_full,
+                )
             if args.report_format == "json":
                 report_text = json.dumps(report_data, ensure_ascii=False, indent=2)
             else:
