@@ -13,7 +13,7 @@ import random
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from google import genai
@@ -828,7 +828,9 @@ def translate_strings(
     acronym_exclude: Optional[Sequence[str]] = None,
     strict_no_english_residue: Optional[bool] = None,
     cache_only: bool = False,
-) -> List[str]:
+    report: bool = False,
+    report_symbols: Optional[Sequence[Optional[str]]] = None,
+) -> Union[List[str], Tuple[List[str], Dict[str, object]]]:
     
     protected_terms = protected_terms or []
     protected_regex = list(DEFAULT_PROTECTED_REGEX) + (list(protected_regex) if protected_regex else [])
@@ -847,6 +849,9 @@ def translate_strings(
     indexes_by_protected: Dict[str, List[int]] = {}
 
     cache: Dict[str, str] = {}
+    report_hits = 0
+    report_misses = 0
+    report_miss_map: Dict[str, Dict[str, Optional[str]]] = {}
     if cache_path and cache_path.exists():
         try:
             cache = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -877,11 +882,14 @@ def translate_strings(
 
         translations.append(initial_translation)
         indexes_by_protected.setdefault(protected_text, []).append(idx)
+    total_translatable = len(protected)
     unique_to_translate: List[str] = []
     already_enqueued: set[str] = set()
 
-    for text in protected:
+    for idx, text in enumerate(protected):
         if not text.strip():
+            if report:
+                report_hits += 1
             cache[text] = text
             # Propagate empty text as-is to every position.
             for idx in indexes_by_protected.get(text, []):
@@ -891,6 +899,20 @@ def translate_strings(
             continue
 
         cached_value = cache.get(text)
+
+        if report:
+            if cached_value and cached_value.strip():
+                report_hits += 1
+            else:
+                report_misses += 1
+                reason = "missing_in_cache" if cached_value is None else "empty_cache_entry"
+                if text not in report_miss_map:
+                    symbol = report_symbols[idx] if report_symbols and idx < len(report_symbols) else None
+                    report_miss_map[text] = {
+                        "symbol": symbol,
+                        "source_text": original_texts[idx],
+                        "reason": reason,
+                    }
 
         if cached_value and cached_value.strip():
             # We already had a cached translation: reuse it everywhere and skip re-translation.
@@ -921,6 +943,13 @@ def translate_strings(
             unique_to_translate.append(text)
 
     if cache_only or not unique_to_translate:
+        if report:
+            return translations, {
+                "total_translatable": total_translatable,
+                "cache_hits": report_hits,
+                "cache_misses": report_misses,
+                "misses": list(report_miss_map.values()),
+            }
         return translations
 
     if not api_key:
@@ -1019,6 +1048,13 @@ def translate_strings(
             if progress_callback:
                 progress_callback(list(translations))
 
+    if report:
+        return translations, {
+            "total_translatable": total_translatable,
+            "cache_hits": report_hits,
+            "cache_misses": report_misses,
+            "misses": list(report_miss_map.values()),
+        }
     return translations
 
 # --- XML Utils ---
@@ -1314,6 +1350,36 @@ def self_test_source_casing() -> None:
 
     print("✅ Source casing self-test passed.")
 
+def format_translation_report(
+    report: Dict[str, object],
+    max_misses: int = 100,
+) -> str:
+    lines = ["🧾 Reporte de traducción"]
+    total = report.get("total_translatable", 0)
+    cache_hits = report.get("cache_hits", 0)
+    cache_misses = report.get("cache_misses", 0)
+    lines.append(f"Total strings translatables: {total}")
+    lines.append(f"cache_hits: {cache_hits}")
+    lines.append(f"cache_misses: {cache_misses}")
+    if "skipped" in report:
+        lines.append(f"skipped: {report.get('skipped')}")
+    lines.append("")
+    lines.append("Misses (lo nuevo/cambiado que falta traducir):")
+    misses = report.get("misses", [])
+    if not misses:
+        lines.append("  (ninguno)")
+        return "\n".join(lines)
+    shown = misses[:max_misses]
+    for miss in shown:
+        symbol = miss.get("symbol") or "N/A"
+        source_text = miss.get("source_text") or ""
+        reason = miss.get("reason") or "missing_in_cache"
+        lines.append(f"- [{reason}] symbol={symbol} text={source_text}")
+    omitted = len(misses) - len(shown)
+    if omitted > 0:
+        lines.append(f"... {omitted} more omitted")
+    return "\n".join(lines)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -1411,6 +1477,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only use cached translations; do not call the Gemini API.",
     )
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="Print a translation summary report at the end.",
+    )
+    parser.add_argument(
+        "--report-file",
+        type=Path,
+        help="Optional path to write the report output (text or JSON).",
+    )
+    parser.add_argument(
+        "--report-format",
+        choices=("text", "json"),
+        default="text",
+        help="Report output format (text or json).",
+    )
     return parser.parse_args()
 
 def main() -> None:
@@ -1489,7 +1571,8 @@ def main() -> None:
         )
 
     try:
-        translated_subset = translate_strings(
+        report_requested = bool(args.report or args.report_file)
+        translation_result = translate_strings(
             translatable_texts,
             api_key=args.api_key,
             source_lang=args.source,
@@ -1506,12 +1589,29 @@ def main() -> None:
             acronym_exclude=acronym_exclude,
             strict_no_english_residue=strict_no_english_residue,
             cache_only=args.cache_only,
+            report=report_requested,
+            report_symbols=[target.symbol for target in translatable_targets],
         )
+        if report_requested:
+            translated_subset, report_data = translation_result
+        else:
+            translated_subset = translation_result
+            report_data = None
         final_texts = assemble_full_texts(
             targets, translated_subset, enforce_skip_integrity=True
         )
         write_output_snapshot(tree, elements, final_texts, args.output, doc_format, diagnostic=args.diagnostic)
         print(f"\n✅ Completed: {args.output}")
+        if report_data is not None:
+            report_data["skipped"] = skipped_count
+            if args.report_format == "json":
+                report_text = json.dumps(report_data, ensure_ascii=False, indent=2)
+            else:
+                report_text = format_translation_report(report_data)
+            if args.report:
+                print("\n" + report_text)
+            if args.report_file:
+                args.report_file.write_text(report_text + "\n", encoding="utf-8")
 
     except Exception as e:
         print(f"\n❌ Error: {e}")
