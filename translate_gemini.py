@@ -827,6 +827,7 @@ def translate_strings(
     protected_regex: Optional[Sequence[re.Pattern[str]]] = None,
     acronym_exclude: Optional[Sequence[str]] = None,
     strict_no_english_residue: Optional[bool] = None,
+    cache_only: bool = False,
 ) -> List[str]:
     
     protected_terms = protected_terms or []
@@ -903,6 +904,14 @@ def translate_strings(
                 translations[idx] = restored
             continue
 
+        if cache_only:
+            for idx in indexes_by_protected.get(text, []):
+                restored = restore_all_tokens(
+                    text, token_maps[idx], phrase_maps[idx], original_texts[idx]
+                )
+                translations[idx] = restored
+            continue
+
         # If there is no cache (or it is empty), register an entry and queue it for translation,
         # avoiding duplicates.
         if text not in cache:
@@ -911,7 +920,7 @@ def translate_strings(
             already_enqueued.add(text)
             unique_to_translate.append(text)
 
-    if not unique_to_translate:
+    if cache_only or not unique_to_translate:
         return translations
 
     if not api_key:
@@ -1397,6 +1406,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run quick quality gate tests and exit.",
     )
+    parser.add_argument(
+        "--cache-only",
+        action="store_true",
+        help="Only use cached translations; do not call the Gemini API.",
+    )
     return parser.parse_args()
 
 def main() -> None:
@@ -1491,6 +1505,7 @@ def main() -> None:
             protected_regex=protected_regex,
             acronym_exclude=acronym_exclude,
             strict_no_english_residue=strict_no_english_residue,
+            cache_only=args.cache_only,
         )
         final_texts = assemble_full_texts(
             targets, translated_subset, enforce_skip_integrity=True
