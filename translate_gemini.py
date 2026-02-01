@@ -43,6 +43,7 @@ STRICT_NO_ENGLISH_RESIDUE = True
 PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
 PROTECT_TOKEN_RE = re.compile(r"__PROTECT_\d+__")
 QUALITY_TOKEN_RE = re.compile(r"__TOK\d+__")
+LOC_ID_RE = re.compile(r"String _locID=(\d+)")
 DEFAULT_SKIP_SYMBOL_CONTAINS = ["folder", "path", "dir", "directory"]
 DEFAULT_PROTECTED_TERMS = ["Age of Empires III: Wars of Liberty", "My Games"]
 DEFAULT_ACRONYM_TERMS = [
@@ -440,6 +441,14 @@ def enforce_acronym_integrity(
             return original_text
 
     return candidate_text
+
+def extract_loc_id(text: str) -> Optional[str]:
+    if not text:
+        return None
+    match = LOC_ID_RE.search(text)
+    if not match:
+        return None
+    return match.group(1)
 
 
 def restore_all_tokens(
@@ -912,6 +921,7 @@ def translate_strings(
                         "symbol": symbol,
                         "source_text": original_texts[idx],
                         "reason": reason,
+                        "loc_id": extract_loc_id(original_texts[idx]),
                     }
 
         if cached_value and cached_value.strip():
@@ -1374,7 +1384,9 @@ def format_translation_report(
         symbol = miss.get("symbol") or "N/A"
         source_text = miss.get("source_text") or ""
         reason = miss.get("reason") or "missing_in_cache"
-        lines.append(f"- [{reason}] symbol={symbol} text={source_text}")
+        loc_id = miss.get("loc_id")
+        loc_label = f" loc_id={loc_id}" if loc_id else ""
+        lines.append(f"- [{reason}] symbol={symbol}{loc_label} text={source_text}")
     omitted = len(misses) - len(shown)
     if omitted > 0:
         lines.append(f"... {omitted} more omitted")
