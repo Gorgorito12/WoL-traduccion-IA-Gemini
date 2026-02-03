@@ -944,6 +944,13 @@ def translate_strings(
             unique_to_translate.append(text)
 
     if cache_only or not unique_to_translate:
+        if cache_path:
+            try:
+                cache_path.write_text(
+                    json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+            except Exception as exc:
+                logging.warning("Failed to write cache file: %s", exc)
         return translations, stats
 
     if not api_key:
