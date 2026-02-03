@@ -1507,10 +1507,10 @@ def main() -> None:
     if not translatable_texts:
         print("🔒 No elements eligible for translation. Output snapshot written.")
         print("\n📊 Summary")
-        print("Total de strings: 0")
-        print("Usadas desde cache: 0")
-        print("Traducidas con API: 0")
-        print("Saltadas por cache vacío (skipped (cached empty)): 0")
+        print("Total strings: 0")
+        print("Used from cache: 0")
+        print("Translated with API: 0")
+        print("Skipped due to empty cache (skipped (cached empty)): 0")
         print(f"\n✅ Completed: {args.output}")
         return
 
@@ -1552,10 +1552,10 @@ def main() -> None:
         )
         write_output_snapshot(tree, elements, final_texts, args.output, doc_format, diagnostic=args.diagnostic)
         print("\n📊 Summary")
-        print(f"Total de strings: {stats.total_strings}")
-        print(f"Usadas desde cache: {stats.cache_used}")
-        print(f"Traducidas con API: {stats.api_translated}")
-        print(f"Saltadas por cache vacío (skipped (cached empty)): {stats.cache_empty_skipped}")
+        print(f"Total strings: {stats.total_strings}")
+        print(f"Used from cache: {stats.cache_used}")
+        print(f"Translated with API: {stats.api_translated}")
+        print(f"Skipped due to empty cache (skipped (cached empty)): {stats.cache_empty_skipped}")
         print(f"\n✅ Completed: {args.output}")
 
     except Exception as e:
