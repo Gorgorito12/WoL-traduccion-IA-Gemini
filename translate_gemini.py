@@ -315,6 +315,15 @@ class TranslationTarget:
 
 
 @dataclass(frozen=True)
+class DiffEntry:
+    symbol: str
+    status: str
+    old_text: str
+    new_text: str
+    cache_status: Optional[str]
+
+
+@dataclass(frozen=True)
 class SkipRules:
     symbol_exact: Sequence[str]
     symbol_contains: Sequence[str]
@@ -1274,6 +1283,260 @@ def build_skip_rules(args: argparse.Namespace) -> SkipRules:
         enable_path_heuristic=not args.no_path_heuristic,
     )
 
+def build_report_paths(output: Path, report_out: Optional[Path]) -> Tuple[Path, Path]:
+    if report_out:
+        base = report_out
+        if base.suffix in {".json", ".txt"}:
+            base = base.with_suffix("")
+        return base.with_suffix(".json"), base.with_suffix(".txt")
+    json_path = output.with_suffix(output.suffix + ".diff_report.json")
+    txt_path = output.with_suffix(output.suffix + ".diff_report.txt")
+    return json_path, txt_path
+
+def build_cache_status(
+    text: str,
+    protected_terms: Sequence[str],
+    protected_regex: Sequence[re.Pattern[str]],
+    acronym_exclude: Sequence[str],
+    cache: Dict[str, str],
+) -> str:
+    phrase_protected, _ = protect_phrases(
+        text,
+        protected_terms,
+        protected_regex,
+        regex_exclude=acronym_exclude,
+    )
+    protected_text, _ = protect_tokens(phrase_protected)
+    cached_value = cache.get(protected_text)
+    if cached_value and cached_value.strip():
+        return "cache_hit"
+    return "cache_miss"
+
+def build_report_entries(
+    input_targets: Sequence[TranslationTarget],
+    baseline_targets: Sequence[TranslationTarget],
+    protected_terms: Sequence[str],
+    protected_regex: Sequence[re.Pattern[str]],
+    acronym_exclude: Sequence[str],
+    cache: Dict[str, str],
+) -> List[DiffEntry]:
+    def make_key(target: TranslationTarget, index: int) -> str:
+        if target.symbol:
+            return f"symbol:{target.symbol}"
+        return f"index:{index}"
+
+    input_map: Dict[str, Tuple[TranslationTarget, int]] = {}
+    baseline_map: Dict[str, Tuple[TranslationTarget, int]] = {}
+
+    for idx, target in enumerate(input_targets):
+        input_map[make_key(target, idx)] = (target, idx)
+    for idx, target in enumerate(baseline_targets):
+        baseline_map[make_key(target, idx)] = (target, idx)
+
+    entries: List[DiffEntry] = []
+
+    for key, (input_target, input_idx) in input_map.items():
+        baseline_entry = baseline_map.get(key)
+        symbol = input_target.symbol or f"#index:{input_idx}"
+        if baseline_entry is None:
+            cache_status = build_cache_status(
+                input_target.text,
+                protected_terms,
+                protected_regex,
+                acronym_exclude,
+                cache,
+            )
+            entries.append(
+                DiffEntry(
+                    symbol=symbol,
+                    status="new",
+                    old_text="",
+                    new_text=input_target.text,
+                    cache_status=cache_status,
+                )
+            )
+            continue
+        baseline_target = baseline_entry[0]
+        if baseline_target.text == input_target.text:
+            entries.append(
+                DiffEntry(
+                    symbol=symbol,
+                    status="unchanged",
+                    old_text=baseline_target.text,
+                    new_text=input_target.text,
+                    cache_status=None,
+                )
+            )
+            continue
+        cache_status = build_cache_status(
+            input_target.text,
+            protected_terms,
+            protected_regex,
+            acronym_exclude,
+            cache,
+        )
+        entries.append(
+            DiffEntry(
+                symbol=symbol,
+                status="changed",
+                old_text=baseline_target.text,
+                new_text=input_target.text,
+                cache_status=cache_status,
+            )
+        )
+
+    for key, (baseline_target, baseline_idx) in baseline_map.items():
+        if key in input_map:
+            continue
+        symbol = baseline_target.symbol or f"#index:{baseline_idx}"
+        entries.append(
+            DiffEntry(
+                symbol=symbol,
+                status="removed",
+                old_text=baseline_target.text,
+                new_text="",
+                cache_status=None,
+            )
+        )
+
+    return entries
+
+def render_report_txt(entries: Sequence[DiffEntry]) -> str:
+    totals = {
+        "total": len(entries),
+        "unchanged": sum(1 for entry in entries if entry.status == "unchanged"),
+        "changed": sum(1 for entry in entries if entry.status == "changed"),
+        "new": sum(1 for entry in entries if entry.status == "new"),
+        "removed": sum(1 for entry in entries if entry.status == "removed"),
+        "cache_hit": sum(1 for entry in entries if entry.cache_status == "cache_hit"),
+        "cache_miss": sum(1 for entry in entries if entry.cache_status == "cache_miss"),
+    }
+
+    def format_entry(entry: DiffEntry) -> str:
+        return (
+            f"- {entry.symbol}\n"
+            f"  OLD: {entry.old_text}\n"
+            f"  NEW: {entry.new_text}\n"
+        )
+
+    new_miss = [
+        entry for entry in entries
+        if entry.status == "new" and entry.cache_status == "cache_miss"
+    ]
+    changed_miss = [
+        entry for entry in entries
+        if entry.status == "changed" and entry.cache_status == "cache_miss"
+    ]
+    covered = [
+        entry for entry in entries
+        if entry.status in {"new", "changed"} and entry.cache_status == "cache_hit"
+    ]
+    removed = [entry for entry in entries if entry.status == "removed"]
+
+    lines = [
+        "# Diff Report",
+        (
+            "Totals: total={total}, unchanged={unchanged}, changed={changed}, new={new}, "
+            "removed={removed}, cache_hit={cache_hit}, cache_miss={cache_miss}"
+        ).format(**totals),
+        "",
+        "## NEW (needs translation)",
+    ]
+    if new_miss:
+        lines.extend(format_entry(entry) for entry in new_miss)
+    else:
+        lines.append("(none)")
+
+    lines.extend(["", "## CHANGED (needs translation)"])
+    if changed_miss:
+        lines.extend(format_entry(entry) for entry in changed_miss)
+    else:
+        lines.append("(none)")
+
+    lines.extend(["", "## Covered by cache"])
+    if covered:
+        lines.extend(format_entry(entry) for entry in covered)
+    else:
+        lines.append("(none)")
+
+    lines.extend(["", "## Removed"])
+    if removed:
+        lines.extend(format_entry(entry) for entry in removed)
+    else:
+        lines.append("(none)")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+def write_diff_report(
+    input_path: Path,
+    baseline_path: Path,
+    output_path: Path,
+    report_out: Optional[Path],
+    skip_rules: SkipRules,
+    protected_terms: Sequence[str],
+    protected_regex: Sequence[re.Pattern[str]],
+    acronym_exclude: Sequence[str],
+) -> None:
+    input_tree, _ = parse_strings_xml(input_path)
+    baseline_tree, _ = parse_strings_xml(baseline_path)
+
+    input_targets = [
+        target for target in iter_translatable_elements(input_tree.getroot(), skip_rules)
+        if not target.skip
+    ]
+    baseline_targets = [
+        target for target in iter_translatable_elements(baseline_tree.getroot(), skip_rules)
+        if not target.skip
+    ]
+
+    cache_file = output_path.with_suffix(output_path.suffix + ".cache.json")
+    cache: Dict[str, str] = {}
+    if cache_file.exists():
+        try:
+            cache = json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logging.warning("Unable to load previous cache (%s): %s", cache_file, exc)
+
+    entries = build_report_entries(
+        input_targets,
+        baseline_targets,
+        protected_terms,
+        protected_regex,
+        acronym_exclude,
+        cache,
+    )
+
+    json_path, txt_path = build_report_paths(output_path, report_out)
+    report_payload = {
+        "summary": {
+            "total": len(entries),
+            "unchanged": sum(1 for entry in entries if entry.status == "unchanged"),
+            "changed": sum(1 for entry in entries if entry.status == "changed"),
+            "new": sum(1 for entry in entries if entry.status == "new"),
+            "removed": sum(1 for entry in entries if entry.status == "removed"),
+            "cache_hit": sum(1 for entry in entries if entry.cache_status == "cache_hit"),
+            "cache_miss": sum(1 for entry in entries if entry.cache_status == "cache_miss"),
+        },
+        "entries": [
+            {
+                "symbol": entry.symbol,
+                "status": entry.status,
+                "old_text": entry.old_text,
+                "new_text": entry.new_text,
+                "cache_status": entry.cache_status,
+            }
+            for entry in entries
+        ],
+    }
+
+    json_path.write_text(
+        json.dumps(report_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    txt_path.write_text(render_report_txt(entries), encoding="utf-8")
+    print(f"📄 Diff report written: {json_path}")
+    print(f"📄 Diff report written: {txt_path}")
+
 def self_test_quality_gate() -> None:
     target_lang = "Spanish"
     def _assert(condition: bool, message: str) -> None:
@@ -1411,6 +1674,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only use cached translations; do not call the Gemini API.",
     )
+    parser.add_argument(
+        "--report-diff",
+        action="store_true",
+        help="Generate a diff report without translating and exit.",
+    )
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        help="Baseline XML file to compare against when using --report-diff.",
+    )
+    parser.add_argument(
+        "--report-out",
+        type=Path,
+        help="Optional base path for diff report output (JSON/TXT).",
+    )
     return parser.parse_args()
 
 def main() -> None:
@@ -1431,6 +1709,23 @@ def main() -> None:
 
     if not args.input.exists():
         raise SystemExit(f"File does not exist: {args.input}")
+
+    if args.report_diff:
+        if not args.baseline:
+            raise SystemExit("--baseline is required when using --report-diff.")
+        if not args.baseline.exists():
+            raise SystemExit(f"Baseline file does not exist: {args.baseline}")
+        write_diff_report(
+            input_path=args.input,
+            baseline_path=args.baseline,
+            output_path=args.output,
+            report_out=args.report_out,
+            skip_rules=skip_rules,
+            protected_terms=protected_terms,
+            protected_regex=protected_regex,
+            acronym_exclude=acronym_exclude,
+        )
+        return
 
     tree, doc_format = parse_strings_xml(args.input)
     targets = list(iter_translatable_elements(tree.getroot(), skip_rules))
