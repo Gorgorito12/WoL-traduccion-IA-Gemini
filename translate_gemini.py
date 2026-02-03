@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import csv
 
 from google import genai
 from google.genai import types
@@ -488,6 +489,53 @@ def compile_regex_list(patterns: Optional[Sequence[str]]) -> List[re.Pattern[str
             logging.warning("Invalid regex skipped (%s): %s", pattern, exc)
     return compiled
 
+def load_cache_file(path: Path) -> Dict[str, str]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logging.warning("Unable to load previous cache (%s): %s", path, exc)
+        return {}
+
+def build_missing_report_rows(
+    targets: Sequence[TranslationTarget],
+    cache: Dict[str, str],
+    protected_terms: Sequence[str],
+    protected_regex: Sequence[re.Pattern[str]],
+    acronym_exclude: Sequence[str],
+) -> List[Tuple[int, str, str, str]]:
+    rows: List[Tuple[int, str, str, str]] = []
+    for idx, target in enumerate(targets, start=1):
+        if target.skip:
+            continue
+        text = target.text or ""
+        if not text.strip():
+            continue
+        phrase_protected, _ = protect_phrases(
+            text,
+            protected_terms,
+            protected_regex,
+            regex_exclude=acronym_exclude,
+        )
+        protected_text, _ = protect_tokens(phrase_protected)
+        cached_value = cache.get(protected_text)
+        if cached_value is None:
+            status = "not_cached"
+        elif not cached_value.strip():
+            status = "cached_empty"
+        else:
+            continue
+        rows.append((idx, text, target.symbol or "", status))
+    return rows
+
+def write_missing_report(path: Path, rows: Sequence[Tuple[int, str, str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["index", "text", "symbol", "status"])
+        writer.writerows(rows)
+
 def decode_auto(path: Path) -> Tuple[str, str, Optional[bytes]]:
     raw = path.read_bytes()
     bom: Optional[bytes] = None
@@ -859,12 +907,8 @@ def translate_strings(
     indexes_by_protected: Dict[str, List[int]] = {}
 
     cache: Dict[str, str] = {}
-    if cache_path and cache_path.exists():
-        try:
-            cache = json.loads(cache_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logging.warning("Unable to load previous cache (%s): %s", cache_path, exc)
-            cache = {}
+    if cache_path:
+        cache = load_cache_file(cache_path)
 
     for idx, inner in enumerate(inners_list):
         phrase_protected, phrase_map = protect_phrases(
@@ -1452,6 +1496,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help='Retry translations that were cached as empty ("").',
     )
+    parser.add_argument(
+        "--report-missing",
+        type=Path,
+        help="Write a report of strings missing from cache (not cached or cached empty).",
+    )
     return parser.parse_args()
 
 def main() -> None:
@@ -1527,6 +1576,16 @@ def main() -> None:
         strict_no_english_residue = True
     if args.no_strict_no_english_residue:
         strict_no_english_residue = False
+    if args.report_missing:
+        cache_snapshot = load_cache_file(cache_file)
+        report_rows = build_missing_report_rows(
+            targets,
+            cache_snapshot,
+            protected_terms,
+            protected_regex,
+            acronym_exclude,
+        )
+        write_missing_report(args.report_missing, report_rows)
 
     def progress_callback(current_subset: Sequence[str]) -> None:
         merged = assemble_full_texts(targets, current_subset, enforce_skip_integrity=True)
