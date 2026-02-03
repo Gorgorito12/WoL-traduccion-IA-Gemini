@@ -85,7 +85,7 @@ python translate_gemini.py "stringtabley_new.xml" "stringtabley_es_latam_new.xml
 
 ## Documentation
 
-📘 **Full documentation and advanced workflows**
+**Full documentation and advanced workflows**
 See the `/docs` folder:
 
 * `docs/USAGE.md` – all parameters and examples
@@ -96,7 +96,7 @@ See the `/docs` folder:
 
 ## Security
 
-⚠️ **Never commit your API key to GitHub.**
+**Never commit your API key to GitHub.**
 Use environment variables or local config files for automation.
 
 ---
