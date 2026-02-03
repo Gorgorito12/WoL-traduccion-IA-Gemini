@@ -314,6 +314,14 @@ class TranslationTarget:
     reason: Optional[str] = None
 
 
+@dataclass
+class TranslationStats:
+    total_strings: int
+    cache_used: int = 0
+    api_translated: int = 0
+    cache_empty_skipped: int = 0
+
+
 @dataclass(frozen=True)
 class SkipRules:
     symbol_exact: Sequence[str]
@@ -828,8 +836,12 @@ def translate_strings(
     acronym_exclude: Optional[Sequence[str]] = None,
     strict_no_english_residue: Optional[bool] = None,
     cache_only: bool = False,
-) -> List[str]:
+    retry_empty_cache: bool = False,
+) -> Tuple[List[str], TranslationStats]:
     
+    inners_list = list(inners)
+    stats = TranslationStats(total_strings=len(inners_list))
+
     protected_terms = protected_terms or []
     protected_regex = list(DEFAULT_PROTECTED_REGEX) + (list(protected_regex) if protected_regex else [])
     acronym_exclude = list(DEFAULT_ACRONYM_EXCLUDE) + (list(acronym_exclude) if acronym_exclude else [])
@@ -854,7 +866,7 @@ def translate_strings(
             logging.warning("Unable to load previous cache (%s): %s", cache_path, exc)
             cache = {}
 
-    for idx, inner in enumerate(inners):
+    for idx, inner in enumerate(inners_list):
         phrase_protected, phrase_map = protect_phrases(
             inner,
             protected_terms,
@@ -894,6 +906,7 @@ def translate_strings(
 
         if cached_value and cached_value.strip():
             # We already had a cached translation: reuse it everywhere and skip re-translation.
+            stats.cache_used += len(indexes_by_protected.get(text, []))
             for idx in indexes_by_protected.get(text, []):
                 restored = restore_all_tokens(
                     cached_value, token_maps[idx], phrase_maps[idx], original_texts[idx]
@@ -903,6 +916,16 @@ def translate_strings(
                 restored = apply_source_casing(original_texts[idx], restored)
                 translations[idx] = restored
             continue
+
+        if cached_value is not None and not cached_value.strip():
+            if not retry_empty_cache or cache_only:
+                for idx in indexes_by_protected.get(text, []):
+                    restored = restore_all_tokens(
+                        text, token_maps[idx], phrase_maps[idx], original_texts[idx]
+                    )
+                    translations[idx] = restored
+                stats.cache_empty_skipped += len(indexes_by_protected.get(text, []))
+                continue
 
         if cache_only:
             for idx in indexes_by_protected.get(text, []):
@@ -921,7 +944,7 @@ def translate_strings(
             unique_to_translate.append(text)
 
     if cache_only or not unique_to_translate:
-        return translations
+        return translations, stats
 
     if not api_key:
         raise RuntimeError(
@@ -996,6 +1019,7 @@ def translate_strings(
                     )
                     cache[original] = ""
                     continue
+                stats.api_translated += len(indexes_by_protected.get(original, []))
                 cache[original] = translated_item
                 for idx in indexes_by_protected.get(original, []):
                     restored = restore_all_tokens(
@@ -1019,7 +1043,7 @@ def translate_strings(
             if progress_callback:
                 progress_callback(list(translations))
 
-    return translations
+    return translations, stats
 
 # --- XML Utils ---
 class CommentedTreeBuilder(ET.TreeBuilder):
@@ -1411,6 +1435,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only use cached translations; do not call the Gemini API.",
     )
+    parser.add_argument(
+        "--cache-file",
+        type=Path,
+        help="Use a specific cache JSON file instead of <output>.cache.json.",
+    )
+    parser.add_argument(
+        "--retry-empty-cache",
+        action="store_true",
+        help='Retry translations that were cached as empty ("").',
+    )
     return parser.parse_args()
 
 def main() -> None:
@@ -1472,10 +1506,15 @@ def main() -> None:
 
     if not translatable_texts:
         print("🔒 No elements eligible for translation. Output snapshot written.")
+        print("\n📊 Summary")
+        print("Total de strings: 0")
+        print("Usadas desde cache: 0")
+        print("Traducidas con API: 0")
+        print("Saltadas por cache vacío (skipped (cached empty)): 0")
         print(f"\n✅ Completed: {args.output}")
         return
 
-    cache_file = args.output.with_suffix(args.output.suffix + ".cache.json")
+    cache_file = args.cache_file or args.output.with_suffix(args.output.suffix + ".cache.json")
     strict_no_english_residue = STRICT_NO_ENGLISH_RESIDUE and target_is_spanish(args.target)
     if args.strict_no_english_residue is True:
         strict_no_english_residue = True
@@ -1489,7 +1528,7 @@ def main() -> None:
         )
 
     try:
-        translated_subset = translate_strings(
+        translated_subset, stats = translate_strings(
             translatable_texts,
             api_key=args.api_key,
             source_lang=args.source,
@@ -1506,11 +1545,17 @@ def main() -> None:
             acronym_exclude=acronym_exclude,
             strict_no_english_residue=strict_no_english_residue,
             cache_only=args.cache_only,
+            retry_empty_cache=args.retry_empty_cache,
         )
         final_texts = assemble_full_texts(
             targets, translated_subset, enforce_skip_integrity=True
         )
         write_output_snapshot(tree, elements, final_texts, args.output, doc_format, diagnostic=args.diagnostic)
+        print("\n📊 Summary")
+        print(f"Total de strings: {stats.total_strings}")
+        print(f"Usadas desde cache: {stats.cache_used}")
+        print(f"Traducidas con API: {stats.api_translated}")
+        print(f"Saltadas por cache vacío (skipped (cached empty)): {stats.cache_empty_skipped}")
         print(f"\n✅ Completed: {args.output}")
 
     except Exception as e:
