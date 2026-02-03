@@ -331,7 +331,3 @@ python translate_gemini.py "stringtabley_new.xml" "stringtabley_es_latam_new.xml
 ```bat
 python translate_gemini.py "stringtabley_new.xml" "stringtabley_es_latam_new.xml" --api-key "YOUR_API_KEY_HERE" --cache-file "wol_es.cache.json"
 ```
-
-```
-
----
