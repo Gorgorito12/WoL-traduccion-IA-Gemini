@@ -1,6 +1,3 @@
-## `docs/USAGE.md`
-
-````md
 # Usage Guide — Gemini XML Translator (WoL)
 
 This document contains the full CLI usage for `translate_gemini.py`, including common workflows and advanced flags.
