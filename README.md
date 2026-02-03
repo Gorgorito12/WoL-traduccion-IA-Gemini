@@ -1,5 +1,3 @@
----
-
 # Gemini XML Translator for Age of Empires III: Wars of Liberty
 
 A **Python** script that translates **XML** files used by the **Age of Empires III: Wars of Liberty** mod using **Google Gemini (gemini-2.5-flash)**. It’s designed for **historical video game localization (1789–1916)** with strict rules to keep **tokens/placeholders** intact, and it’s optimized with **multithreading** and **automatic caching** to avoid retranslating strings you already processed.
