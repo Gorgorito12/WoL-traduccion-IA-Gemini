@@ -350,6 +350,15 @@ def unprotect_tokens(text: str, token_map: Dict[str, str]) -> str:
         text = text.replace(key, value)
     return text
 
+def normalize_cache_key(text: str) -> str:
+    """Normalize cache keys to remain stable across runs.
+
+    - Strips leading/trailing whitespace.
+    - Collapses internal whitespace to a single space.
+    - Preserves case and literal placeholder sequences (e.g., %s, \\n).
+    """
+    return re.sub(r"\s+", " ", text.strip())
+
 def protect_phrases(
     text: str,
     phrases: Sequence[str],
@@ -855,8 +864,11 @@ def translate_strings(
     token_maps: List[Dict[str, str]] = []
     phrase_maps: List[Dict[str, str]] = []
     original_texts: List[str] = []
+    cache_keys: List[str] = []
     translations: List[str] = []
-    indexes_by_protected: Dict[str, List[int]] = {}
+    indexes_by_cache_key: Dict[str, List[int]] = {}
+    protected_by_cache_key: Dict[str, str] = {}
+    source_by_cache_key: Dict[str, str] = {}
 
     cache: Dict[str, str] = {}
     if cache_path and cache_path.exists():
@@ -867,6 +879,7 @@ def translate_strings(
             cache = {}
 
     for idx, inner in enumerate(inners_list):
+        cache_key = normalize_cache_key(inner)
         phrase_protected, phrase_map = protect_phrases(
             inner,
             protected_terms,
@@ -878,6 +891,7 @@ def translate_strings(
         token_maps.append(token_map)
         phrase_maps.append(phrase_map)
         original_texts.append(inner)
+        cache_keys.append(cache_key)
 
         initial_translation = inner
         if existing_translations and idx < len(existing_translations):
@@ -885,69 +899,90 @@ def translate_strings(
             if candidate and candidate.strip():
                 initial_translation = candidate
                 if candidate != inner:
-                    cache.setdefault(protected_text, candidate)
+                    cache.setdefault(cache_key, candidate)
 
         translations.append(initial_translation)
-        indexes_by_protected.setdefault(protected_text, []).append(idx)
+        indexes_by_cache_key.setdefault(cache_key, []).append(idx)
+        protected_by_cache_key.setdefault(cache_key, protected_text)
+        source_by_cache_key.setdefault(cache_key, inner)
     unique_to_translate: List[str] = []
-    already_enqueued: set[str] = set()
+    processed_cache_keys: set[str] = set()
+    queued_cache_keys: set[str] = set()
+    cache_key_for_protected: Dict[str, str] = {}
 
-    for text in protected:
-        if not text.strip():
-            cache[text] = text
-            # Propagate empty text as-is to every position.
-            for idx in indexes_by_protected.get(text, []):
-                translations[idx] = restore_all_tokens(
-                    text, token_maps[idx], phrase_maps[idx], original_texts[idx]
-                )
+    for cache_key in cache_keys:
+        if cache_key in processed_cache_keys:
+            continue
+        processed_cache_keys.add(cache_key)
+        protected_text = protected_by_cache_key[cache_key]
+
+        if not cache_key:
+            for idx in indexes_by_cache_key.get(cache_key, []):
+                translations[idx] = original_texts[idx]
             continue
 
-        cached_value = cache.get(text)
+        cached_value = cache.get(cache_key)
+        legacy_value = None
+        if cached_value is None:
+            legacy_value = cache.get(protected_text)
 
-        if cached_value and cached_value.strip():
-            # We already had a cached translation: reuse it everywhere and skip re-translation.
-            stats.cache_used += len(indexes_by_protected.get(text, []))
-            for idx in indexes_by_protected.get(text, []):
-                restored = restore_all_tokens(
-                    cached_value, token_maps[idx], phrase_maps[idx], original_texts[idx]
-                )
-                restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
+        if cached_value and str(cached_value).strip():
+            stats.cache_used += len(indexes_by_cache_key.get(cache_key, []))
+            for idx in indexes_by_cache_key.get(cache_key, []):
+                restored = str(cached_value)
                 restored = enforce_acronym_integrity(original_texts[idx], restored, exclude=acronym_exclude)
                 restored = apply_source_casing(original_texts[idx], restored)
                 translations[idx] = restored
             continue
 
-        if cached_value is not None and not cached_value.strip():
+        if legacy_value and str(legacy_value).strip():
+            stats.cache_used += len(indexes_by_cache_key.get(cache_key, []))
+            migrated_value: Optional[str] = None
+            for idx in indexes_by_cache_key.get(cache_key, []):
+                restored = restore_all_tokens(
+                    str(legacy_value), token_maps[idx], phrase_maps[idx], original_texts[idx]
+                )
+                restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
+                restored = enforce_acronym_integrity(original_texts[idx], restored, exclude=acronym_exclude)
+                restored = apply_source_casing(original_texts[idx], restored)
+                translations[idx] = restored
+                if migrated_value is None:
+                    migrated_value = restored
+            if migrated_value and migrated_value.strip():
+                cache[cache_key] = migrated_value
+                if protected_text in cache and protected_text != cache_key:
+                    cache.pop(protected_text, None)
+            continue
+
+        if (cached_value is not None and not str(cached_value).strip()) or (
+            legacy_value is not None and not str(legacy_value).strip()
+        ):
             if not retry_empty_cache or cache_only:
-                for idx in indexes_by_protected.get(text, []):
-                    restored = restore_all_tokens(
-                        text, token_maps[idx], phrase_maps[idx], original_texts[idx]
-                    )
-                    translations[idx] = restored
-                stats.cache_empty_skipped += len(indexes_by_protected.get(text, []))
+                for idx in indexes_by_cache_key.get(cache_key, []):
+                    translations[idx] = original_texts[idx]
+                stats.cache_empty_skipped += len(indexes_by_cache_key.get(cache_key, []))
                 continue
 
         if cache_only:
-            for idx in indexes_by_protected.get(text, []):
-                restored = restore_all_tokens(
-                    text, token_maps[idx], phrase_maps[idx], original_texts[idx]
-                )
-                translations[idx] = restored
+            for idx in indexes_by_cache_key.get(cache_key, []):
+                translations[idx] = original_texts[idx]
             continue
 
-        # If there is no cache (or it is empty), register an entry and queue it for translation,
-        # avoiding duplicates.
-        if text not in cache:
-            cache[text] = ""
-        if text not in already_enqueued:
-            already_enqueued.add(text)
-            unique_to_translate.append(text)
+        if cache_key not in queued_cache_keys:
+            queued_cache_keys.add(cache_key)
+            cache_key_for_protected[protected_text] = cache_key
+            unique_to_translate.append(protected_text)
 
     if cache_only or not unique_to_translate:
         if cache_path:
             try:
                 cache_path.write_text(
-                    json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
+                    json.dumps(
+                        {k: v for k, v in cache.items() if str(v).strip()},
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
                 )
             except Exception as exc:
                 logging.warning("Failed to write cache file: %s", exc)
@@ -1011,24 +1046,26 @@ def translate_strings(
 
             # Store in cache and update main list
             if translated_batch is None:
-                # Mark these items as not-yet-translated (empty cache) so a rerun will retry them.
-                for original in original_batch:
-                    cache[original] = ""
                 # Skip updating translations from this batch.
                 continue
 
             for original, translated_item in zip(original_batch, translated_batch):
-                if strict_no_english_residue and has_english_residue(original, translated_item, target_lang):
+                cache_key = cache_key_for_protected.get(original)
+                if cache_key is None:
+                    cache_key = normalize_cache_key(original)
+                source_text = source_by_cache_key.get(cache_key, original)
+                if strict_no_english_residue and has_english_residue(source_text, translated_item, target_lang):
                     logging.warning(
                         "Skipping cache/write due to English residue. src=%s out=%s",
-                        original,
+                        source_text,
                         translated_item,
                     )
-                    cache[original] = ""
+                    for idx in indexes_by_cache_key.get(cache_key, []):
+                        translations[idx] = original_texts[idx]
                     continue
-                stats.api_translated += len(indexes_by_protected.get(original, []))
-                cache[original] = translated_item
-                for idx in indexes_by_protected.get(original, []):
+                stats.api_translated += len(indexes_by_cache_key.get(cache_key, []))
+                final_cache_value: Optional[str] = None
+                for idx in indexes_by_cache_key.get(cache_key, []):
                     restored = restore_all_tokens(
                         translated_item,
                         token_maps[idx],
@@ -1039,11 +1076,22 @@ def translate_strings(
                     restored = enforce_acronym_integrity(original_texts[idx], restored, exclude=acronym_exclude)
                     restored = apply_source_casing(original_texts[idx], restored)
                     translations[idx] = restored
+                    if final_cache_value is None:
+                        final_cache_value = restored
+                if final_cache_value and final_cache_value.strip():
+                    cache[cache_key] = final_cache_value
 
             # Save partial progress (thread-safe because we are on the main thread)
             if cache_path:
                 try:
-                    cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+                    cache_path.write_text(
+                        json.dumps(
+                            {k: v for k, v in cache.items() if str(v).strip()},
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
                 except Exception as exc:
                     logging.warning("Could not persist cache for batch %s: %s", batch_idx, exc)
 
