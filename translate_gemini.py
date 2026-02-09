@@ -867,6 +867,7 @@ def translate_strings(
     original_texts: List[str] = []
     translations: List[str] = []
     indexes_by_protected: Dict[str, List[int]] = {}
+    indexes_by_inner: Dict[str, List[int]] = {}
 
     cache: Dict[str, str] = {}
     cache_norm: Dict[str, str] = {}
@@ -874,7 +875,12 @@ def translate_strings(
         try:
             cache = json.loads(cache_path.read_text(encoding="utf-8"))
             for key, value in cache.items():
-                if isinstance(value, str) and value.strip():
+                if (
+                    isinstance(value, str)
+                    and value.strip()
+                    and "__PROTECT_" not in value
+                    and "__TOK" not in value
+                ):
                     normalized_key = normalize_cache_key(str(key))
                     cache_norm.setdefault(normalized_key, value)
         except Exception as exc:
@@ -886,9 +892,9 @@ def translate_strings(
     cache_misses_seen: set[str] = set()
 
     def record_cache_miss(cache_key: str, text: str) -> None:
-        stats.cache_miss += len(indexes_by_protected.get(text, []))
+        stats.cache_miss += len(indexes_by_inner.get(text, []))
         if cache_key not in cache_misses_seen and len(cache_misses) < 300:
-            cache_misses.append(cache_key)
+            cache_misses.append(text)
             cache_misses_seen.add(cache_key)
 
     def write_cache_misses() -> None:
@@ -923,38 +929,50 @@ def translate_strings(
             if candidate and candidate.strip():
                 initial_translation = candidate
                 if candidate != inner:
-                    cache_key = normalize_cache_key(protected_text)
-                    cache.setdefault(cache_key, candidate)
-                    cache_norm.setdefault(cache_key, candidate)
+                    cache_key = normalize_cache_key(inner)
+                    if "__PROTECT_" not in candidate and "__TOK" not in candidate:
+                        cache.setdefault(cache_key, candidate)
+                        cache_norm.setdefault(cache_key, candidate)
 
         translations.append(initial_translation)
         indexes_by_protected.setdefault(protected_text, []).append(idx)
+        indexes_by_inner.setdefault(inner, []).append(idx)
     unique_to_translate: List[str] = []
     already_enqueued: set[str] = set()
+    processed_inners: set[str] = set()
 
-    for text in protected:
-        cache_key = normalize_cache_key(text)
-        if not text.strip():
-            cache[cache_key] = text
+    for idx, inner in enumerate(inners_list):
+        if inner in processed_inners:
+            continue
+        processed_inners.add(inner)
+        protected_text = protected[idx]
+        cache_key = normalize_cache_key(inner)
+        if not inner.strip():
+            cache[cache_key] = inner
             # Propagate empty text as-is to every position.
-            for idx in indexes_by_protected.get(text, []):
+            for idx in indexes_by_inner.get(inner, []):
                 translations[idx] = restore_all_tokens(
-                    text, token_maps[idx], phrase_maps[idx], original_texts[idx]
+                    inner, token_maps[idx], phrase_maps[idx], original_texts[idx]
                 )
             continue
 
         cached_value = cache.get(cache_key)
+        if cached_value and ("__PROTECT_" in cached_value or "__TOK" in cached_value):
+            cached_value = None
+            cache[cache_key] = ""
 
         if not (cached_value and cached_value.strip()):
             cached_value = cache_norm.get(cache_key)
+            if cached_value and ("__PROTECT_" in cached_value or "__TOK" in cached_value):
+                cached_value = None
             if cached_value and cached_value.strip():
                 cache[cache_key] = cached_value
                 cache_norm[cache_key] = cached_value
 
         if cached_value and cached_value.strip():
             # We already had a cached translation: reuse it everywhere and skip re-translation.
-            stats.cache_used += len(indexes_by_protected.get(text, []))
-            for idx in indexes_by_protected.get(text, []):
+            stats.cache_used += len(indexes_by_inner.get(inner, []))
+            for idx in indexes_by_inner.get(inner, []):
                 restored = restore_all_tokens(
                     cached_value, token_maps[idx], phrase_maps[idx], original_texts[idx]
                 )
@@ -964,33 +982,33 @@ def translate_strings(
                 translations[idx] = restored
             continue
 
-        record_cache_miss(cache_key, text)
+        record_cache_miss(cache_key, inner)
 
         if cached_value is not None and not cached_value.strip():
             if not retry_empty_cache or cache_only:
-                for idx in indexes_by_protected.get(text, []):
+                for idx in indexes_by_inner.get(inner, []):
                     restored = restore_all_tokens(
-                        text, token_maps[idx], phrase_maps[idx], original_texts[idx]
+                        inner, token_maps[idx], phrase_maps[idx], original_texts[idx]
                     )
                     translations[idx] = restored
-                stats.cache_empty_skipped += len(indexes_by_protected.get(text, []))
+                stats.cache_empty_skipped += len(indexes_by_inner.get(inner, []))
                 continue
 
         if cache_only:
-            for idx in indexes_by_protected.get(text, []):
+            for idx in indexes_by_inner.get(inner, []):
                 restored = restore_all_tokens(
-                    text, token_maps[idx], phrase_maps[idx], original_texts[idx]
+                    inner, token_maps[idx], phrase_maps[idx], original_texts[idx]
                 )
                 translations[idx] = restored
             continue
 
         # If there is no cache (or it is empty), register an entry and queue it for translation,
         # avoiding duplicates.
-        if cache_key not in cache:
+        if cache_key not in cache or not cache.get(cache_key):
             cache[cache_key] = ""
-        if text not in already_enqueued:
-            already_enqueued.add(text)
-            unique_to_translate.append(text)
+        if protected_text not in already_enqueued:
+            already_enqueued.add(protected_text)
+            unique_to_translate.append(protected_text)
 
     if cache_only or not unique_to_translate:
         if cache_path:
@@ -1063,24 +1081,28 @@ def translate_strings(
             if translated_batch is None:
                 # Mark these items as not-yet-translated (empty cache) so a rerun will retry them.
                 for original in original_batch:
-                    cache_key = normalize_cache_key(original)
-                    cache[cache_key] = ""
+                    for idx in indexes_by_protected.get(original, []):
+                        cache_key = normalize_cache_key(original_texts[idx])
+                        cache[cache_key] = ""
                 # Skip updating translations from this batch.
                 continue
 
             for original, translated_item in zip(original_batch, translated_batch):
-                cache_key = normalize_cache_key(original)
                 if strict_no_english_residue and has_english_residue(original, translated_item, target_lang):
                     logging.warning(
                         "Skipping cache/write due to English residue. src=%s out=%s",
                         original,
                         translated_item,
                     )
-                    cache[cache_key] = ""
+                    for idx in indexes_by_protected.get(original, []):
+                        cache_key = normalize_cache_key(original_texts[idx])
+                        cache[cache_key] = ""
                     continue
                 stats.api_translated += len(indexes_by_protected.get(original, []))
-                cache[cache_key] = translated_item
-                cache_norm[cache_key] = translated_item
+                for idx in indexes_by_protected.get(original, []):
+                    cache_key = normalize_cache_key(original_texts[idx])
+                    cache[cache_key] = translated_item
+                    cache_norm[cache_key] = translated_item
                 for idx in indexes_by_protected.get(original, []):
                     restored = restore_all_tokens(
                         translated_item,
