@@ -15,6 +15,9 @@ It is designed for **historical video game localization (1789–1916)**, with st
 * **Cache-only mode** (0 API calls).
 * **Global cache support** for versioned workflows.
 * Compact (default) and Detailed prompt modes.
+* **Version-update merge by `_locID`**: carry an old translation onto a new English version,
+  reusing unchanged strings and flagging what changed/added (CLI `--match-by-locid`, or the
+  GUI **Comparar / WinMerge** tab).
 
 ---
 
@@ -80,6 +83,21 @@ python translate_gemini.py "stringtabley_new.xml" "stringtabley_es_latam_new.xml
 | `--cache-only`      | Use cache only (no API calls)                     |
 | `--cache-file PATH` | Use a shared/global cache file                    |
 | `--detailed-prompt` | Use a more explicit prompt (higher token usage)   |
+
+---
+
+## Version updates (new mod version)
+
+Match the old translation to the new English by the stable `_locID` attribute, reusing what didn't
+change and translating only what's new/changed:
+
+```bat
+python translate_gemini.py "stringtabley_new.xml" "stringtabley_es_latam_new.xml" --match-by-locid --prev-source "stringtabley_old.xml" --prev-translation "stringtabley_es_latam_old.xml" --cache-file "wol_es.cache.json" --api-key "YOUR_API_KEY_HERE"
+```
+
+In the **GUI**, use the **Comparar / WinMerge** tab to compare the files, see what's missing, edit
+translations by hand, auto-translate the gaps, and export the adapted XML. See `docs/USAGE.md` for
+details (and `--cache-only`/`--report` for a zero-API preview).
 
 ---
 

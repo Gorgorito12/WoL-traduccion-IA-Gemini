@@ -331,6 +331,7 @@ class TranslationTarget:
     symbol: Optional[str]
     skip: bool
     reason: Optional[str] = None
+    loc_id: Optional[str] = None
 
 
 @dataclass
@@ -496,6 +497,83 @@ def restore_all_tokens(
     restored = unprotect_tokens(text, placeholder_map)
     restored = restore_protected_terms(restored, protected_map, original_text)
     return restored
+
+
+def _normalize_protection(
+    protected_terms: Optional[Sequence[str]] = None,
+    protected_regex: Optional[Sequence[re.Pattern[str]]] = None,
+    acronym_exclude: Optional[Sequence[str]] = None,
+) -> Tuple[List[str], List[re.Pattern[str]], List[str]]:
+    """Merge user-supplied protection settings with the built-in defaults.
+
+    This is the single source of truth used both by translate_strings and by the
+    standalone cache-key helper, so the protected text (and therefore the cache key)
+    is computed identically no matter who asks. DEFAULT_PROTECTED_TERMS is always
+    prepended (protect_phrases is idempotent for already-protected text, so callers
+    that already added the defaults — main()/the GUI — get the same key, while callers
+    that pass nothing — protected_cache_key()/the compare tab — now match them too).
+    """
+    protected_terms = list(DEFAULT_PROTECTED_TERMS) + (list(protected_terms) if protected_terms else [])
+    protected_regex = list(DEFAULT_PROTECTED_REGEX) + (list(protected_regex) if protected_regex else [])
+    acronym_exclude = list(DEFAULT_ACRONYM_EXCLUDE) + (list(acronym_exclude) if acronym_exclude else [])
+    return protected_terms, protected_regex, acronym_exclude
+
+
+def protect_for_cache(
+    text: str,
+    protected_terms: Sequence[str],
+    protected_regex: Sequence[re.Pattern[str]],
+    acronym_exclude: Sequence[str],
+) -> Tuple[str, Dict[str, str], Dict[str, str]]:
+    """Apply phrase + token protection exactly as translate_strings does.
+
+    Returns (protected_text, token_map, phrase_map). The protected_text is the cache key.
+    Callers must pass already-normalized lists (see _normalize_protection).
+    """
+    phrase_protected, phrase_map = protect_phrases(
+        text,
+        protected_terms,
+        protected_regex,
+        regex_exclude=acronym_exclude,
+    )
+    protected_text, token_map = protect_tokens(phrase_protected)
+    return protected_text, token_map, phrase_map
+
+
+def protected_cache_key(
+    text: str,
+    protected_terms: Optional[Sequence[str]] = None,
+    protected_regex: Optional[Sequence[re.Pattern[str]]] = None,
+    acronym_exclude: Optional[Sequence[str]] = None,
+) -> str:
+    """The exact cache key translate_strings would use for `text`.
+
+    Normalizes the protection settings (prepending the built-in defaults) just like
+    translate_strings, so external callers (merge seeding, GUI manual edits) write to
+    the same keys the engine reads.
+    """
+    terms, regex, exclude = _normalize_protection(protected_terms, protected_regex, acronym_exclude)
+    key, _token_map, _phrase_map = protect_for_cache(text, terms, regex, exclude)
+    return key
+
+
+# Only printf-style format specifiers are load-bearing for the game engine; an
+# altered/missing %s or %1$s can crash it. Escaped whitespace (\n/\t/\r) is allowed
+# to move around (translations legitimately reorder it), so it is NOT compared here.
+# IGNORECASE so an old translation's %S/%D is treated as equivalent to %s/%d.
+_FORMAT_SPECIFIER_RE = re.compile(r"%\d+\$[sdif]|%[sdif]", re.IGNORECASE)
+
+
+def placeholders_compatible(new_source: str, candidate_translation: str) -> bool:
+    """True if `candidate_translation` carries the same set of %-format specifiers as `new_source`.
+
+    Used before reusing an old translation against a new source string, so we never
+    reuse a translation whose placeholders no longer line up with the (possibly changed)
+    source. Comparison is case-insensitive (%S == %s) since old WoL translations vary case.
+    """
+    def specs(text: str) -> List[str]:
+        return sorted(m.lower() for m in _FORMAT_SPECIFIER_RE.findall(text or ""))
+    return specs(new_source) == specs(candidate_translation)
 
 
 def is_all_caps_source(text: str) -> bool:
@@ -934,9 +1012,9 @@ def translate_strings(
     inners_list = list(inners)
     stats = TranslationStats(total_strings=len(inners_list))
 
-    protected_terms = protected_terms or []
-    protected_regex = list(DEFAULT_PROTECTED_REGEX) + (list(protected_regex) if protected_regex else [])
-    acronym_exclude = list(DEFAULT_ACRONYM_EXCLUDE) + (list(acronym_exclude) if acronym_exclude else [])
+    protected_terms, protected_regex, acronym_exclude = _normalize_protection(
+        protected_terms, protected_regex, acronym_exclude
+    )
     strict_no_english_residue = (
         STRICT_NO_ENGLISH_RESIDUE and target_is_spanish(target_lang)
         if strict_no_english_residue is None
@@ -959,13 +1037,9 @@ def translate_strings(
             cache = {}
 
     for idx, inner in enumerate(inners_list):
-        phrase_protected, phrase_map = protect_phrases(
-            inner,
-            protected_terms,
-            protected_regex,
-            regex_exclude=acronym_exclude,
+        protected_text, token_map, phrase_map = protect_for_cache(
+            inner, protected_terms, protected_regex, acronym_exclude
         )
-        protected_text, token_map = protect_tokens(phrase_protected)
         protected.append(protected_text)
         token_maps.append(token_map)
         phrase_maps.append(phrase_map)
@@ -1268,6 +1342,7 @@ def iter_translatable_elements(root: ET.Element, skip_rules: SkipRules) -> Itera
             symbol=elem.attrib.get("symbol"),
             skip=skip,
             reason=reason,
+            loc_id=elem.attrib.get("_locID"),
         )
 
     for elem in root.iter():
@@ -1436,6 +1511,275 @@ def load_existing_translations(path: Path, reference_count: int, skip_rules: Ski
         return None
 
 
+# --- Merge by _locID (carry an old translation onto a new source version) ---
+
+
+@dataclass(frozen=True)
+
+
+class MergeEntry:
+    """One new-version string and what we decided to do with it.
+
+    Aligned 1:1 (and in order) with the NON-SKIP translatable targets of the new file.
+    """
+    loc_id: Optional[str]
+    new_source: str
+    status: str            # "unchanged" | "changed" | "new"
+    draft: Optional[str]   # old translation to show as a starting point (may be None)
+    seed: Optional[str]    # value safe to auto-seed into the cache; None if not safe
+    reason: str            # "reuse-safe" | "changed-needs-review" | "new-needs-translation"
+                           # | "placeholder-mismatch" | "old-equals-source" | "no-old-translation"
+    english_old: Optional[str] = None  # the old-version English text (for a new-vs-old diff view)
+
+
+@dataclass(frozen=True)
+
+
+class MergeReport:
+    entries: List[MergeEntry]
+    counts: Dict[str, int]
+
+
+def build_locid_index(targets: Sequence[TranslationTarget]) -> Dict[str, List[str]]:
+    """Map _locID -> list of texts (document order). Targets without _locID are skipped."""
+    index: Dict[str, List[str]] = {}
+    for target in targets:
+        if target.loc_id:
+            index.setdefault(target.loc_id, []).append(target.text)
+    return index
+
+
+def build_source_content_map(
+    old_source_targets: Sequence[TranslationTarget],
+    old_trans_targets: Sequence[TranslationTarget],
+) -> Dict[str, str]:
+    """Build a robust {old_english_text: old_translation} map by joining on _locID.
+
+    This is the content fallback used when a new string has no usable _locID (missing or
+    duplicated). It only pairs entries whose _locID exists in BOTH files, aligning by
+    position within a duplicate-id group.
+    """
+    src_by_id = build_locid_index(old_source_targets)
+    trans_by_id = build_locid_index(old_trans_targets)
+    content_map: Dict[str, str] = {}
+    for loc_id, src_list in src_by_id.items():
+        trans_list = trans_by_id.get(loc_id)
+        if not trans_list:
+            continue
+        for i, src_text in enumerate(src_list):
+            if i < len(trans_list):
+                content_map.setdefault(src_text, trans_list[i])
+    return content_map
+
+
+def _pick_from_group(
+    new_source: str,
+    src_list: Sequence[str],
+    trans_list: Sequence[str],
+    cursor: Dict[str, int],
+    loc_id: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve a duplicated _locID: prefer an exact source-content match, else consume positionally."""
+    for i, src_text in enumerate(src_list):
+        if src_text == new_source and i < len(trans_list):
+            return src_text, trans_list[i]
+    pos = cursor.get(loc_id, 0)
+    cursor[loc_id] = pos + 1
+    src = src_list[pos] if pos < len(src_list) else None
+    trans = trans_list[pos] if pos < len(trans_list) else None
+    return src, trans
+
+
+_MARKUP_RE = re.compile(r"<[^>]*>")
+# Tokens with no translatable content: markup, escaped UI blocks, printf-style specifiers
+# (including WoL's %1s / %2s form), and escaped whitespace.
+_NONTRANSLATABLE_RE = re.compile(r"<[^>]*>|&lt;.*?&gt;|%\d*\$?[a-zA-Z]|\\[ntr]")
+
+
+def _normalize_for_change(text: str) -> str:
+    """Collapse *cosmetic-only* differences for change detection.
+
+    Removes markup tags and ALL whitespace, then lowercases, so that an English string that
+    only gained `<color=...>` wrapping, changed capitalization, or shifted spacing compares
+    equal to its old version (its existing translation is still usable). Whitespace is dropped
+    entirely so that replacing a tag with a space cannot create a spurious difference.
+    """
+    stripped = _MARKUP_RE.sub(" ", text or "")
+    return re.sub(r"\s+", "", stripped).lower()
+
+
+def _has_translatable_text(text: str) -> bool:
+    """True if any alphabetic content remains after removing markup/placeholders/tokens.
+
+    Used to keep purely non-translatable strings (format strings, filenames-as-markup,
+    pure placeholder lines) out of the "needs translation" bucket.
+    """
+    cleaned = _NONTRANSLATABLE_RE.sub(" ", text or "")
+    cleaned = PROTECT_TOKEN_RE.sub(" ", cleaned)
+    cleaned = QUALITY_TOKEN_RE.sub(" ", cleaned)
+    return any(ch.isalpha() for ch in cleaned)
+
+
+def _classify_merge_entry(
+    loc_id: Optional[str],
+    new_source: str,
+    english_old: Optional[str],
+    candidate: Optional[str],
+) -> MergeEntry:
+    """Decide status/seed/draft for one new string given its old English + old translation.
+
+    The English can relate to the new source in four ways:
+      * unchanged  – byte-identical.
+      * cosmetic   – differs only in markup (`<color=...>`), case, or whitespace; the old
+                     translation is still usable, so we reuse it (reason "reuse-cosmetic").
+                     The new markup is NOT re-applied — it is cosmetic.
+      * changed    – the text really changed; re-translate.
+      * new        – the _locID did not exist before.
+    """
+    if english_old is not None:
+        if english_old == new_source:
+            relation = "unchanged"
+        elif _normalize_for_change(english_old) == _normalize_for_change(new_source):
+            relation = "cosmetic"
+        else:
+            relation = "changed"
+    else:
+        # No old English text to compare. A content match means an identical old source
+        # carried this translation, so it is effectively unchanged-by-content.
+        relation = "unchanged" if (candidate is not None) else "new"
+
+    draft = candidate if (candidate and candidate.strip()) else None
+    seed: Optional[str] = None
+
+    # The old translation is "just the English source" if it equals the new source, OR (for a
+    # cosmetic change, where the markup differs) if it normalizes to the same text. This catches
+    # strings the previous translator left in English so we never seed English as a translation.
+    draft_is_source = bool(draft) and (
+        draft == new_source
+        or (relation == "cosmetic" and _normalize_for_change(draft) == _normalize_for_change(new_source))
+    )
+
+    if relation in ("unchanged", "cosmetic"):
+        if not draft:
+            status, reason = "unchanged", "no-old-translation"
+        elif draft_is_source:
+            # Old "translation" is identical to the source (left in English).
+            if not _has_translatable_text(new_source):
+                seed = new_source                 # nothing to translate -> keep as-is
+                status, reason = "unchanged", "kept-as-source"
+            else:
+                status, reason = "unchanged", "old-equals-source"
+        elif not placeholders_compatible(new_source, draft):
+            status = "changed" if relation == "cosmetic" else "unchanged"
+            reason = "placeholder-mismatch"
+        elif relation == "cosmetic":
+            seed = draft                          # reuse; only formatting/case changed
+            status, reason = "changed", "reuse-cosmetic"
+        else:
+            seed = draft
+            status, reason = "unchanged", "reuse-safe"
+    elif relation == "changed":
+        status, reason = "changed", "changed-needs-review"  # draft shown, never seeded
+    else:
+        status, reason = "new", "new-needs-translation"
+
+    return MergeEntry(
+        loc_id=loc_id,
+        new_source=new_source,
+        status=status,
+        draft=draft,
+        seed=seed,
+        reason=reason,
+        english_old=english_old,
+    )
+
+
+def merge_by_locid(
+    new_targets: Sequence[TranslationTarget],
+    old_source_targets: Sequence[TranslationTarget],
+    old_trans_targets: Sequence[TranslationTarget],
+) -> MergeReport:
+    """Carry an old translation onto a new source version, matching by _locID.
+
+    Inputs are the NON-SKIP translatable targets of, respectively: the new English file,
+    the old English file, and the old translated file. The report is aligned 1:1 with
+    ``new_targets``. Matching precedence per new string:
+      1. Unique _locID present in the old translation -> direct lookup (+ old English for
+         change detection).
+      2. Duplicated _locID -> resolve within the id group (exact content, else positional).
+      3. No usable _locID -> content fallback (old_english_text -> translation).
+      4. Otherwise -> new.
+    """
+    old_src_by_id = build_locid_index(old_source_targets)
+    old_trans_by_id = build_locid_index(old_trans_targets)
+    content_map = build_source_content_map(old_source_targets, old_trans_targets)
+
+    src_cursor: Dict[str, int] = {}
+
+    entries: List[MergeEntry] = []
+    for target in new_targets:
+        new_source = target.text
+        loc_id = target.loc_id
+        english_old: Optional[str] = None
+        candidate: Optional[str] = None
+
+        if loc_id and loc_id in old_trans_by_id:
+            trans_list = old_trans_by_id[loc_id]
+            src_list = old_src_by_id.get(loc_id, [])
+            if len(trans_list) == 1 and len(src_list) <= 1:
+                candidate = trans_list[0]
+                english_old = src_list[0] if src_list else None
+            else:
+                english_old, candidate = _pick_from_group(
+                    new_source, src_list, trans_list, src_cursor, loc_id
+                )
+
+        if candidate is None:
+            # Content fallback: an old English string identical to this new source.
+            candidate = content_map.get(new_source)
+
+        entries.append(_classify_merge_entry(loc_id, new_source, english_old, candidate))
+
+    counts: Dict[str, int] = {}
+    for entry in entries:
+        counts[entry.status] = counts.get(entry.status, 0) + 1
+        counts[f"reason:{entry.reason}"] = counts.get(f"reason:{entry.reason}", 0) + 1
+    counts["seeded"] = sum(1 for entry in entries if entry.seed is not None)
+    counts["total"] = len(entries)
+
+    return MergeReport(entries=entries, counts=counts)
+
+
+def seed_list_from_report(report: MergeReport) -> List[str]:
+    """Turn a MergeReport into an ``existing_translations`` list for translate_strings.
+
+    Only reuse-safe entries carry a value; everything else is "" (the engine's
+    "needs translation" sentinel), so changed/new strings are translated, not reused.
+    """
+    return [entry.seed if entry.seed is not None else "" for entry in report.entries]
+
+
+def write_merge_report(path: Path, report: MergeReport) -> None:
+    """Write a JSON report: full counts plus every entry that still needs attention."""
+    needs_attention = [
+        {
+            "loc_id": entry.loc_id,
+            "status": entry.status,
+            "reason": entry.reason,
+            "new_source": entry.new_source,
+            "draft": entry.draft,
+        }
+        for entry in report.entries
+        if entry.seed is None
+    ]
+    data = {
+        "counts": report.counts,
+        "needs_attention_count": len(needs_attention),
+        "needs_attention": needs_attention,
+    }
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def build_skip_rules(args: argparse.Namespace) -> SkipRules:
     symbol_contains = list(DEFAULT_SKIP_SYMBOL_CONTAINS)
     if args.skip_symbol_contains:
@@ -1489,6 +1833,173 @@ def self_test_source_casing() -> None:
     _assert("IP" in upper_ip, "Acronym IP should remain intact")
 
     print("✅ Source casing self-test passed.")
+
+
+def self_test_merge() -> None:
+    def _assert(condition: bool, message: str) -> None:
+        if not condition:
+            raise SystemExit(f"Merge self-test failed: {message}")
+
+    def _t(text: str, loc_id: Optional[str] = None) -> TranslationTarget:
+        return TranslationTarget(
+            element=ET.Element("String"),
+            text=text,
+            symbol=None,
+            skip=False,
+            reason=None,
+            loc_id=loc_id,
+        )
+
+    # 1) Unique _locID, English unchanged -> reuse-safe seed.
+    # 2) Duplicate _locID -> aligned within the group by content.
+    # 3) No _locID -> content fallback.
+    # 4) Changed English -> draft shown, never seeded.
+    # 5) Placeholder lost in old translation -> not reused.
+    new = [
+        _t("Gang Saw", "1"),                       # unchanged
+        _t("Attack now", "2"),                     # changed (old was "Attack")
+        _t("%s is not ready.", "3"),               # unchanged but old trans lost %s
+        _t("Apple", "5"),                          # duplicate id group
+        _t("Banana", "5"),                         # duplicate id group
+        _t("Cat", None),                           # no _locID -> content fallback
+        _t("Brand New String", "999"),             # new id
+    ]
+    old_source = [
+        _t("Gang Saw", "1"),
+        _t("Attack", "2"),
+        _t("%s is not ready.", "3"),
+        _t("Apple", "5"),
+        _t("Banana", "5"),
+        _t("Cat", "9"),
+    ]
+    old_trans = [
+        _t("Sierra de banda", "1"),
+        _t("Atacar", "2"),
+        _t("no está listo.", "3"),                 # lost the %s
+        _t("Manzana", "5"),
+        _t("Plátano", "5"),
+        _t("Gato", "9"),
+    ]
+
+    report = merge_by_locid(new, old_source, old_trans)
+    by_source = {e.new_source: e for e in report.entries}
+
+    e = by_source["Gang Saw"]
+    _assert(e.status == "unchanged" and e.seed == "Sierra de banda" and e.reason == "reuse-safe",
+            f"Gang Saw should be reuse-safe, got {e}")
+
+    e = by_source["Attack now"]
+    _assert(e.status == "changed" and e.seed is None and e.draft == "Atacar"
+            and e.reason == "changed-needs-review",
+            f"changed string must keep draft but never seed, got {e}")
+
+    e = by_source["%s is not ready."]
+    _assert(e.status == "unchanged" and e.seed is None and e.reason == "placeholder-mismatch",
+            f"placeholder loss must block reuse, got {e}")
+
+    _assert(by_source["Apple"].seed == "Manzana", f"Apple should map to Manzana, got {by_source['Apple']}")
+    _assert(by_source["Banana"].seed == "Plátano", f"Banana should map to Plátano, got {by_source['Banana']}")
+
+    e = by_source["Cat"]
+    _assert(e.seed == "Gato" and e.reason == "reuse-safe",
+            f"no-_locID string should reuse via content fallback, got {e}")
+
+    e = by_source["Brand New String"]
+    _assert(e.status == "new" and e.seed is None and e.reason == "new-needs-translation",
+            f"unknown id should be new, got {e}")
+
+    seeds = seed_list_from_report(report)
+    _assert(len(seeds) == len(new), "seed list must align 1:1 with new targets")
+    _assert(seeds[1] == "" and seeds[6] == "", "changed/new entries must seed as empty string")
+    _assert(report.counts["seeded"] == 4, f"expected 4 safe seeds, got {report.counts.get('seeded')}")
+
+    # --- Cosmetic changes / kept-as-source / case-insensitive placeholders ---
+    new2 = [
+        _t("Good against <color=0.1,0.2,0.3>shock units</color>.", "100"),  # markup-only change
+        _t("Manoeuvre Cavalry", "101"),                                     # case-only change
+        _t("XP %s", "102"),                                                 # unchanged, trans uses %S
+        _t("%1s%2s. %3s", "103"),                                           # pure format -> keep
+        _t("eulay.rtf", "104"),                                             # English filename left as-is
+        _t("Light cavalry that raids.", "105"),                             # real text change
+        _t("Defends against <color=1,2,3>Cannons</color>.", "106"),         # cosmetic, but old trans still English
+    ]
+    old_source2 = [
+        _t("Good against shock units.", "100"),
+        _t("manoeuvre cavalry", "101"),
+        _t("XP %s", "102"),
+        _t("%1s%2s. %3s", "103"),
+        _t("eulay.rtf", "104"),
+        _t("Heavy infantry that defends.", "105"),
+        _t("Defends against Cannons.", "106"),
+    ]
+    old_trans2 = [
+        _t("Bueno contra unidades de choque.", "100"),
+        _t("Caballería de maniobra", "101"),
+        _t("XP %S", "102"),
+        _t("%1s%2s. %3s", "103"),
+        _t("eulay.rtf", "104"),
+        _t("Infantería pesada que defiende.", "105"),
+        _t("Defends against Cannons.", "106"),                              # never translated
+    ]
+    r2 = merge_by_locid(new2, old_source2, old_trans2)
+    b2 = {e.new_source: e for e in r2.entries}
+
+    e = b2["Good against <color=0.1,0.2,0.3>shock units</color>."]
+    _assert(e.reason == "reuse-cosmetic" and e.seed == "Bueno contra unidades de choque.",
+            f"markup-only change must reuse the old translation, got {e}")
+
+    e = b2["Manoeuvre Cavalry"]
+    _assert(e.reason == "reuse-cosmetic" and e.seed == "Caballería de maniobra",
+            f"case-only change must reuse the old translation, got {e}")
+
+    e = b2["XP %s"]
+    _assert(e.reason == "reuse-safe" and e.seed == "XP %S",
+            f"%S should be treated as compatible with %s, got {e}")
+
+    e = b2["%1s%2s. %3s"]
+    _assert(e.reason == "kept-as-source" and e.seed == "%1s%2s. %3s",
+            f"pure format string should be kept as-is, got {e}")
+
+    e = b2["eulay.rtf"]
+    _assert(e.reason == "old-equals-source" and e.seed is None,
+            f"English filename with letters should stay flagged, got {e}")
+
+    e = b2["Light cavalry that raids."]
+    _assert(e.reason == "changed-needs-review" and e.seed is None,
+            f"a real text change must still be flagged, got {e}")
+    _assert(e.english_old == "Heavy infantry that defends.",
+            f"changed entry must expose the old English for the diff view, got {e.english_old!r}")
+
+    e = b2["Defends against <color=1,2,3>Cannons</color>."]
+    _assert(e.seed is None and e.reason == "old-equals-source",
+            f"a cosmetic change whose old translation is still English must NOT be seeded, got {e}")
+
+    print("✅ Merge self-test passed.")
+
+
+def self_test_cache_key_parity() -> None:
+    """The public cache-key helper must produce the exact key translate_strings stores."""
+    def _assert(condition: bool, message: str) -> None:
+        if not condition:
+            raise SystemExit(f"Cache-key parity self-test failed: {message}")
+
+    samples = [
+        "Need %s right now",
+        "Pop: %d  <icon=\"(32)(ui/ingame/resource_population)\">",
+        "This game requires Microsoft Windows XP or later.",
+        "Plain text with no tokens",
+    ]
+    for text in samples:
+        terms, regex, exclude = _normalize_protection(None, None, None)
+        engine_key, _tokens, _phrases = protect_for_cache(text, terms, regex, exclude)
+        public_key = protected_cache_key(text)
+        _assert(public_key == engine_key,
+                f"protected_cache_key diverged from engine key for {text!r}")
+
+    key = protected_cache_key("Need %s right now")
+    _assert("%s" not in key and "__TOK" in key, "placeholders must be tokenized in the cache key")
+
+    print("✅ Cache-key parity self-test passed.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -1630,6 +2141,30 @@ def parse_args() -> argparse.Namespace:
         help='Retry translations that were cached as empty ("").',
     )
 
+    # --- Merge group (carry an old translation onto a new source version by _locID) ---
+    merge_group = parser.add_argument_group("Merge (version update by _locID)")
+    merge_group.add_argument(
+        "--match-by-locid",
+        action="store_true",
+        help="Reuse an old translation by matching _locID instead of position. "
+             "Requires --prev-source and --prev-translation.",
+    )
+    merge_group.add_argument(
+        "--prev-source",
+        type=Path,
+        help="Old source XML (the English version the old translation was made from).",
+    )
+    merge_group.add_argument(
+        "--prev-translation",
+        type=Path,
+        help="Old translated XML to carry over (e.g. the previous Spanish file).",
+    )
+    merge_group.add_argument(
+        "--report",
+        type=Path,
+        help="Write a JSON merge report (counts + strings that still need attention).",
+    )
+
     # --- Diagnostics group ---
     diag_group = parser.add_argument_group("Diagnostics")
     diag_group.add_argument(
@@ -1647,6 +2182,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run quick quality gate tests and exit.",
     )
+    diag_group.add_argument(
+        "--self-test-merge",
+        action="store_true",
+        help="Run the _locID merge / cache-key self-tests and exit.",
+    )
 
     return parser.parse_args()
 
@@ -1658,6 +2198,10 @@ def main() -> None:
     if args.self_test_quality_gate:
         self_test_quality_gate()
         self_test_source_casing()
+        return
+    if args.self_test_merge:
+        self_test_merge()
+        self_test_cache_key_parity()
         return
     skip_rules = build_skip_rules(args)
     protected_terms = list(DEFAULT_PROTECTED_TERMS)
@@ -1692,25 +2236,66 @@ def main() -> None:
     if skipped_count:
         print(f"🛑 Skip filter engaged: {skipped_count} element(s) protected from translation.")
 
-    existing_translations_full = load_existing_translations(args.output, len(targets), skip_rules)
-    existing_translations_subset: Optional[List[str]] = None
-    if existing_translations_full:
-        print("↩️  Resuming translation from existing output file.")
-        existing_translations_subset = [
-            text for target, text in zip(targets, existing_translations_full) if not target.skip
+    # --- Merge by _locID: carry an old translation onto this new source version ---
+    merge_report: Optional[MergeReport] = None
+    if args.match_by_locid:
+        if not args.prev_source or not args.prev_translation:
+            raise SystemExit("--match-by-locid requires both --prev-source and --prev-translation.")
+        if not args.prev_source.exists():
+            raise SystemExit(f"File does not exist: {args.prev_source}")
+        if not args.prev_translation.exists():
+            raise SystemExit(f"File does not exist: {args.prev_translation}")
+        prev_src_tree, _ = parse_strings_xml(args.prev_source)
+        prev_trans_tree, _ = parse_strings_xml(args.prev_translation)
+        old_source_targets = [
+            t for t in iter_translatable_elements(prev_src_tree.getroot(), skip_rules) if not t.skip
         ]
-        for target, text in zip(targets, existing_translations_full):
-            if target.skip and text != target.text:
-                logging.warning(
-                    "Existing output differs for skipped element (symbol=%s, reason=%s); restoring input text.",
-                    target.symbol,
-                    target.reason,
-                )
+        old_trans_targets = [
+            t for t in iter_translatable_elements(prev_trans_tree.getroot(), skip_rules) if not t.skip
+        ]
+        merge_report = merge_by_locid(translatable_targets, old_source_targets, old_trans_targets)
+        c = merge_report.counts
+        print(
+            f"🔗 Merge by _locID: {c.get('unchanged', 0)} unchanged, "
+            f"{c.get('changed', 0)} changed, {c.get('new', 0)} new "
+            f"→ {c.get('seeded', 0)} reused safely (the rest will be translated)."
+        )
+        if args.report:
+            write_merge_report(args.report, merge_report)
+            print(f"📝 Merge report written: {args.report}")
+
+    existing_translations_subset: Optional[List[str]] = None
+    if merge_report is not None:
+        # The merge takes precedence over resume-from-output: only reuse-safe entries
+        # are seeded ("" elsewhere -> translated). The snapshot falls back to the new
+        # source text where nothing was reused yet.
+        existing_translations_subset = seed_list_from_report(merge_report)
+        starting_subset = [
+            seed if seed else target.text
+            for seed, target in zip(existing_translations_subset, translatable_targets)
+        ]
         starting_texts = assemble_full_texts(
-            targets, existing_translations_subset, enforce_skip_integrity=True
+            targets, starting_subset, enforce_skip_integrity=True
         )
     else:
-        starting_texts = [target.text for target in targets]
+        existing_translations_full = load_existing_translations(args.output, len(targets), skip_rules)
+        if existing_translations_full:
+            print("↩️  Resuming translation from existing output file.")
+            existing_translations_subset = [
+                text for target, text in zip(targets, existing_translations_full) if not target.skip
+            ]
+            for target, text in zip(targets, existing_translations_full):
+                if target.skip and text != target.text:
+                    logging.warning(
+                        "Existing output differs for skipped element (symbol=%s, reason=%s); restoring input text.",
+                        target.symbol,
+                        target.reason,
+                    )
+            starting_texts = assemble_full_texts(
+                targets, existing_translations_subset, enforce_skip_integrity=True
+            )
+        else:
+            starting_texts = [target.text for target in targets]
 
     write_output_snapshot(tree, elements, starting_texts, args.output, doc_format, diagnostic=args.diagnostic)
 

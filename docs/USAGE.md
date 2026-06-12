@@ -74,6 +74,45 @@ python translate_gemini.py "stringtabley.xml" "stringtabley_es_latam.xml" --cach
 
 ---
 
+## Version update: merge by `_locID` (recommended for new mod versions)
+
+When a new version of the mod ships, match the old translation to the new English by the stable
+`_locID` attribute (instead of fragile line-by-line position). This reuses unchanged strings,
+flags the ones whose English **changed**, and lists the brand-new ones — so you only translate
+what actually moved.
+
+```bat
+python translate_gemini.py "stringtabley_new.xml" "stringtabley_es_latam_new.xml" ^
+  --match-by-locid ^
+  --prev-source "stringtabley_old.xml" ^
+  --prev-translation "stringtabley_es_latam_old.xml" ^
+  --cache-file "wol_es.cache.json" ^
+  --api-key "YOUR_API_KEY_HERE" ^
+  --report "update_report.json"
+```
+
+* `--prev-source`: the **old English** XML the old translation was made from (needed to detect
+  what changed).
+* `--prev-translation`: the **old translated** XML to carry over.
+* `--report PATH`: writes a JSON summary (counts + every string that still needs attention).
+* Add `--cache-only` to preview with **zero API calls** (reused strings get applied; new/changed
+  ones stay in English until you run with a key).
+
+Safety rules baked in: a reused translation is only trusted when the English is unchanged **and**
+its `%s`/`%1$s` placeholders still line up; if the old "translation" is actually still English, or
+the English changed, the string is sent for (re)translation instead of carried over blindly.
+
+> Tip: the bulk of your reuse comes from the **cache file**, not from `--prev-translation` if that
+> file isn't really translated. Always pass `--cache-file` pointing at your populated cache.
+
+### Self-tests for the merge logic
+
+```bat
+python translate_gemini.py --self-test-merge
+```
+
+---
+
 ## Full options list (most relevant)
 
 ### API & performance

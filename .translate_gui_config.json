@@ -1,0 +1,12 @@
+{
+  "lang": "es",
+  "target_lang": "Latin American Spanish",
+  "output_path": "C:\\Users\\Jeison\\Downloads\\trad n",
+  "verbose": false,
+  "cache_only": false,
+  "retry_empty": false,
+  "cmp_old_source_path": "C:/Users/Jeison/Downloads/trad n/stringtabley_translated.xml",
+  "cmp_old_trans_path": "C:/Users/Jeison/Downloads/trad n/stringtabley_translated.xml",
+  "cmp_cache_path": "",
+  "geometry": "1637x1196+352+20"
+}
