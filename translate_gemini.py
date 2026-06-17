@@ -163,58 +163,119 @@ def has_english_residue(src: str, out: str, target_lang: str) -> bool:
     return False
 
 
-def terminology_overrides_for_target(target_lang: str) -> str:
-    """Extra instructions appended to the prompt, only when needed.
+def _team_casing_repl(match: "re.Match[str]") -> str:
+    """Preserve the casing of the matched English 'team' on the Spanish 'equipo'."""
+    word = match.group(0)
+    if word.isupper():
+        return "EQUIPO"
+    if word.islower():
+        return "equipo"
+    return "Equipo"
 
-    Keep this language-conditional so the script remains global (multi-language).
+
+@dataclass(frozen=True)
+class GlossaryEntry:
+    """A single Spanish-target terminology rule, the source of truth for BOTH layers.
+
+    - ``prompt_hint`` guides Gemini up front (preventive, "soft").
+    - ``output_fixes`` deterministically corrects the translation afterwards (hard guarantee).
+
+    ``output_fixes`` only run when ``source_trigger`` matches the ENGLISH original, so we never
+    touch unrelated strings. To add a term, append one entry here — both layers pick it up.
     """
-    if target_is_spanish(target_lang):
-        return (
-            "TERMINOLOGY OVERRIDES (apply ONLY when target language is Spanish)\n"
+
+    name: str
+    source_trigger: "re.Pattern[str]"
+    prompt_hint: str
+    # Tuple of (compiled pattern, replacement); replacement is a str or a callable (re.sub style).
+    output_fixes: Tuple[Tuple["re.Pattern[str]", object], ...]
+
+
+SPANISH_GLOSSARY: List[GlossaryEntry] = [
+    GlossaryEntry(
+        name="home-city",
+        source_trigger=re.compile(r"\bHome\s+Cit(?:y|ies)\b", re.IGNORECASE),
+        prompt_hint=(
             "- Translate 'Home City' as 'Metrópoli'.\n"
             "- Translate 'Home Cities' as 'Metrópolis'.\n"
             "- If 'Home City' appears inside a longer sentence, still render it as 'Metrópoli/Metrópolis'.\n"
-        )
+        ),
+        output_fixes=(
+            # Leftover English occurrences.
+            (re.compile(r"\bHome\s+Cities\b", re.IGNORECASE), "Metrópolis"),
+            (re.compile(r"\bHome\s+City\b", re.IGNORECASE), "Metrópoli"),
+            # The common (but unwanted in WoL Spanish) translation 'ciudad natal' / 'ciudades natales'.
+            # Pick singular/plural from the Spanish form itself.
+            (re.compile(r"\bciudades\s+natales\b", re.IGNORECASE), "Metrópolis"),
+            (re.compile(r"\bciudad\s+natal\b", re.IGNORECASE), "Metrópoli"),
+        ),
+    ),
+    GlossaryEntry(
+        name="team",
+        source_trigger=re.compile(r"\bteam\b", re.IGNORECASE),
+        prompt_hint="- Translate 'team' as 'equipo' (keep the casing of the original word).\n",
+        output_fixes=((re.compile(r"\bteam\b", re.IGNORECASE), _team_casing_repl),),
+    ),
+    GlossaryEntry(
+        name="game-ages",
+        # Activate whenever the source mentions an 'Age' (named epoch or generic 'Age up').
+        # This only gates WHICH strings get post-processed; the output_fixes below are themselves
+        # tightly anchored, so a broad trigger here is safe (it never rewrites a bare 'Era').
+        source_trigger=re.compile(r"\bAges?\b", re.IGNORECASE),
+        prompt_hint=(
+            "- Translate the game-epoch names with 'Edad' (NEVER 'Era'): "
+            "'Enlightenment Age'→'Edad de la Ilustración', 'National Age'→'Edad Nacional', "
+            "'Capital Age'→'Edad Capital', 'Industrial Age'→'Edad Industrial', "
+            "'Imperial Age'→'Edad Imperial', 'Golden Age'→'Edad de Oro', 'Stone Age'→'Edad de Piedra'.\n"
+            "- When 'Age' means a game epoch (e.g. 'Age up', 'advance to the Age', 'reach the Age'), "
+            "translate it as 'Edad', not 'Era'. Do NOT translate the title 'Age of Empires'.\n"
+        ),
+        output_fixes=(
+            # Named ages: accept either 'Era' or 'Edad' from the model and force 'Edad <X>'.
+            # Anchored on the second word, so 'ciudad capital' / a bare verb 'era' never match.
+            (re.compile(r"\b(?:Era|Edad)\s+(Nacional|Capital|Industrial|Imperial)\b", re.IGNORECASE),
+             lambda m: "Edad " + m.group(1).capitalize()),
+            (re.compile(r"\b(?:Era|Edad)\s+de\s+la\s+(?:Ilustración|Iluminación)\b", re.IGNORECASE),
+             "Edad de la Ilustración"),
+            (re.compile(r"\b(?:Era|Edad)\s+de\s+(Oro|Piedra)\b", re.IGNORECASE),
+             lambda m: "Edad de " + m.group(1).capitalize()),
+            # Generic epoch sense after an advance verb: '...avanzar a la Era' -> '...Edad'.
+            # Only the trailing 'Era' (the noun, never the verb 'era' here) is rewritten.
+            (re.compile(r"((?:avanz|alcanz|sub|lleg)\w*\s+(?:de\s+|a\s+(?:la\s+)?))Era\b", re.IGNORECASE),
+             lambda m: m.group(1) + "Edad"),
+        ),
+    ),
+]
+
+
+def terminology_overrides_for_target(target_lang: str) -> str:
+    """Extra instructions appended to the prompt, only when needed.
+
+    Built from ``SPANISH_GLOSSARY`` so the prompt and the post-process fixes share one source
+    of truth. Keep this language-conditional so the script remains global (multi-language).
+    """
+    if target_is_spanish(target_lang):
+        hints = "".join(entry.prompt_hint for entry in SPANISH_GLOSSARY)
+        return "TERMINOLOGY OVERRIDES (apply ONLY when target language is Spanish)\n" + hints
     return ""
 
 
 def apply_postprocess_overrides(original_text: str, translated_text: str, target_lang: str) -> str:
     """Last-mile fixes that must be *conditional on the target language*.
 
-    This prevents Spanish-specific decisions from leaking into other targets like Portuguese.
+    Driven by ``SPANISH_GLOSSARY``: each entry's ``output_fixes`` run only when its
+    ``source_trigger`` matches the English original. This prevents Spanish-specific decisions
+    from leaking into other targets like Portuguese, and keeps the fixes scoped to relevant strings.
     """
     if not target_is_spanish(target_lang):
         return translated_text
 
-    # Only enforce if the SOURCE contains the Home City term(s) (so we don't break unrelated 'ciudad natal').
-    src_has_plural = re.search(r"\bHome\s+Cities\b", original_text, re.IGNORECASE) is not None
-    src_has_singular = re.search(r"\bHome\s+City\b", original_text, re.IGNORECASE) is not None
-
     out = translated_text
-
-    if src_has_plural or src_has_singular:
-        # Replace any leftover English occurrences.
-        out = re.sub(r"\bHome\s+Cities\b", "Metrópolis", out, flags=re.IGNORECASE)
-        out = re.sub(r"\bHome\s+City\b", "Metrópoli", out, flags=re.IGNORECASE)
-
-        # Replace the common (but unwanted in WoL Spanish) translation 'ciudad natal'.
-        out = re.sub(
-            r"\bciudades?\s+natales?\b",
-            "Metrópolis" if src_has_plural else "Metrópoli",
-            out,
-            flags=re.IGNORECASE,
-        )
-
-    if re.search(r"\bteam\b", original_text, re.IGNORECASE):
-        def repl(match: re.Match[str]) -> str:
-            word = match.group(0)
-            if word.isupper():
-                return "EQUIPO"
-            if word.islower():
-                return "equipo"
-            return "Equipo"
-
-        out = re.sub(r"\bteam\b", repl, out, flags=re.IGNORECASE)
+    for entry in SPANISH_GLOSSARY:
+        if not entry.source_trigger.search(original_text):
+            continue
+        for pattern, replacement in entry.output_fixes:
+            out = pattern.sub(replacement, out)
 
     return out
 
@@ -1835,6 +1896,63 @@ def self_test_source_casing() -> None:
     print("✅ Source casing self-test passed.")
 
 
+def self_test_glossary() -> None:
+    target_lang = "Spanish"
+
+    def _assert(condition: bool, message: str) -> None:
+        if not condition:
+            raise SystemExit(f"Glossary self-test failed: {message}")
+
+    f = apply_postprocess_overrides
+
+    # Named ages: 'Era <X>' (and lowercase 'edad') get forced to the canonical 'Edad <X>'.
+    cases = [
+        ("II: National Age", "II: Era Nacional", "Edad Nacional"),
+        ("Build in the Industrial Age", "Construye en la era industrial", "Edad Industrial"),
+        ("You reach the Imperial Age!", "¡Alcanzas la Era Imperial!", "Edad Imperial"),
+        ("Advance to the Capital Age", "Avanza a la Era Capital", "Edad Capital"),
+        ("I: Enlightenment Age", "I: Era de la Ilustración", "Edad de la Ilustración"),
+        ("A new Golden Age", "Una nueva Era de Oro", "Edad de Oro"),
+        ("The Stone Age", "La Era de Piedra", "Edad de Piedra"),
+    ]
+    for src, bad, expected in cases:
+        out = f(src, bad, target_lang)
+        _assert(expected in out, f"expected '{expected}' in {out!r} (source {src!r})")
+        _assert(" Era " not in f" {out} ", f"'Era' should be gone from {out!r}")
+
+    # Generic epoch sense after an advance verb: only the trailing noun 'Era' becomes 'Edad'.
+    adv = f(
+        "Allows you to send the Cavalier, who advances you to the National Age.",
+        "...quien te avanza a la Era Nacional.",
+        target_lang,
+    )
+    _assert("Edad Nacional" in adv, f"expected 'Edad Nacional' in {adv!r}")
+    adv_up = f("Age up quickly", "avanza de Era rápido", target_lang)
+    _assert("avanza de Edad" in adv_up, f"expected 'avanza de Edad' in {adv_up!r}")
+
+    # CRITICAL negative case: a bare 'era' (the verb 'was') must NEVER become 'Edad'.
+    src_verb = "In a bygone age the world was different"
+    out_verb = "En una época pasada el mundo era diferente"
+    _assert(
+        f(src_verb, out_verb, target_lang) == out_verb,
+        f"verb 'era' must stay untouched, got {f(src_verb, out_verb, target_lang)!r}",
+    )
+
+    # Regression: Home City / team still work; non-Spanish targets are untouched.
+    _assert(f("Go to your Home City", "Ve a tu ciudad natal", target_lang) == "Ve a tu Metrópoli",
+            "Home City should map to Metrópoli")
+    _assert(f("Manage your Home Cities", "Gestiona tus ciudades natales", target_lang) == "Gestiona tus Metrópolis",
+            "Home Cities should map to Metrópolis")
+    _assert(f("TEAM bonus", "Bono de TEAM", target_lang) == "Bono de EQUIPO",
+            "TEAM should become EQUIPO")
+    _assert(f("Team bonus", "Bono de Team", target_lang) == "Bono de Equipo",
+            "Team should become Equipo")
+    _assert(f("II: National Age", "II: Era Nacional", "Portuguese") == "II: Era Nacional",
+            "non-Spanish target must be left untouched")
+
+    print("✅ Glossary self-test passed.")
+
+
 def self_test_merge() -> None:
     def _assert(condition: bool, message: str) -> None:
         if not condition:
@@ -2198,6 +2316,7 @@ def main() -> None:
     if args.self_test_quality_gate:
         self_test_quality_gate()
         self_test_source_casing()
+        self_test_glossary()
         return
     if args.self_test_merge:
         self_test_merge()

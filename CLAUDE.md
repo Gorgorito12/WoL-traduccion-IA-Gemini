@@ -62,9 +62,15 @@ when touching them.
    `translate_batch_gemini`. The model is asked for a strict JSON array; `reconcile_batch_length`
    repairs length mismatches (pad with source / truncate) so a bad response never desyncs the list.
 6. **Quality gates (Spanish-target only, applied per result).** `apply_postprocess_overrides`
-   (Home City→Metrópoli, team→equipo), `enforce_acronym_integrity`, `apply_source_casing`, and
+   (Home City→Metrópoli, team→equipo, game ages like *National Age*→*Edad Nacional*),
+   `enforce_acronym_integrity`, `apply_source_casing`, and
    `has_english_residue`. These are gated by `target_is_spanish()` so other target languages are
-   unaffected.
+   unaffected. The forced-terminology rules (Home City, team, game ages) live in one place,
+   `SPANISH_GLOSSARY` (a list of `GlossaryEntry`): each entry carries the `prompt_hint` fed to Gemini
+   *and* the deterministic `output_fixes` applied here, so both layers share one source of truth and
+   adding a term is one entry. `output_fixes` run only when the entry's `source_trigger` matches the
+   English original, and are anchored to whole phrases (e.g. `(Era|Edad) Nacional`→`Edad Nacional`) —
+   never a bare `Era`→`Edad`, since `Era` is also the verb *was*. Guarded by `self_test_glossary`.
 7. **Reassemble & write.** `assemble_full_texts` merges translated + skipped text back in original
    order; `write_output_snapshot` does an atomic write. `progress_callback` writes a snapshot
    periodically so partial progress survives a crash/cancel.
