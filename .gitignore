@@ -1,0 +1,4 @@
+# Per-user GUI state (window geometry, last-used paths) — regenerated locally.
+.translate_gui_config.json
+__pycache__/
+*.pyc

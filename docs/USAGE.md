@@ -31,6 +31,27 @@ python translate_gemini.py "stringtabley.xml" "stringtabley_es_latam.xml"
 
 ---
 
+## Other language pairs (Chinese→English, Italian→English, Japanese→Spanish, …)
+
+The engine is language-agnostic: pass the pair with `--source` / `--target` (defaults:
+English → Latin American Spanish). The Spanish-only quality gates (glossary, English-residue
+detection) simply switch off for other targets.
+
+```bat
+python translate_gemini.py "stringtabley_zh.xml" "stringtabley_en.xml" --api-key "KEY" --source "Chinese (Simplified)" --target "English" --cache-file "wol_zh-en.cache.json"
+```
+
+> Use **one cache file per language pair** — the cache key is the source text only, so mixing
+> pairs in one file returns wrong-language translations. In the GUI, both languages are dropdowns
+> ("Translate from / to"), and when the fields are left empty the automatic output/cache names are
+> partitioned per pair (`X_translated_zh-en.xml`, `X_translated_zh-en.xml.cache.json`); the default
+> English→Latin American Spanish pair keeps the legacy names (`X_translated.xml`).
+> The GUI also sanity-checks the pair: if the file doesn't look like the selected source language
+> (e.g. an English file with German→Japanese selected), it warns before translating and offers to
+> switch the source in one click.
+
+---
+
 ## Recommended: use a global cache file (version-friendly)
 
 If you translate multiple mod versions, always reuse the same cache:

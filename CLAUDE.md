@@ -153,7 +153,28 @@ cache + Gemini, and **Solo caché** (`_on_cache_only_clicked`) = cache only, no 
 `_start_translation(cache_only)` (there is no "Cache only" checkbox). `_set_run_buttons(running)`
 enables/disables the Traducir/Solo caché/Stop trio together. Rarely-used options (Retry empty cache,
 Verbose) live under an **Avanzado ▾** toggle (`_toggle_advanced`). `_estimate_cost` subtracts strings
-already in the selected cache, so the cost reflects only what would actually hit the API.
+already in the cache the run would actually use (explicit field or the automatic per-file one, via
+the same `_resolve_paths`), so the cost reflects only what would actually hit the API.
+
+**Language pairs.** The Settings row is a "Translate from / to" pair of editable comboboxes
+(`self.source_lang` / `self.target_lang`, persisted in the config); both flow into
+`translate_strings` at the two GUI call sites. Because the cache key is the source text with NO
+language dimension, one cache must never serve two pairs — the GUI enforces this through naming:
+`_resolve_paths(input)` (single source of truth for `_run_batch` and `_estimate_cost`) appends
+`_pair_suffix()` to the automatic output name (`X_translated_zh-en.xml`, slugs from `_lang_slug` /
+`LANG_SLUGS`), and the automatic cache derives from that output name, so pairs self-partition.
+**Exception: the historic default pair English→Latin American Spanish keeps the legacy names**
+(`X_translated.xml`, `<output>.cache.json`) so existing outputs/caches keep working. Manual
+Output-folder/Cache-file fields always win. The Spanish-only quality gates are unaffected: they
+key off `target_is_spanish()`, not the GUI.
+
+**Source-language sanity check.** `_start_translation` calls `_maybe_warn_source_language()`:
+it samples the first queued file and runs `_detect_language()` (module-level heuristic — Unicode
+script counts decide ja/zh/ko/ru/ar; stopword votes with a 1.5× margin decide Latin-script
+languages, `None` = inconclusive). On a mismatch it shows Yes/No/Cancel (Yes switches the source
+combobox to the detected language). Deliberately conservative and failure-proof: inconclusive
+guesses and detector exceptions never block a run. Translator tab only — the CLI and the Compare
+tab are untouched.
 
 **Build cache (no API).** The **Compare tab's** "Generar caché (sin API)…" button (`_on_build_cache`
 / `_run_build_cache`) pairs an English XML with its already-translated XML and writes the
@@ -169,6 +190,10 @@ tab) yields the same key `translate_strings` consumes — Translator/CLI keys ar
 **Hover tooltips.** Every control in both tabs has a `Tooltip` (a hover `Toplevel`) attached via
 `self._tip(widget, key)`, where the text is `lambda: self.t(key)` so it follows the language. Tooltip
 text lives under `tip_*` keys in `TR`. When adding a control, attach a tooltip the same way.
+
+**Per-user state.** `.translate_gui_config.json` (window geometry, last-used paths/languages) is
+written next to the script on close and is **gitignored** — never commit it; it once shipped the
+author's personal output path to every user.
 
 **UI language (ES/EN).** All user-facing text comes from the module-level `TR` dict via `self.t(key,
 **fmt)`; the language selector lives in a persistent top bar. Switching language calls

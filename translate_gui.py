@@ -75,6 +75,101 @@ DEFAULT_TARGET_OPTIONS = [
     "Turkish",
 ]
 
+DEFAULT_SOURCE_OPTIONS = ["English"] + DEFAULT_TARGET_OPTIONS
+
+# Short codes used to partition the automatic output/cache filenames per language
+# pair (e.g. "_zh-en"). Checked in order, so variant names must come before their
+# base language. Fallback for unknown names: first word, letters only.
+LANG_SLUGS = [
+    ("spain", "es-es"), ("spanish", "es"), ("español", "es"), ("espanol", "es"),
+    ("traditional", "zh-tw"), ("chinese", "zh"),
+    ("brazil", "pt-br"), ("portugal", "pt-pt"), ("portuguese", "pt"),
+    ("english", "en"), ("french", "fr"), ("german", "de"), ("italian", "it"),
+    ("japanese", "ja"), ("korean", "ko"), ("russian", "ru"),
+    ("arabic", "ar"), ("turkish", "tr"),
+]
+
+
+def _lang_slug(name: str) -> str:
+    lowered = (name or "").strip().lower()
+    for key, code in LANG_SLUGS:
+        if key in lowered:
+            return code
+    first_word = re.sub(r"[^a-z]", "", lowered.split()[0]) if lowered.split() else ""
+    return first_word or "xx"
+
+
+# Slug → dropdown display name, for the source-language-mismatch dialog.
+SLUG_TO_NAME = {
+    "en": "English", "es": "Latin American Spanish", "fr": "French", "de": "German",
+    "it": "Italian", "pt": "Portuguese (Brazil)", "ja": "Japanese", "ko": "Korean",
+    "zh": "Chinese (Simplified)", "ru": "Russian", "ar": "Arabic", "tr": "Turkish",
+}
+
+# Function-word votes to tell Latin-script languages apart in _detect_language.
+_STOPWORD_VOTES = {
+    "en": {"the", "and", "of", "to", "is", "you", "your", "with", "for", "this"},
+    "de": {"der", "die", "das", "und", "ist", "nicht", "mit", "ein", "eine", "für", "wird"},
+    "es": {"el", "la", "los", "las", "de", "que", "para", "con", "una", "tu", "más"},
+    "fr": {"le", "les", "des", "et", "est", "pour", "une", "vous", "dans", "plus"},
+    "it": {"il", "che", "di", "non", "per", "una", "gli", "sono", "più", "è",
+           "della", "delle", "degli", "questa", "questo"},
+    "pt": {"o", "os", "de", "que", "não", "para", "uma", "você", "com", "mais"},
+    "tr": {"ve", "bir", "için", "bu", "daha", "olarak"},
+}
+
+
+def _detect_language(texts) -> Optional[str]:
+    """Best-effort guess of the dominant language of `texts` (a slug like 'en'), or None.
+
+    Conservative by design: character scripts decide the non-Latin languages;
+    Latin-script ones need a clear stopword-vote margin, otherwise None (stay quiet).
+    """
+    sample = [t for t in texts if t and t.strip()][:200]
+    if not sample:
+        return None
+    joined = " ".join(sample)
+
+    kana = han = hangul = cyrillic = arabic = latin = 0
+    for ch in joined:
+        cp = ord(ch)
+        if 0x3040 <= cp <= 0x30FF:
+            kana += 1
+        elif 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF:
+            han += 1
+        elif 0xAC00 <= cp <= 0xD7AF:
+            hangul += 1
+        elif 0x0400 <= cp <= 0x04FF:
+            cyrillic += 1
+        elif 0x0600 <= cp <= 0x06FF:
+            arabic += 1
+        elif ("a" <= ch <= "z") or ("A" <= ch <= "Z"):
+            latin += 1
+
+    # Kana implies Japanese even mixed with han; han alone means Chinese.
+    if kana > 5:
+        return "ja"
+    for slug, count in (("ko", hangul), ("zh", han), ("ru", cyrillic), ("ar", arabic)):
+        # Markup/placeholders add Latin chars even in non-Latin files, hence the soft ratio.
+        if count > 5 and count * 2 >= latin:
+            return slug
+
+    words = re.findall(r"[a-záéíóúüñàèìòùâêîôûäöüßçãõ]+", joined.lower())
+    if len(words) < 20:
+        return None
+    votes = {slug: 0 for slug in _STOPWORD_VOTES}
+    for word in words:
+        for slug, stopwords in _STOPWORD_VOTES.items():
+            if word in stopwords:
+                votes[slug] += 1
+    ranked = sorted(votes.items(), key=lambda kv: kv[1], reverse=True)
+    (best_slug, best), (_, second) = ranked[0], ranked[1]
+    # Romance languages share function words ("la", "de", "una"), so demand a
+    # clear but not extreme lead; anything murkier returns None and we stay quiet.
+    if best >= max(8, len(words) // 50) and best >= second * 1.5:
+        return best_slug
+    return None
+
 # Dark theme palette.
 BG_MAIN = "#1e1e1e"
 BG_FRAME = "#252525"
@@ -124,7 +219,8 @@ TR = {
         "btn_auto": "Auto",
         "hint_auto_paths": "(Deja los campos vacíos para rutas automáticas)",
         "frame_settings": "Ajustes",
-        "lbl_target_language": "Idioma de destino:",
+        "lbl_source_language": "Traducir de:",
+        "lbl_target_language": "a:",
         "lbl_api_key": "Clave API de Gemini:",
         "btn_show_hide": "Mostrar/Ocultar",
         "btn_test": "Probar",
@@ -156,6 +252,11 @@ TR = {
         "mb_missing_file_msg": "El archivo no existe:\n{p}",
         "mb_missing_key_title": "Falta clave API",
         "mb_missing_key_msg": "Introduce una clave API de Gemini, o activa 'Solo caché'.",
+        "mb_lang_mismatch_title": "El idioma de origen no coincide",
+        "mb_lang_mismatch_msg": ("El archivo parece estar en {detected}, pero elegiste {selected} "
+                                 "como idioma de origen.\n\n¿Cambiar el origen a {detected}?\n\n"
+                                 "Sí = usar {detected}   ·   No = mantener {selected}   ·   "
+                                 "Cancelar = no traducir"),
         "mb_no_key_title": "Sin clave",
         "mb_no_key_msg": "Introduce primero una clave API.",
         "mb_apikey_title": "Clave API",
@@ -191,8 +292,8 @@ TR = {
         "filt_new": "Nuevos",
         "filt_reused": "Reusados/traducidos",
         "filt_all": "Todos",
-        "col_source": "Inglés nuevo",
-        "col_old_source": "Inglés viejo",
+        "col_source": "Origen nuevo",
+        "col_old_source": "Origen viejo",
         "col_translation": "Traducción",
         "col_status": "Estado",
         "diff_new": "NUEVO:",
@@ -270,8 +371,9 @@ TR = {
         "tip_remove": "Quitar de la cola los archivos seleccionados.",
         "tip_clear": "Vaciar la cola de archivos.",
         "tip_output_folder": "Carpeta donde se escriben los XML traducidos (como <nombre>_translated.xml). Vacío = junto al original.",
-        "tip_cache_file": "Archivo de caché a usar (inglés→español). Reutiliza traducciones y ahorra API. Vacío = uno automático por archivo.",
-        "tip_cache_auto": "Volver al caché automático (<salida>.cache.json).",
+        "tip_cache_file": "Archivo de caché a usar (origen→destino). Reutiliza traducciones y ahorra API. Usa UN caché por par de idiomas. Vacío = uno automático por archivo y par.",
+        "tip_cache_auto": "Volver al caché automático (<salida>.cache.json, separado por par de idiomas).",
+        "tip_source_lang": "Idioma original del XML de entrada (ej. inglés, chino, japonés).",
         "tip_target_lang": "Idioma al que se traduce el texto (ej. español latino). Distinto del idioma de la interfaz.",
         "tip_api_key": "Tu clave de Google Gemini. Solo se necesita para cadenas que NO estén en el caché. No se guarda en disco.",
         "tip_test": "Hace una llamada mínima a Gemini para comprobar que la clave funciona.",
@@ -292,7 +394,7 @@ TR = {
         "tip_cmp_search": "Busca dentro de _locID / inglés / traducción.",
         "tip_cmp_apply": "Aplica el texto editado a la fila seleccionada.",
         "tip_cmp_autotranslate": "Traduce con Gemini las cadenas nuevas/cambiadas que falten (necesita clave API).",
-        "tip_cmp_save_cache": "Genera/actualiza el caché (inglés→español) con lo reutilizado/editado. No usa API.",
+        "tip_cmp_save_cache": "Genera/actualiza el caché (origen→destino) con lo reutilizado/editado. No usa API.",
         "tip_cmp_export": "Escribe el XML final adaptado (español donde lo hay, inglés en lo pendiente).",
     },
     "en": {
@@ -323,7 +425,8 @@ TR = {
         "btn_auto": "Auto",
         "hint_auto_paths": "(Leave fields empty for automatic paths)",
         "frame_settings": "Settings",
-        "lbl_target_language": "Target language:",
+        "lbl_source_language": "Translate from:",
+        "lbl_target_language": "to:",
         "lbl_api_key": "Gemini API key:",
         "btn_show_hide": "Show/Hide",
         "btn_test": "Test",
@@ -354,6 +457,11 @@ TR = {
         "mb_missing_file_msg": "File does not exist:\n{p}",
         "mb_missing_key_title": "Missing API key",
         "mb_missing_key_msg": "Enter a Gemini API key, or enable 'Cache only'.",
+        "mb_lang_mismatch_title": "Source language mismatch",
+        "mb_lang_mismatch_msg": ("The file looks like it is in {detected}, but you selected "
+                                 "{selected} as the source language.\n\nSwitch the source to "
+                                 "{detected}?\n\nYes = use {detected}   ·   No = keep {selected}"
+                                 "   ·   Cancel = abort"),
         "mb_no_key_title": "No key",
         "mb_no_key_msg": "Please enter an API key first.",
         "mb_apikey_title": "API key",
@@ -388,8 +496,8 @@ TR = {
         "filt_new": "New",
         "filt_reused": "Reused/translated",
         "filt_all": "All",
-        "col_source": "New English",
-        "col_old_source": "Old English",
+        "col_source": "New source",
+        "col_old_source": "Old source",
         "col_translation": "Translation",
         "col_status": "Status",
         "diff_new": "NEW:",
@@ -467,8 +575,9 @@ TR = {
         "tip_remove": "Remove the selected files from the queue.",
         "tip_clear": "Empty the file queue.",
         "tip_output_folder": "Folder where translated XML is written (as <name>_translated.xml). Empty = next to the original.",
-        "tip_cache_file": "Cache file to use (English→Spanish). Reuses translations and saves API. Empty = one automatic per file.",
-        "tip_cache_auto": "Revert to the automatic cache (<output>.cache.json).",
+        "tip_cache_file": "Cache file to use (source→target). Reuses translations and saves API. Use ONE cache per language pair. Empty = one automatic per file and pair.",
+        "tip_cache_auto": "Revert to the automatic cache (<output>.cache.json, split per language pair).",
+        "tip_source_lang": "The original language of the input XML (e.g. English, Chinese, Japanese).",
         "tip_target_lang": "The language the text is translated into (e.g. Latin American Spanish). Separate from the UI language.",
         "tip_api_key": "Your Google Gemini key. Needed only for strings NOT in the cache. Not saved to disk.",
         "tip_test": "Makes a tiny Gemini call to check the key works.",
@@ -489,7 +598,7 @@ TR = {
         "tip_cmp_search": "Search within _locID / English / translation.",
         "tip_cmp_apply": "Apply the edited text to the selected row.",
         "tip_cmp_autotranslate": "Translate the missing new/changed strings with Gemini (needs an API key).",
-        "tip_cmp_save_cache": "Build/update the cache (English→Spanish) from reused/edited strings. No API.",
+        "tip_cmp_save_cache": "Build/update the cache (source→target) from reused/edited strings. No API.",
         "tip_cmp_export": "Write the final adapted XML (Spanish where available, English for pending).",
     },
 }
@@ -644,6 +753,7 @@ class TranslatorGUI:
         self.api_key = tk.StringVar(
             value=os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
         )
+        self.source_lang = tk.StringVar(value=tg.DEFAULT_SOURCE_LANG)
         self.target_lang = tk.StringVar(value=tg.DEFAULT_TARGET_LANG)
         self.cache_only = tk.BooleanVar(value=False)
         self.retry_empty = tk.BooleanVar(value=False)
@@ -860,11 +970,18 @@ class TranslatorGUI:
         settings_frame = ttk.LabelFrame(parent, text=self.t("frame_settings"), padding=8)
         settings_frame.pack(fill="x", padx=10, pady=4)
 
-        _lbl = ttk.Label(settings_frame, text=self.t("lbl_target_language"))
-        _lbl.grid(row=0, column=0, sticky="w", **pad); self._tip(_lbl, "tip_target_lang")
-        _cb = ttk.Combobox(settings_frame, textvariable=self.target_lang,
-                           values=DEFAULT_TARGET_OPTIONS, width=28)
-        _cb.grid(row=0, column=1, sticky="w", **pad); self._tip(_cb, "tip_target_lang")
+        _lbl = ttk.Label(settings_frame, text=self.t("lbl_source_language"))
+        _lbl.grid(row=0, column=0, sticky="w", **pad); self._tip(_lbl, "tip_source_lang")
+        lang_row = ttk.Frame(settings_frame)
+        lang_row.grid(row=0, column=1, sticky="w", **pad)
+        _cb = ttk.Combobox(lang_row, textvariable=self.source_lang,
+                           values=DEFAULT_SOURCE_OPTIONS, width=24)
+        _cb.pack(side="left"); self._tip(_cb, "tip_source_lang")
+        _lbl = ttk.Label(lang_row, text=self.t("lbl_target_language"))
+        _lbl.pack(side="left", padx=(8, 8)); self._tip(_lbl, "tip_target_lang")
+        _cb = ttk.Combobox(lang_row, textvariable=self.target_lang,
+                           values=DEFAULT_TARGET_OPTIONS, width=24)
+        _cb.pack(side="left"); self._tip(_cb, "tip_target_lang")
 
         _lbl = ttk.Label(settings_frame, text=self.t("lbl_api_key"))
         _lbl.grid(row=1, column=0, sticky="w", **pad); self._tip(_lbl, "tip_api_key")
@@ -1393,7 +1510,7 @@ class TranslatorGUI:
             translated, stats = tg.translate_strings(
                 inners,
                 api_key=self.api_key.get() or None,
-                source_lang=tg.DEFAULT_SOURCE_LANG,
+                source_lang=self.source_lang.get().strip() or tg.DEFAULT_SOURCE_LANG,
                 target_lang=self.target_lang.get(),
                 cache_path=cache_file,
                 existing_translations=list(self.cmp_values),
@@ -1630,6 +1747,29 @@ class TranslatorGUI:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    # ------------------------------------------------------ automatic paths --
+
+    def _pair_suffix(self) -> str:
+        """Filename suffix that partitions automatic paths per language pair.
+
+        The historic default pair (English → Latin American Spanish) keeps the
+        legacy names, so existing outputs/caches keep working.
+        """
+        src = self.source_lang.get().strip() or tg.DEFAULT_SOURCE_LANG
+        tgt = self.target_lang.get().strip() or tg.DEFAULT_TARGET_LANG
+        if src == tg.DEFAULT_SOURCE_LANG and tgt == tg.DEFAULT_TARGET_LANG:
+            return ""
+        return f"_{_lang_slug(src)}-{_lang_slug(tgt)}"
+
+    def _resolve_paths(self, input_path: Path) -> "tuple[Path, Path]":
+        """(output, cache) paths for one input file, honoring the manual fields."""
+        name = f"{input_path.stem}_translated{self._pair_suffix()}{input_path.suffix}"
+        folder = self.output_path.get().strip()
+        out_path = (Path(folder) / name) if folder else input_path.with_name(name)
+        custom_cache = self.cache_file_path.get().strip()
+        cache_path = Path(custom_cache) if custom_cache else out_path.with_suffix(out_path.suffix + ".cache.json")
+        return out_path, cache_path
+
     # -------------------------------------------------------- cost estimate --
 
     def _estimate_cost(self) -> None:
@@ -1638,27 +1778,33 @@ class TranslatorGUI:
             return
 
         try:
-            # If a cache file is given, only the UNcached strings would cost API.
-            cache = {}
-            cache_path = self.cache_file_path.get().strip()
-            using_cache = bool(cache_path) and Path(cache_path).exists()
-            if using_cache:
-                try:
-                    cache = json.loads(Path(cache_path).read_text(encoding="utf-8"))
-                except Exception:
-                    cache, using_cache = {}, False
+            # Strings already in the cache (explicit, or the automatic per-file
+            # one the run would use) cost no API.
+            caches: dict = {}
+
+            def _cache_for(path: Path) -> dict:
+                _, cache_path = self._resolve_paths(path)
+                key = str(cache_path)
+                if key not in caches:
+                    try:
+                        caches[key] = (json.loads(cache_path.read_text(encoding="utf-8"))
+                                       if cache_path.exists() else {})
+                    except Exception:
+                        caches[key] = {}
+                return caches[key]
 
             skip_rules = self._build_default_skip_rules()
             total_strings = 0
             pending_strings = 0
             pending_chars = 0
             for path in self.input_paths:
+                cache = _cache_for(path)
                 tree, _ = tg.parse_strings_xml(path)
                 for target in tg.iter_translatable_elements(tree.getroot(), skip_rules):
                     if target.skip:
                         continue
                     total_strings += 1
-                    cached = cache.get(tg.protected_cache_key(target.text)) if using_cache else None
+                    cached = cache.get(tg.protected_cache_key(target.text))
                     if cached and cached.strip():
                         continue  # already translated → no API
                     pending_strings += 1
@@ -1669,6 +1815,7 @@ class TranslatorGUI:
             cost_usd = (approx_tokens * 2.5) / 1_000_000 * COST_PER_M_INPUT_TOKENS
             tok = f"{int(approx_tokens):,}"
             cost = f"{cost_usd:.3f}"
+            using_cache = any(caches.values())
             if using_cache:
                 self.estimate_label.configure(text=self.t(
                     "est_with_cache", pending=pending_strings,
@@ -1840,6 +1987,8 @@ class TranslatorGUI:
         if not cache_only and not self.api_key.get().strip():
             messagebox.showerror(self.t("mb_missing_key_title"), self.t("mb_missing_key_msg"))
             return
+        if not self._maybe_warn_source_language():
+            return
 
         self.cache_only.set(cache_only)
         self._clear_log()
@@ -1851,6 +2000,37 @@ class TranslatorGUI:
 
         self.worker = threading.Thread(target=self._run_batch, daemon=True)
         self.worker.start()
+
+    def _maybe_warn_source_language(self) -> bool:
+        """Warn when the first queued file doesn't look like the chosen source language.
+
+        Returns False only when the user cancels the run; detector failures or
+        inconclusive guesses never block a translation.
+        """
+        try:
+            skip_rules = self._build_default_skip_rules()
+            tree, _ = tg.parse_strings_xml(self.input_paths[0])
+            sample = []
+            for target in tg.iter_translatable_elements(tree.getroot(), skip_rules):
+                if not target.skip:
+                    sample.append(target.text)
+                    if len(sample) >= 200:
+                        break
+            detected = _detect_language(sample)
+            selected = self.source_lang.get().strip() or tg.DEFAULT_SOURCE_LANG
+            if not detected or detected == _lang_slug(selected).split("-")[0]:
+                return True
+            detected_name = SLUG_TO_NAME.get(detected, detected)
+            answer = messagebox.askyesnocancel(
+                self.t("mb_lang_mismatch_title"),
+                self.t("mb_lang_mismatch_msg", detected=detected_name, selected=selected))
+            if answer is None:
+                return False
+            if answer:
+                self.source_lang.set(detected_name)
+            return True
+        except Exception:
+            return True
 
     def _on_stop_clicked(self) -> None:
         if self.cancel_event:
@@ -1878,7 +2058,6 @@ class TranslatorGUI:
                 stream=redirector,
             )
 
-            output_folder = Path(self.output_path.get().strip()) if self.output_path.get().strip() else None
             skip_rules = self._build_default_skip_rules()
 
             for file_idx, input_path in enumerate(self.input_paths, start=1):
@@ -1891,13 +2070,7 @@ class TranslatorGUI:
                 print(f"📂 File {file_idx}/{len(self.input_paths)}: {input_path.name}", flush=True)
                 print("=" * 60, flush=True)
 
-                if output_folder:
-                    out_path = output_folder / f"{input_path.stem}_translated{input_path.suffix}"
-                else:
-                    out_path = input_path.with_name(f"{input_path.stem}_translated{input_path.suffix}")
-
-                custom_cache = self.cache_file_path.get().strip()
-                cache_file = Path(custom_cache) if custom_cache else out_path.with_suffix(out_path.suffix + ".cache.json")
+                out_path, cache_file = self._resolve_paths(input_path)
 
                 if cache_file.exists():
                     try:
@@ -1927,7 +2100,7 @@ class TranslatorGUI:
                 translated, stats = tg.translate_strings(
                     translatable_texts,
                     api_key=self.api_key.get() or None,
-                    source_lang=tg.DEFAULT_SOURCE_LANG,
+                    source_lang=self.source_lang.get().strip() or tg.DEFAULT_SOURCE_LANG,
                     target_lang=self.target_lang.get(),
                     cache_path=cache_file,
                     existing_translations=existing,
@@ -2041,6 +2214,7 @@ class TranslatorGUI:
 
         lang = data.get("lang", "es")
         self.lang.set(lang if lang in ("es", "en") else "es")
+        self.source_lang.set(data.get("source_lang", tg.DEFAULT_SOURCE_LANG))
         self.target_lang.set(data.get("target_lang", tg.DEFAULT_TARGET_LANG))
         self.output_path.set(data.get("output_path", ""))
         self.verbose.set(bool(data.get("verbose", False)))
@@ -2056,6 +2230,7 @@ class TranslatorGUI:
     def _save_config(self) -> None:
         data = {
             "lang": self.lang.get(),
+            "source_lang": self.source_lang.get(),
             "target_lang": self.target_lang.get(),
             "output_path": self.output_path.get(),
             "verbose": self.verbose.get(),
