@@ -154,7 +154,10 @@ cache + Gemini, and **Solo caché** (`_on_cache_only_clicked`) = cache only, no 
 enables/disables the Traducir/Solo caché/Stop trio together. Rarely-used options (Retry empty cache,
 Verbose) live under an **Avanzado ▾** toggle (`_toggle_advanced`). `_estimate_cost` subtracts strings
 already in the cache the run would actually use (explicit field or the automatic per-file one, via
-the same `_resolve_paths`), so the cost reflects only what would actually hit the API.
+the same `_resolve_paths`), so the cost reflects only what would actually hit the API. Its cost
+model prices input and output separately (`COST_PER_M_INPUT_TOKENS` / `COST_PER_M_OUTPUT_TOKENS` —
+output is ~8× input and dominates), adds the prompt template once per estimated batch, and counts
+CJK characters as ~1 token each (`_approx_tokens`).
 
 **Language pairs.** The Settings row is a "Translate from / to" pair of editable comboboxes
 (`self.source_lang` / `self.target_lang`, persisted in the config); both flow into
@@ -213,6 +216,11 @@ All Gemini-specific code lives in exactly two functions: `setup_gemini` (client 
 retries, token protection, XML I/O) is provider-agnostic. Adding another backend (e.g. an
 OpenAI-compatible provider) means adding a parallel pair of functions and a `--provider` switch,
 not touching the pipeline.
+
+`translate_batch_gemini` sets `thinking_config=ThinkingConfig(thinking_budget=0)`: 2.5 Flash's
+default *dynamic thinking* bills its hidden reasoning tokens at the output price and adds nothing
+to mechanical translation — do not remove this without a reason (it silently multiplies cost). The
+config is built in a try/except so older `google-genai` SDKs without `ThinkingConfig` still work.
 
 ## Docs
 

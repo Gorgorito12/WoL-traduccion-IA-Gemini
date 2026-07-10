@@ -166,6 +166,33 @@ Startup crashes are also shown in an error dialog even under `pythonw`.
 
 ---
 
+## 9) The real API cost is higher than the GUI estimate
+
+### Cause (historical)
+
+Older versions underestimated by 4-10× because of a combination of factors:
+
+- **Output tokens cost ~8× more than input** on gemini-2.5-flash ($2.50/M vs $0.30/M), and a
+  translation's output is about as long as its input. The old estimate priced everything at the
+  input rate.
+- **"Thinking" was enabled by default.** gemini-2.5-flash generates hidden reasoning tokens before
+  answering and bills them at the output rate. For string translation they add cost, not quality.
+- **Per-batch prompt overhead**: the rules template (~400 tokens) is resent with every batch.
+- **Retries** (transient errors, the Spanish residue retry) re-send whole batches.
+
+### Current behavior
+
+- The engine now disables thinking (`thinking_budget=0` in `translate_batch_gemini`) — same model,
+  same translations, no hidden reasoning bill.
+- The GUI estimate now models input + output prices separately, adds the per-batch template
+  overhead, and counts CJK characters realistically (~1 token each). Expect the real bill to land
+  close to the estimate; retries can still add a little.
+
+If you need it even cheaper: `gemini-2.5-flash-lite` (~8× cheaper) or the Gemini Batch API (50%
+discount) are options, but both require code changes (configurable model / async pipeline).
+
+---
+
 ## Still blocked?
 
 When reporting an issue, include:

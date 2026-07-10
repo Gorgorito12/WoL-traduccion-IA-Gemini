@@ -838,14 +838,25 @@ def translate_batch_gemini(
         extra_rules=extra_rules,
     )
 
+    # Ask the API to return strict JSON whenever possible. thinking_budget=0
+    # disables 2.5 Flash's default "dynamic thinking": those hidden reasoning
+    # tokens are billed as output and add nothing to mechanical translation.
+    config_kwargs = dict(
+        response_mime_type="application/json",
+        response_schema=list[str],
+    )
+    try:
+        config = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            **config_kwargs,
+        )
+    except (AttributeError, TypeError):  # older google-genai without ThinkingConfig
+        config = types.GenerateContentConfig(**config_kwargs)
+
     response = client.models.generate_content(
         model=DEFAULT_MODEL,
         contents=prompt,
-        # Ask the API to return strict JSON whenever possible.
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=list[str],
-        ),
+        config=config,
     )
 
     # The google-genai SDK returns a GenerateContentResponse with .text, and may also include .candidates.
@@ -1868,8 +1879,12 @@ def self_test_quality_gate() -> None:
 
     src2 = "Enter the IP address of the host to connect through direct IP."
     out2_bad = "Enter the IP address of the host to connect through direct IP."
-    out2_good = "Introduce la dirección IP del host para conectar mediante IP directa."
+    # "host" is deliberately in ENGLISH_RESIDUE_STOPWORDS (translate it as "anfitrión"),
+    # so a Spanish translation that keeps "host" must be flagged too.
+    out2_residue = "Introduce la dirección IP del host para conectar mediante IP directa."
+    out2_good = "Introduce la dirección IP del anfitrión para conectar mediante IP directa."
     _assert(has_english_residue(src2, out2_bad, target_lang), "expected residue for IP address prompt")
+    _assert(has_english_residue(src2, out2_residue, target_lang), "expected residue for kept 'host'")
     _assert("IP" in out2_good, "expected IP to remain unchanged")
     _assert(not has_english_residue(src2, out2_good, target_lang), "expected no residue in Spanish translation")
 
@@ -2127,8 +2142,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     # --- Positional I/O ---
-    parser.add_argument("input", type=Path, help="Input XML file to translate.")
-    parser.add_argument("output", type=Path, help="Output XML file path.")
+    # Optional at the argparse level so the --self-test-* flags work without files;
+    # main() re-enforces them (with the same argparse error) for normal runs.
+    parser.add_argument("input", type=Path, nargs="?", default=None,
+                        help="Input XML file to translate.")
+    parser.add_argument("output", type=Path, nargs="?", default=None,
+                        help="Output XML file path.")
 
     # --- API group ---
     api_group = parser.add_argument_group("API")
@@ -2306,7 +2325,11 @@ def parse_args() -> argparse.Namespace:
         help="Run the _locID merge / cache-key self-tests and exit.",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not (args.self_test_quality_gate or args.self_test_merge) and (
+            args.input is None or args.output is None):
+        parser.error("the following arguments are required: input, output")
+    return args
 
 
 def main() -> None:

@@ -53,10 +53,25 @@ except ImportError as exc:
 APP_TITLE = "Gemini XML Translator"
 CONFIG_FILENAME = ".translate_gui_config.json"
 
-# Rough cost per 1M input tokens for gemini-2.5-flash (USD). Update if pricing changes.
+# Rough cost per 1M tokens for gemini-2.5-flash (USD). Update if pricing changes.
+# Output is ~8x input; translations are billed mostly on the OUTPUT side.
 COST_PER_M_INPUT_TOKENS = 0.30
-# Approximation: each character ≈ 0.25 tokens.
+COST_PER_M_OUTPUT_TOKENS = 2.50
+# Approximation for Latin scripts: each character ≈ 0.25 tokens.
 CHARS_PER_TOKEN = 4
+# Translations tend to run a bit longer than the source (+ JSON framing).
+OUTPUT_LENGTH_FACTOR = 1.15
+
+
+def _approx_tokens(text: str) -> float:
+    """Rough token count: CJK chars ≈ 1 token each, the rest ≈ 4 chars/token."""
+    cjk = 0
+    for ch in text:
+        cp = ord(ch)
+        if 0x3040 <= cp <= 0x30FF or 0x3400 <= cp <= 0x4DBF or 0x4E00 <= cp <= 0x9FFF \
+                or 0xAC00 <= cp <= 0xD7AF:
+            cjk += 1
+    return cjk + (len(text) - cjk) / CHARS_PER_TOKEN
 
 DEFAULT_TARGET_OPTIONS = [
     "Latin American Spanish",
@@ -380,7 +395,8 @@ TR = {
         "tip_cache_only": "Usa SOLO el caché; nunca llama a Gemini (0 costo). Lo no cacheado queda sin traducir.",
         "tip_retry_empty": "Reintenta las cadenas que quedaron marcadas como vacías/fallidas en el caché.",
         "tip_verbose": "Muestra registro detallado (depuración) en el panel inferior.",
-        "tip_estimate": "Calcula cuántas cadenas/tokens y un costo aproximado, sin traducir nada.",
+        "tip_estimate": ("Calcula cadenas/tokens y costo aproximado sin traducir nada. Incluye entrada, "
+                         "salida y el prompt repetido por lote; los reintentos pueden subirlo un poco."),
         "tip_open_folder": "Abre la carpeta de salida en el explorador (al terminar).",
         "tip_translate": "Inicia la traducción de la cola (usa caché; llama a Gemini solo para lo no cacheado).",
         "tip_stop": "Cancela la operación en curso.",
@@ -584,7 +600,8 @@ TR = {
         "tip_cache_only": "Use the cache ONLY; never call Gemini (zero cost). Uncached strings stay untranslated.",
         "tip_retry_empty": "Retry strings previously cached as empty/failed.",
         "tip_verbose": "Show detailed (debug) logging in the panel below.",
-        "tip_estimate": "Estimate strings/tokens and a rough cost, without translating.",
+        "tip_estimate": ("Estimate strings/tokens and a rough cost without translating. Covers input, "
+                         "output and the per-batch prompt overhead; retries may add a little."),
         "tip_open_folder": "Open the output folder in the file explorer (when finished).",
         "tip_translate": "Start translating the queue (uses cache; calls Gemini only for uncached strings).",
         "tip_stop": "Cancel the running operation.",
@@ -1796,7 +1813,8 @@ class TranslatorGUI:
             skip_rules = self._build_default_skip_rules()
             total_strings = 0
             pending_strings = 0
-            pending_chars = 0
+            pending_tokens = 0.0
+            pending_bytes = 0
             for path in self.input_paths:
                 cache = _cache_for(path)
                 tree, _ = tg.parse_strings_xml(path)
@@ -1808,12 +1826,18 @@ class TranslatorGUI:
                     if cached and cached.strip():
                         continue  # already translated → no API
                     pending_strings += 1
-                    pending_chars += len(target.text)
+                    pending_tokens += _approx_tokens(target.text)
+                    pending_bytes += len(target.text.encode("utf-8"))
 
-            approx_tokens = pending_chars / CHARS_PER_TOKEN
-            # Rough upper-bound: ×2.5 accounts for prompt overhead + output tokens.
-            cost_usd = (approx_tokens * 2.5) / 1_000_000 * COST_PER_M_INPUT_TOKENS
-            tok = f"{int(approx_tokens):,}"
+            # Input = the strings plus the rules template resent with every batch;
+            # output = the translations, billed at the (much higher) output price.
+            batches = -(-pending_bytes // tg.MAX_BUDGET_BYTES) if pending_bytes else 0
+            template_tokens = _approx_tokens(tg.DEFAULT_PROMPT_CONFIG.compact_template)
+            in_tokens = pending_tokens + template_tokens * batches
+            out_tokens = pending_tokens * OUTPUT_LENGTH_FACTOR
+            cost_usd = (in_tokens * COST_PER_M_INPUT_TOKENS
+                        + out_tokens * COST_PER_M_OUTPUT_TOKENS) / 1_000_000
+            tok = f"{int(in_tokens + out_tokens):,}"
             cost = f"{cost_usd:.3f}"
             using_cache = any(caches.values())
             if using_cache:
