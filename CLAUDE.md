@@ -74,6 +74,18 @@ when touching them.
    adding a term is one entry. `output_fixes` run only when the entry's `source_trigger` matches the
    English original, and are anchored to whole phrases (e.g. `(Era|Edad) Nacional`→`Edad Nacional`) —
    never a bare `Era`→`Edad`, since `Era` is also the verb *was*. Guarded by `self_test_glossary`.
+
+   **User glossary (pair-agnostic, NOT Spanish-gated).** `glossary.txt` next to the script (or CLI
+   `--glossary-file`): `source term = target term` lines, `#` comments. Loaded by
+   `load_user_glossary`; same two-layer philosophy: `user_glossary_rules(batch, glossary)` injects
+   prompt rules **only into batches that contain the term** (via `translate_batch_with_retry`'s
+   `base_extra_rules`, composed with the strict-retry rules), and `apply_user_glossary_fixes`
+   deterministically replaces a source term the model left untranslated (whole-word for Latin,
+   plain replace for CJK) — it runs at both postprocess points, so it also fixes cache hits. It
+   canNOT fix a wrong-but-translated synonym (that's the prompt layer's job). Glossary changes do
+   not alter cache keys, so already-cached strings keep their old wording. Threaded through
+   `translate_strings(user_glossary=...)`; the GUI auto-loads `glossary.txt` on each run and its
+   "Glosario…" button (Avanzado) creates/opens it. Guarded by `self_test_user_glossary`.
 7. **Reassemble & write.** `assemble_full_texts` merges translated + skipped text back in original
    order; `write_output_snapshot` does an atomic write. `progress_callback` writes a snapshot
    periodically so partial progress survives a crash/cancel.
@@ -152,7 +164,14 @@ only fills empty values (`old if old else new`) so it never clobbers manual edit
 cache + Gemini, and **Solo caché** (`_on_cache_only_clicked`) = cache only, no API — both call
 `_start_translation(cache_only)` (there is no "Cache only" checkbox). `_set_run_buttons(running)`
 enables/disables the Traducir/Solo caché/Stop trio together. Rarely-used options (Retry empty cache,
-Verbose) live under an **Avanzado ▾** toggle (`_toggle_advanced`). `_estimate_cost` subtracts strings
+Verbose, and the **Protected words** field) live under an **Avanzado ▾** toggle
+(`_toggle_advanced`). Protected words (comma-separated, persisted in the config) become
+whole-word case-sensitive regexes via `_custom_protected_regex()` — regex, not plain terms,
+because `protect_phrases` exact terms match substrings ("Ram" would mask inside "Framework").
+That list is passed to BOTH `translate_strings` call sites and to every GUI
+`protected_cache_key` call (compare-tab prefill/save/build-cache and `_estimate_cost`) so cache
+keys stay identical across tabs; adding a word changes the key of strings containing it — they
+re-translate once. `_estimate_cost` subtracts strings
 already in the cache the run would actually use (explicit field or the automatic per-file one, via
 the same `_resolve_paths`), so the cost reflects only what would actually hit the API. Its cost
 model prices input and output separately (`COST_PER_M_INPUT_TOKENS` / `COST_PER_M_OUTPUT_TOKENS` —

@@ -53,6 +53,22 @@ except ImportError as exc:
 APP_TITLE = "Gemini XML Translator"
 CONFIG_FILENAME = ".translate_gui_config.json"
 
+# Template written when the user opens the glossary for the first time.
+GLOSSARY_TEMPLATE = """\
+# Glosario / Glossary — one entry per line:  source term = target term
+# Se aplica al traducir: fuerza la terminología oficial en el idioma destino.
+# Applied while translating: forces official terminology in the target language.
+#
+# Ejemplos (chino → inglés) / Examples (Chinese → English):
+# 主城 = Home City
+# 设置 = Settings
+#
+# Ejemplo (inglés → español) / Example (English → Spanish):
+# Home City = Metrópoli
+#
+# Las líneas que empiezan con # se ignoran. / Lines starting with # are ignored.
+"""
+
 # Rough cost per 1M tokens for gemini-2.5-flash (USD). Update if pricing changes.
 # Output is ~8x input; translations are billed mostly on the OUTPUT side.
 COST_PER_M_INPUT_TOKENS = 0.30
@@ -242,6 +258,17 @@ TR = {
         "chk_cache_only": "Solo caché",
         "chk_retry_empty": "Reintentar caché vacía",
         "chk_verbose": "Detallado",
+        "lbl_protected_words": "Palabras protegidas:",
+        "btn_glossary": "Glosario…",
+        "tip_glossary": ("Abre glossary.txt: líneas 'término origen = término destino' que fuerzan la "
+                         "terminología oficial al traducir (ej. 主城 = Home City). Vale para cualquier "
+                         "par de idiomas. No afecta a lo ya guardado en caché."),
+        "mb_glossary_err_title": "Glosario",
+        "mb_glossary_err_msg": "No se pudo abrir/crear glossary.txt: {exc}",
+        "tip_protected_words": ("Palabras/frases que Gemini NUNCA debe traducir (ej. nombres de unidades: "
+                                "Sepoy, Ashigaru). Sepáralas con comas. Respetan mayúsculas y palabra completa. "
+                                "Ojo: al añadir palabras nuevas, las cadenas que las contienen se retraducen "
+                                "una vez (cambia su clave de caché)."),
         "btn_estimate": "Estimar costo",
         "btn_open_folder": "Abrir carpeta de salida",
         "btn_translate": "Traducir",
@@ -449,6 +476,17 @@ TR = {
         "chk_cache_only": "Cache only",
         "chk_retry_empty": "Retry empty cache",
         "chk_verbose": "Verbose",
+        "lbl_protected_words": "Protected words:",
+        "btn_glossary": "Glossary…",
+        "tip_glossary": ("Opens glossary.txt: 'source term = target term' lines that force official "
+                         "terminology while translating (e.g. 主城 = Home City). Works for any language "
+                         "pair. Does not affect what is already cached."),
+        "mb_glossary_err_title": "Glossary",
+        "mb_glossary_err_msg": "Could not open/create glossary.txt: {exc}",
+        "tip_protected_words": ("Words/phrases Gemini must NEVER translate (e.g. unit names: Sepoy, "
+                                "Ashigaru). Comma-separated. Case-sensitive, whole-word. Note: adding new "
+                                "words re-translates the strings containing them once (their cache key "
+                                "changes)."),
         "btn_estimate": "Estimate cost",
         "btn_open_folder": "Open output folder",
         "btn_translate": "Translate",
@@ -776,6 +814,7 @@ class TranslatorGUI:
         self.retry_empty = tk.BooleanVar(value=False)
         self.verbose = tk.BooleanVar(value=False)
         self.cache_file_path = tk.StringVar()
+        self.protected_words = tk.StringVar()
         self.search_text = tk.StringVar()
 
         self.last_output_path: Optional[Path] = None
@@ -1017,11 +1056,21 @@ class TranslatorGUI:
         self._advanced_btn.grid(row=2, column=0, sticky="w", padx=8, pady=(8, 2))
         self._tip(self._advanced_btn, "tip_advanced")
         self._advanced_frame = ttk.Frame(settings_frame)
-        self._advanced_frame.grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 2))
-        _c = ttk.Checkbutton(self._advanced_frame, text=self.t("chk_retry_empty"), variable=self.retry_empty)
+        self._advanced_frame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 2))
+        chk_row = ttk.Frame(self._advanced_frame)
+        chk_row.pack(side="top", anchor="w")
+        _c = ttk.Checkbutton(chk_row, text=self.t("chk_retry_empty"), variable=self.retry_empty)
         _c.pack(side="left", padx=(0, 16)); self._tip(_c, "tip_retry_empty")
-        _c = ttk.Checkbutton(self._advanced_frame, text=self.t("chk_verbose"), variable=self.verbose)
+        _c = ttk.Checkbutton(chk_row, text=self.t("chk_verbose"), variable=self.verbose)
         _c.pack(side="left"); self._tip(_c, "tip_verbose")
+        words_row = ttk.Frame(self._advanced_frame)
+        words_row.pack(side="top", fill="x", pady=(6, 0))
+        _lbl = ttk.Label(words_row, text=self.t("lbl_protected_words"))
+        _lbl.pack(side="left", padx=(0, 6)); self._tip(_lbl, "tip_protected_words")
+        _e = ttk.Entry(words_row, textvariable=self.protected_words)
+        _e.pack(side="left", fill="x", expand=True); self._tip(_e, "tip_protected_words")
+        _b = ttk.Button(words_row, text=self.t("btn_glossary"), command=self._open_glossary)
+        _b.pack(side="left", padx=(6, 0)); self._tip(_b, "tip_glossary")
         self._advanced_frame.grid_remove()
         self._refresh_advanced_btn()
 
@@ -1288,9 +1337,11 @@ class TranslatorGUI:
             if cache_path and Path(cache_path).exists():
                 try:
                     cache = json.loads(Path(cache_path).read_text(encoding="utf-8"))
+                    custom_regex = self._custom_protected_regex()
                     for i, entry in enumerate(report.entries):
                         if not values[i]:
-                            cached = cache.get(tg.protected_cache_key(entry.new_source))
+                            cached = cache.get(tg.protected_cache_key(
+                                entry.new_source, protected_regex=custom_regex))
                             if cached and cached.strip():
                                 values[i] = cached
                                 cache_filled += 1
@@ -1531,6 +1582,8 @@ class TranslatorGUI:
                 target_lang=self.target_lang.get(),
                 cache_path=cache_file,
                 existing_translations=list(self.cmp_values),
+                protected_regex=self._custom_protected_regex(),
+                user_glossary=self._load_user_glossary(),
                 cache_only=not use_api,
                 batch_progress_callback=progress_cb,
                 cancel_event=self.cancel_event,
@@ -1581,9 +1634,11 @@ class TranslatorGUI:
             if path.exists():
                 cache = json.loads(path.read_text(encoding="utf-8"))
             written = 0
+            custom_regex = self._custom_protected_regex()
             for entry, value in zip(self.cmp_entries, self.cmp_values):
                 if value and value.strip() and value != entry.new_source:
-                    cache[tg.protected_cache_key(entry.new_source)] = value
+                    cache[tg.protected_cache_key(
+                        entry.new_source, protected_regex=custom_regex)] = value
                     written += 1
             tg._write_cache_atomic(path, cache)
             messagebox.showinfo(self.t("mb_cache_saved_title"),
@@ -1811,6 +1866,7 @@ class TranslatorGUI:
                 return caches[key]
 
             skip_rules = self._build_default_skip_rules()
+            custom_regex = self._custom_protected_regex()
             total_strings = 0
             pending_strings = 0
             pending_tokens = 0.0
@@ -1822,7 +1878,8 @@ class TranslatorGUI:
                     if target.skip:
                         continue
                     total_strings += 1
-                    cached = cache.get(tg.protected_cache_key(target.text))
+                    cached = cache.get(tg.protected_cache_key(
+                        target.text, protected_regex=custom_regex))
                     if cached and cached.strip():
                         continue  # already translated → no API
                     pending_strings += 1
@@ -1849,6 +1906,37 @@ class TranslatorGUI:
                     "est_result", strings=total_strings, tokens=tok, cost=cost))
         except Exception as exc:
             self.estimate_label.configure(text=self.t("est_error", exc=exc))
+
+    def _glossary_path(self) -> Path:
+        return Path(__file__).with_name("glossary.txt")
+
+    def _load_user_glossary(self):
+        """The user glossary dict for translate_strings, or None when empty/absent."""
+        return tg.load_user_glossary(self._glossary_path()) or None
+
+    def _open_glossary(self) -> None:
+        """Open glossary.txt in the default editor, creating a commented template first."""
+        path = self._glossary_path()
+        try:
+            if not path.exists():
+                path.write_text(GLOSSARY_TEMPLATE, encoding="utf-8")
+            os.startfile(path)
+        except Exception as exc:
+            messagebox.showerror(self.t("mb_glossary_err_title"),
+                                 self.t("mb_glossary_err_msg", exc=exc))
+
+    def _custom_protected_regex(self) -> list:
+        """User-defined protected words as whole-word, case-sensitive patterns.
+
+        Passed to every translate_strings / protected_cache_key call in the GUI so
+        the cache keys stay identical no matter which tab computes them.
+        """
+        patterns = []
+        for term in self.protected_words.get().split(","):
+            term = term.strip()
+            if term:
+                patterns.append(re.compile(rf"(?<!\w){re.escape(term)}(?!\w)"))
+        return patterns
 
     def _build_default_skip_rules(self):
         import argparse
@@ -1925,9 +2013,11 @@ class TranslatorGUI:
                 except Exception:
                     cache = {}
             written = 0
+            custom_regex = self._custom_protected_regex()
             for entry in report.entries:
                 if entry.seed:
-                    cache[tg.protected_cache_key(entry.new_source)] = entry.seed
+                    cache[tg.protected_cache_key(
+                        entry.new_source, protected_regex=custom_regex)] = entry.seed
                     written += 1
             tg._write_cache_atomic(out, cache)
             print(self.t("log_build_summary", n=written), flush=True)
@@ -2083,6 +2173,9 @@ class TranslatorGUI:
             )
 
             skip_rules = self._build_default_skip_rules()
+            user_glossary = self._load_user_glossary()
+            if user_glossary:
+                print(f"📖 Glossary: {len(user_glossary)} term(s) from glossary.txt", flush=True)
 
             for file_idx, input_path in enumerate(self.input_paths, start=1):
                 if self.cancel_event and self.cancel_event.is_set():
@@ -2129,7 +2222,9 @@ class TranslatorGUI:
                     cache_path=cache_file,
                     existing_translations=existing,
                     protected_terms=list(tg.DEFAULT_PROTECTED_TERMS),
+                    protected_regex=self._custom_protected_regex(),
                     acronym_exclude=list(tg.DEFAULT_ACRONYM_EXCLUDE),
+                    user_glossary=user_glossary,
                     cache_only=self.cache_only.get(),
                     retry_empty_cache=self.retry_empty.get(),
                     batch_progress_callback=progress_cb,
@@ -2242,6 +2337,7 @@ class TranslatorGUI:
         self.target_lang.set(data.get("target_lang", tg.DEFAULT_TARGET_LANG))
         self.output_path.set(data.get("output_path", ""))
         self.verbose.set(bool(data.get("verbose", False)))
+        self.protected_words.set(data.get("protected_words", ""))
         self.cache_only.set(bool(data.get("cache_only", False)))
         self.retry_empty.set(bool(data.get("retry_empty", False)))
         # Do NOT persist the API key by default — it is a secret.
@@ -2258,6 +2354,7 @@ class TranslatorGUI:
             "target_lang": self.target_lang.get(),
             "output_path": self.output_path.get(),
             "verbose": self.verbose.get(),
+            "protected_words": self.protected_words.get(),
             "cache_only": self.cache_only.get(),
             "retry_empty": self.retry_empty.get(),
             "cmp_old_source_path": self.cmp_old_source_path.get(),

@@ -1,0 +1,12 @@
+# Glosario / Glossary — one entry per line:  source term = target term
+# Se aplica al traducir: fuerza la terminología oficial en el idioma destino.
+# Applied while translating: forces official terminology in the target language.
+#
+# Ejemplos (chino → inglés) / Examples (Chinese → English):
+# 主城 = Home City
+# 设置 = Settings
+#
+# Ejemplo (inglés → español) / Example (English → Spanish):
+# Home City = Metrópoli
+#
+# Las líneas que empiezan con # se ignoran. / Lines starting with # are ignored.

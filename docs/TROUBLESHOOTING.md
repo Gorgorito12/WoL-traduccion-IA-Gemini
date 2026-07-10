@@ -102,6 +102,15 @@ Custom text patterns or manual edits may have changed protected placeholders.
 python translate_gemini.py "input.xml" "output.xml" --api-key "YOUR_API_KEY_HERE" --protect "MyExactToken" --protect-regex "HP_[0-9]+"
 ```
 
+- In the GUI, use **Avanzado ▾ → Palabras protegidas** (comma-separated, case-sensitive,
+  whole-word) to keep game terms like unit names untranslated.
+- Note: adding new protected words changes the cache key of every string containing them, so
+  those strings re-translate once on the next run (by design — their old translations may have
+  translated the term).
+- If a **glossary** term (`glossary.txt`) is not being enforced in some strings, they were likely
+  translated (and cached) before you added the entry — the glossary does not change cache keys.
+  Remove those entries from the cache file (or re-translate those strings) to refresh them.
+
 ---
 
 ## 6) XML output encoding/BOM issues in game

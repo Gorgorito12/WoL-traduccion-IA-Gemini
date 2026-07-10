@@ -52,6 +52,47 @@ python translate_gemini.py "stringtabley_zh.xml" "stringtabley_en.xml" --api-key
 
 ---
 
+## Protecting game terms (keep original English words untranslated)
+
+To stop Gemini from translating specific game terms (e.g. Asian Dynasties unit names), protect
+them — they are masked as `__PROTECT_x__` before the API call and restored verbatim afterwards:
+
+```bat
+python translate_gemini.py "input.xml" "output.xml" --api-key "KEY" --protect-regex "\bSepoy\b" --protect-regex "\bAshigaru\b"
+```
+
+(`--protect "Sepoy"` also works but matches substrings case-sensitively; `--protect-regex` with
+`\b` is safer for single words.)
+
+In the GUI: **Avanzado ▾ → Palabras protegidas** — comma-separated (e.g. `Sepoy, Ashigaru,
+Flying Crow`), case-sensitive, whole-word, remembered between sessions, and applied consistently
+to translation, cache keys and the cost estimate. Adding new words re-translates the strings that
+contain them once (their cache key changes).
+
+---
+
+## Forcing official game terminology (user glossary)
+
+When the model should always use an exact term in the **target** language — e.g. translating
+Chinese→English and wanting the official Age of Empires terms ("Home City", "Settings"), not
+invented variants — use the user glossary. Create `glossary.txt` next to the scripts (the GUI's
+**Avanzado ▾ → Glosario…** button creates it with a template):
+
+```text
+# source term = target term
+主城 = Home City
+设置 = Settings
+```
+
+Works for any language pair (entries only fire when the source term appears in a string). Two
+layers: the prompt instructs Gemini per batch, and a deterministic pass fixes source terms left
+untranslated in the output. CLI: picked up automatically, or pass `--glossary-file "my.txt"`.
+
+Note: the glossary does NOT change cache keys — strings translated before you added a term keep
+their old wording until re-translated.
+
+---
+
 ## Recommended: use a global cache file (version-friendly)
 
 If you translate multiple mod versions, always reuse the same cache:

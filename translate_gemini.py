@@ -280,6 +280,83 @@ def apply_postprocess_overrides(original_text: str, translated_text: str, target
     return out
 
 
+def load_user_glossary(path: Optional[Path]) -> Dict[str, str]:
+    """Parse a user glossary file: one 'source term = target term' per line.
+
+    Lines starting with '#' and blank lines are ignored; malformed lines are
+    skipped with a warning. Returns {} when the file is missing/unreadable.
+    Unlike SPANISH_GLOSSARY this is pair-agnostic: entries simply never fire
+    when their source term does not appear in the strings being translated.
+    """
+    glossary: Dict[str, str] = {}
+    if not path:
+        return glossary
+    try:
+        content = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return glossary
+    except Exception as exc:
+        logging.warning("Could not read glossary file %s: %s", path, exc)
+        return glossary
+    for line_no, line in enumerate(content.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        source_term, sep, target_term = line.partition("=")
+        source_term, target_term = source_term.strip(), target_term.strip()
+        if not sep or not source_term or not target_term:
+            logging.warning("Glossary line %s ignored (expected 'source = target'): %s", line_no, line)
+            continue
+        glossary[source_term] = target_term
+    return glossary
+
+
+def user_glossary_rules(batch: Sequence[str], glossary: Optional[Dict[str, str]]) -> str:
+    """Prompt rules for the user-glossary terms that actually occur in `batch`.
+
+    Filtering per batch keeps the prompt small: strings without glossary terms
+    pay zero extra tokens.
+    """
+    if not glossary:
+        return ""
+    lines = [
+        f"- Translate '{source_term}' as '{target_term}' (official game term); use it consistently."
+        for source_term, target_term in glossary.items()
+        if any(source_term in text for text in batch)
+    ]
+    if not lines:
+        return ""
+    return "MANDATORY TERMINOLOGY (user glossary)\n" + "\n".join(lines)
+
+
+def apply_user_glossary_fixes(
+    original_text: str,
+    translated_text: str,
+    glossary: Optional[Dict[str, str]],
+) -> str:
+    """Deterministic layer of the user glossary: fix source terms left untranslated.
+
+    Only handles the model leaving the SOURCE term verbatim in the output (whole-word
+    for Latin terms, plain replace for CJK). Wrong-but-translated synonyms can't be
+    fixed deterministically — that is what the prompt rules are for.
+    """
+    if not glossary:
+        return translated_text
+    out = translated_text
+    for source_term, target_term in glossary.items():
+        if source_term == target_term or source_term not in original_text or source_term not in out:
+            continue
+        if re.search(r"[A-Za-z]", source_term):
+            out = re.sub(
+                rf"(?<!\w){re.escape(source_term)}(?!\w)",
+                lambda _m: target_term,
+                out,
+            )
+        else:
+            out = out.replace(source_term, target_term)
+    return out
+
+
 @dataclass(frozen=True)
 
 
@@ -955,12 +1032,13 @@ def translate_batch_with_retry(
     prompt_config: PromptConfig,
     strict_no_english_residue: bool,
     max_quality_retries: int = DEFAULT_MAX_QUALITY_RETRIES,
+    base_extra_rules: str = "",
 ) -> List[str]:
     attempt = 0
     quality_attempt = 0
     last_partial: Optional[List[str]] = None
     quality_prompt_compact = compact_prompt
-    extra_rules = ""
+    extra_rules = base_extra_rules
     while True:
         try:
             translations = translate_batch_gemini(
@@ -983,7 +1061,7 @@ def translate_batch_with_retry(
                     if quality_attempt < max_quality_retries:
                         quality_attempt += 1
                         quality_prompt_compact = False
-                        extra_rules = STRICT_QUALITY_RULES
+                        extra_rules = (base_extra_rules + "\n\n" + STRICT_QUALITY_RULES).strip()
                         logging.warning(
                             "Quality retry %s/%s: English residue detected. src=%s out=%s",
                             quality_attempt,
@@ -1079,6 +1157,7 @@ def translate_strings(
     api_timeout_seconds: int = DEFAULT_API_TIMEOUT,
     batch_progress_callback: Optional[Callable[[int, int], None]] = None,
     cancel_event: Optional[threading.Event] = None,
+    user_glossary: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[str], TranslationStats]:
     
     inners_list = list(inners)
@@ -1150,6 +1229,7 @@ def translate_strings(
                     cached_value, token_maps[idx], phrase_maps[idx], original_texts[idx]
                 )
                 restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
+                restored = apply_user_glossary_fixes(original_texts[idx], restored, user_glossary)
                 restored = enforce_acronym_integrity(original_texts[idx], restored, exclude=acronym_exclude)
                 restored = apply_source_casing(original_texts[idx], restored)
                 translations[idx] = restored
@@ -1225,6 +1305,7 @@ def translate_strings(
                 compact_prompt,
                 prompt_config,
                 strict_no_english_residue,
+                base_extra_rules=user_glossary_rules(batch, user_glossary),
             ): idx
             for idx, batch in batch_map.items()
         }
@@ -1295,6 +1376,7 @@ def translate_strings(
                             original_texts[idx],
                         )
                         restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
+                        restored = apply_user_glossary_fixes(original_texts[idx], restored, user_glossary)
                         restored = enforce_acronym_integrity(original_texts[idx], restored, exclude=acronym_exclude)
                         restored = apply_source_casing(original_texts[idx], restored)
                         translations[idx] = restored
@@ -1968,6 +2050,49 @@ def self_test_glossary() -> None:
     print("✅ Glossary self-test passed.")
 
 
+def self_test_user_glossary() -> None:
+    def _assert(condition: bool, message: str) -> None:
+        if not condition:
+            raise SystemExit(f"User glossary self-test failed: {message}")
+
+    import tempfile
+    content = (
+        "# official terms\n"
+        "\n"
+        "主城 = Home City\n"
+        "Sepoy=Sepoy\n"
+        "malformed line without an equals sign\n"
+        "  设置  =  Settings  \n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "glossary.txt"
+        path.write_text(content, encoding="utf-8")
+        glossary = load_user_glossary(path)
+    _assert(glossary == {"主城": "Home City", "Sepoy": "Sepoy", "设置": "Settings"},
+            f"unexpected parse result: {glossary}")
+    _assert(load_user_glossary(Path("no_such_glossary_file.txt")) == {},
+            "missing file should parse to an empty glossary")
+
+    rules = user_glossary_rules(["你的主城遭到攻击。"], glossary)
+    _assert("主城" in rules and "Home City" in rules, "expected a rule for the matching term")
+    _assert("设置" not in rules, "terms absent from the batch must not be hinted")
+    _assert(user_glossary_rules(["nothing relevant"], glossary) == "",
+            "no rules expected for a non-matching batch")
+    _assert(user_glossary_rules(["anything"], None) == "", "None glossary must yield no rules")
+
+    fixed = apply_user_glossary_fixes("你的主城遭到攻击。", "Your 主城 is under attack.", glossary)
+    _assert(fixed == "Your Home City is under attack.", f"CJK leftover fix failed: {fixed}")
+    latin = {"Metropoli": "Home City"}
+    fixed = apply_user_glossary_fixes("La Metropoli está en peligro", "The Metropoli is in danger", latin)
+    _assert(fixed == "The Home City is in danger", f"Latin leftover fix failed: {fixed}")
+    fixed = apply_user_glossary_fixes("La Metropolitana", "The Metropolitana", latin)
+    _assert(fixed == "The Metropolitana", "whole-word: longer words must not be rewritten")
+    fixed = apply_user_glossary_fixes("Train a Sepoy", "Train a Sepoy", glossary)
+    _assert(fixed == "Train a Sepoy", "source == target entries must be a no-op")
+
+    print("✅ User glossary self-test passed.")
+
+
 def self_test_merge() -> None:
     def _assert(condition: bool, message: str) -> None:
         if not condition:
@@ -2259,6 +2384,13 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="ALL-CAPS tokens that should be allowed to translate (repeatable). Example: --acronym-exclude ONE",
     )
+    protect_group.add_argument(
+        "--glossary-file",
+        type=Path,
+        default=None,
+        help=("User glossary file: one 'source term = target term' per line, '#' comments. "
+              "Defaults to glossary.txt next to this script when it exists."),
+    )
 
     # --- Cache group ---
     cache_group = parser.add_argument_group("Cache")
@@ -2340,6 +2472,7 @@ def main() -> None:
         self_test_quality_gate()
         self_test_source_casing()
         self_test_glossary()
+        self_test_user_glossary()
         return
     if args.self_test_merge:
         self_test_merge()
@@ -2353,6 +2486,14 @@ def main() -> None:
     acronym_exclude = list(DEFAULT_ACRONYM_EXCLUDE)
     if args.acronym_exclude:
         acronym_exclude.extend([t.strip() for t in args.acronym_exclude if t and t.strip()])
+
+    glossary_path = args.glossary_file
+    if glossary_path is None:
+        default_glossary = Path(__file__).with_name("glossary.txt")
+        glossary_path = default_glossary if default_glossary.exists() else None
+    user_glossary = load_user_glossary(glossary_path)
+    if user_glossary:
+        print(f"📖 User glossary: {len(user_glossary)} term(s) from {glossary_path.name}")
 
     if not args.input.exists():
         raise SystemExit(f"File does not exist: {args.input}")
@@ -2507,6 +2648,7 @@ def main() -> None:
             cache_only=args.cache_only,
             retry_empty_cache=args.retry_empty_cache,
             api_timeout_seconds=args.api_timeout,
+            user_glossary=user_glossary or None,
         )
         final_texts = assemble_full_texts(
             targets, translated_subset, enforce_skip_integrity=True
