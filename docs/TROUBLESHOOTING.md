@@ -62,7 +62,7 @@ Use strict residue detection and retry empty cache entries:
 python translate_gemini.py "stringtabley.xml" "stringtabley_es_latam.xml" --api-key "YOUR_API_KEY_HERE" --strict-no-english-residue --retry-empty-cache
 ```
 
-You can also run the built-in quality test:
+You can also run the built-in quality tests (quality gate, casing, glossaries):
 
 ```bat
 python translate_gemini.py --self-test-quality-gate

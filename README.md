@@ -1,6 +1,7 @@
 # Gemini XML Translator for Age of Empires III: Wars of Liberty
 
-A **Python** script to translate **XML localization files** for the **Age of Empires III: Wars of Liberty** mod using **Google Gemini (gemini-2.5-flash)**.
+A **Python** tool (GUI + CLI) to translate **XML localization files** for the **Age of Empires
+III: Wars of Liberty** mod using **Google Gemini (gemini-2.5-flash)**.
 
 It is designed for **historical video game localization (1789–1916)**, with strict rules to preserve **tokens/placeholders**, and optimized with **multithreading and caching** to minimize API usage when updating mod versions.
 
@@ -8,12 +9,21 @@ It is designed for **historical video game localization (1789–1916)**, with st
 
 ## Features
 
+* **Two-tab GUI** (ES/EN interface): a batch **Translator** (drag & drop queue, cost estimate,
+  Stop button) and a **Comparar / WinMerge** tab for version updates.
+* **Any language pair** — e.g. English→Spanish, Chinese→English, Japanese→Spanish
+  (`--source`/`--target`, or the GUI's "Translate from / to" dropdowns). The GUI warns if the
+  file doesn't look like the selected source language.
 * Video game localization–focused output (clear, natural, historically appropriate).
 * Strict protection of **placeholders and tokens** (`__TOK#__`, `%s`, `%1$s`, `\n`, etc.).
-* **Multithreaded** translation for speed.
-* **Automatic caching** to avoid retranslating unchanged strings.
-* **Cache-only mode** (0 API calls).
-* **Global cache support** for versioned workflows.
+* **Protected words**: terms Gemini must never translate (unit names like *Sepoy*) — GUI field
+  or `--protect`/`--protect-regex`.
+* **User glossary** (`glossary.txt`): force official game terminology in the target language
+  (e.g. `主城 = Home City`, `Home City = Metrópoli`).
+* **Multithreaded** translation for speed, with **realistic cost estimating** (input+output
+  pricing; the model's costly "thinking" mode is disabled).
+* **Automatic caching** to avoid retranslating unchanged strings — auto-partitioned per
+  language pair; **cache-only mode** (0 API calls) and **global cache support** for versions.
 * Compact (default) and Detailed prompt modes.
 * **Version-update merge by `_locID`**: carry an old translation onto a new English version,
   reusing unchanged strings and flagging what changed/added (CLI `--match-by-locid`, or the
@@ -23,21 +33,28 @@ It is designed for **historical video game localization (1789–1916)**, with st
 
 ## Requirements
 
-* **Python 3.10+**
-* **CMD or PowerShell** (Windows)
+* **Windows** (the GUI/launcher; the CLI itself is portable Python 3.10+)
 * **Google Gemini API Key** (only required for uncached strings)
+
+Python is **not** a prerequisite for the launcher — see below.
 
 ---
 
-## Installation
+## Installation & Quick Start (GUI — recommended)
+
+Double-click **`Translator.bat`**. It is self-sufficient: if Python is missing it installs
+Python 3.13 automatically (winget, no admin), installs the dependencies (`google-genai`, `tqdm`,
+optional `tkinterdnd2` for drag & drop), and opens the GUI. Any failure shows a message instead
+of closing silently.
+
+Then: drop your XML files in the queue, pick the language pair, paste your API key, and press
+**Traducir** (or **Solo caché** for a zero-API pass).
+
+## Quick Start (CLI)
 
 ```bat
 pip install google-genai tqdm
 ```
-
----
-
-## Quick Start
 
 ### First translation (creates cache)
 
@@ -49,6 +66,12 @@ python translate_gemini.py "stringtabley.xml" "stringtabley_es_latam.xml" --api-
 
 ```bat
 python translate_gemini.py "stringtabley.xml" "stringtabley_es_latam.xml"
+```
+
+### Other language pairs
+
+```bat
+python translate_gemini.py "stringtabley_zh.xml" "stringtabley_en.xml" --api-key "KEY" --source "Chinese (Simplified)" --target "English" --cache-file "wol_zh-en.cache.json"
 ```
 
 ---
@@ -77,12 +100,15 @@ python translate_gemini.py "stringtabley_new.xml" "stringtabley_es_latam_new.xml
 
 ## Common Options
 
-| Option              | Description                                       |
-| ------------------- | ------------------------------------------------- |
-| `--api-key`         | Gemini API key (only needed for uncached strings) |
-| `--cache-only`      | Use cache only (no API calls)                     |
-| `--cache-file PATH` | Use a shared/global cache file                    |
-| `--detailed-prompt` | Use a more explicit prompt (higher token usage)   |
+| Option                | Description                                                    |
+| --------------------- | -------------------------------------------------------------- |
+| `--api-key`           | Gemini API key (only needed for uncached strings)              |
+| `--source` `--target` | Language pair (defaults: English → Latin American Spanish)     |
+| `--cache-only`        | Use cache only (no API calls)                                  |
+| `--cache-file PATH`   | Use a shared/global cache file (one per language pair)         |
+| `--glossary-file`     | User glossary forcing official terms (`glossary.txt` if present) |
+| `--protect` / `--protect-regex` | Words/patterns Gemini must never translate           |
+| `--detailed-prompt`   | Use a more explicit prompt (higher token usage)                |
 
 ---
 

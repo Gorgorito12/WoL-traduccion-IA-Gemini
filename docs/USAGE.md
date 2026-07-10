@@ -180,8 +180,14 @@ python translate_gemini.py --self-test-merge
 ### API & performance
 
 * `--api-key "KEY"`: required only when there are uncached strings to translate.
+* `--api-timeout N`: per-request API timeout in seconds (default: 120).
 * `--max-workers N`: number of concurrent workers (default: 8).
 * `--max-budget-bytes N`: batch size budget for requests (default: 4500).
+
+### Languages
+
+* `--source "NAME"` / `--target "NAME"`: the language pair (defaults: English → Latin American
+  Spanish). See "Other language pairs" above.
 
 ### Prompt modes
 
@@ -212,11 +218,16 @@ python translate_gemini.py --self-test-merge
 * `--protect "PHRASE"`: protect exact phrases from translation (repeatable).
 * `--protect-regex "REGEX"`: protect regex matches from translation (repeatable).
 * `--acronym-exclude "TOKEN"`: allow specific ALL-CAPS tokens to translate (repeatable).
+* `--glossary-file "PATH"`: user glossary forcing official terminology (defaults to
+  `glossary.txt` next to the script when it exists). See "Forcing official game terminology".
 
 ### Diagnostics & tests
 
 * `--diagnostic`: print encoding/BOM diagnostics after each write.
-* `--self-test-quality-gate`: run quick quality gate + casing tests and exit.
+* `--verbose`: debug-level logging.
+* `--self-test-quality-gate`: run the quality-gate, source-casing, glossary and user-glossary
+  self-tests and exit (no files needed).
+* `--self-test-merge`: run the `_locID`-merge and cache-key-parity self-tests and exit.
 
 ---
 

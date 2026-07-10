@@ -22,6 +22,7 @@ python translate_gemini.py "INPUT.xml" "OUTPUT.xml" --cache-file "wol_es.cache.j
 
 REM Run the self-tests (the only tests in the repo) and exit
 python translate_gemini.py --self-test-quality-gate
+python translate_gemini.py --self-test-merge
 
 REM Launch the GUI. Translator.bat is self-sufficient: it resolves a real Python
 REM (rejecting the Microsoft Store alias stub), auto-installs Python 3.13 via winget
@@ -30,8 +31,10 @@ REM sibling pythonw.exe. Every failure path prints a message and pauses.
 python translate_gui.py
 ```
 
-There is no build, lint, or external test framework. "Tests" = the two `self_test_*` functions in
-`translate_gemini.py`, run via `--self-test-quality-gate`. The API key falls back to the
+There is no build, lint, or external test framework. "Tests" = the six `self_test_*` functions in
+`translate_gemini.py`: `--self-test-quality-gate` runs four (quality gate, source casing, glossary,
+user glossary) and `--self-test-merge` runs two (merge by `_locID`, cache-key parity). Both flags
+work without the `input output` positionals. The API key falls back to the
 `GEMINI_API_KEY` / `GOOGLE_API_KEY` env vars.
 
 ## Architecture

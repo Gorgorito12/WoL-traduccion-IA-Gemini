@@ -17,19 +17,26 @@ If a string changed (even one character), it is treated as a **new key** and tra
 
 ---
 
-## 2) The #1 rule: use a single “global cache” per language
+## 2) The #1 rule: use a single “global cache” per language pair
 
 If you let the script use its default cache naming (`<output>.cache.json`), changing output names per version creates new caches and wastes API.
 
 ### Recommended setup
 
-Keep one cache per target language, for example:
+Keep one cache per **language pair** — the cache key is the source text only (no language
+dimension), so a cache reused across pairs would silently return wrong-language translations.
+For example:
 
-- `wol_es.cache.json`
-- `wol_pt.cache.json`
-- `wol_de.cache.json`
+- `wol_es.cache.json` (English→Spanish)
+- `wol_pt.cache.json` (English→Portuguese)
+- `wol_zh-en.cache.json` (Chinese→English)
 
 Use it every time via `--cache-file`.
+
+> GUI note: when the Output/Cache fields are left empty, the GUI already partitions the automatic
+> names per pair (`X_translated_zh-en.xml` + `.cache.json`; the default English→Latin American
+> Spanish pair keeps the legacy `X_translated.xml` names). The explicit `--cache-file` global
+> cache remains the recommended pattern for version updates.
 
 ---
 
@@ -87,6 +94,10 @@ Important notes:
 
 - You must provide **both** source and translated output so the script can pair strings.
 - If the translated file is from a different version (different counts/order), rebuild may not be possible or may be partial.
+
+> **Preferred method:** the GUI's Compare tab has a **“Generar caché (sin API)…”** button that
+> rebuilds the cache by pairing the two XMLs on the stable `_locID` attribute instead of by
+> position — it tolerates reordering and count mismatches, which the CLI method above does not.
 
 ---
 
