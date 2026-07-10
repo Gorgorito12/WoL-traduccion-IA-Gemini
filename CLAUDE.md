@@ -23,7 +23,10 @@ python translate_gemini.py "INPUT.xml" "OUTPUT.xml" --cache-file "wol_es.cache.j
 REM Run the self-tests (the only tests in the repo) and exit
 python translate_gemini.py --self-test-quality-gate
 
-REM Launch the GUI (Translator.bat does this and silently installs tkinterdnd2)
+REM Launch the GUI. Translator.bat is self-sufficient: it resolves a real Python
+REM (rejecting the Microsoft Store alias stub), auto-installs Python 3.13 via winget
+REM if missing, auto-installs google-genai/tqdm/tkinterdnd2, and launches with the
+REM sibling pythonw.exe. Every failure path prints a message and pauses.
 python translate_gui.py
 ```
 
@@ -127,7 +130,10 @@ the keys the engine reads. `self_test_cache_key_parity` guards this.
 
 ### GUI: two tabs
 
-`translate_gui.py` wraps the engine in a `ttk.Notebook` with two tabs. **Tab 1 ("Traductor")** is
+`translate_gui.py` wraps the engine in a `ttk.Notebook` with two tabs. Its `main()` is a thin
+try/except around `_run_gui()` (the real startup) that shows any startup exception in a
+`messagebox` — under `pythonw.exe` there is no console, so without this a construction-time crash
+would be invisible. **Tab 1 ("Traductor")** is
 the original batch translator, unchanged — `_build_ui(parent)` builds it. **Tab 2 ("Comparar /
 WinMerge", `_build_compare_ui`)** is the version-update view: pick new-English / old-English /
 old-translation (+ optional cache), `merge_by_locid`, show a `ttk.Treeview` (columns `_locID | New

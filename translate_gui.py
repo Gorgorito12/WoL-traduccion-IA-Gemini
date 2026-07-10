@@ -2078,6 +2078,26 @@ class TranslatorGUI:
 
 
 def main() -> None:
+    # Any startup crash under pythonw.exe would otherwise be invisible (no console):
+    # surface it in a messagebox instead.
+    try:
+        _run_gui()
+    except Exception:
+        import traceback
+        err = traceback.format_exc()
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror(
+                "Startup error / Error al iniciar",
+                f"The GUI failed to start. / La interfaz no pudo iniciarse.\n\n{err}",
+            )
+        except Exception:
+            print(err, file=sys.stderr)
+        sys.exit(1)
+
+
+def _run_gui() -> None:
     # Step 1: tell Windows we render at native DPI (must happen BEFORE creating Tk root).
     _enable_windows_dpi_awareness()
 

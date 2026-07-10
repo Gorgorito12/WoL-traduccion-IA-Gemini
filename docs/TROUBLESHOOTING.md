@@ -136,6 +136,36 @@ Review the summary counters to see how many strings were reused vs. left pending
 
 ---
 
+## 8) `Translator.bat` opens a console window and closes / the GUI never appears
+
+### Cause
+
+Usually Python is not really installed: on Windows 10/11, `python.exe` may resolve to the
+Microsoft Store *alias stub* (`...\WindowsApps\python.exe`), which does nothing. Older versions of
+the launcher failed silently in that case.
+
+### Fix
+
+`Translator.bat` is now self-sufficient: it detects the Store stub, installs Python 3.13
+automatically via `winget` (per-user, no admin), installs the pip dependencies
+(`google-genai`, `tqdm`, and optional `tkinterdnd2`), and only then launches the GUI. Any failure
+now shows a message and pauses instead of closing silently — just re-run the `.bat` and read the
+console output.
+
+If `winget` is not available on your system, install Python manually from
+<https://www.python.org/downloads/> (check **"Add python.exe to PATH"**) and re-run the `.bat`.
+
+To see a full traceback when the GUI fails after launch, run it from a console with `python`
+(not `pythonw`):
+
+```bat
+python translate_gui.py
+```
+
+Startup crashes are also shown in an error dialog even under `pythonw`.
+
+---
+
 ## Still blocked?
 
 When reporting an issue, include:
