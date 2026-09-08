@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import io
 import logging
 import os
@@ -10,6 +11,7 @@ import re
 import time
 import json
 import random
+import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +40,11 @@ BACKOFF_MAX_SECONDS = 30.0
 # Use the compact prompt by default to reduce tokens without losing core rules.
 DEFAULT_COMPACT_PROMPT = True
 DEFAULT_MAX_WORKERS = 8
+# 2.5 Flash defaults to temperature 1.0. The prompt asks for identical translations of identical
+# strings, but batches run in parallel and independently, so only low-variance sampling can
+# actually deliver that. This is why "deck" came out as both "mazo" and "baraja" on one screen.
+DEFAULT_TEMPERATURE = 0.2
+DEFAULT_SEED = 12345
 DEFAULT_MAX_QUALITY_RETRIES = 2
 STRICT_NO_ENGLISH_RESIDUE = True
 
@@ -54,7 +61,18 @@ PLACEHOLDER_RE = re.compile(r"(%\d+\$[sdif]|%[sdif]|\\n|\\t|\\r)")
 PROTECT_TOKEN_RE = re.compile(r"__PROTECT_\d+__")
 QUALITY_TOKEN_RE = re.compile(r"__TOK\d+__")
 DEFAULT_SKIP_SYMBOL_CONTAINS = ["folder", "path", "dir", "directory"]
-DEFAULT_PROTECTED_TERMS = ["Age of Empires III: Wars of Liberty", "My Games"]
+# Order matters: protect_phrases consumes this list in order, so the longest title must come
+# first or the shorter one would mask half of it. The bare "Age of Empires III" MUST be here:
+# without it, its "of" trips ENGLISH_RESIDUE_STOPWORDS and the engine discards a perfectly good
+# Spanish translation and ships the English source instead (144 strings did exactly that).
+# "Age of Empire III" (sic) is the game's own typo and appears in real strings.
+DEFAULT_PROTECTED_TERMS = [
+    "Age of Empires III: Wars of Liberty",
+    "Age of Empires III",
+    "Age of Empire III",
+    "Wars of Liberty",
+    "My Games",
+]
 DEFAULT_ACRONYM_TERMS = [
     "XP",
     "HP",
@@ -97,6 +115,12 @@ DEFAULT_ACRONYM_EXCLUDE = [
     "TEAM",
 ]
 
+# Only words that are unambiguously English and never appear in a correct Spanish string.
+# Deliberately NOT here (each caused false positives that shipped English to players):
+#   "original"/"version" - both are real Spanish words;
+#   "new"/"world"/"trade"/"center" - too common inside untranslatable proper nouns
+#     ("New World Trade Center", "Fort Ross"). The exact phrase is still caught by
+#     ENGLISH_RESIDUE_PHRASES below, which is precise where a bare word is not.
 ENGLISH_RESIDUE_STOPWORDS = {
     "the",
     "of",
@@ -106,17 +130,22 @@ ENGLISH_RESIDUE_STOPWORDS = {
     "address",
     "host",
     "connect",
-    "original",
-    "version",
-    "new",
-    "world",
-    "trade",
-    "center",
 }
 ENGLISH_RESIDUE_PHRASES = {
     "of the",
     "new world trade center",
 }
+STRICT_MARKUP_RULES = (
+    "STRICT MARKUP RULE\n"
+    "Every <color=...>...</color> pair MUST still wrap the translated word it wrapped in the "
+    "source. Move the tags together with the word when the word order changes. Never leave a "
+    "pair empty and never drop a pair: the coloured word tells the player what the unit is "
+    "strong against, so losing the colour loses meaning, not just styling.\n"
+    "For 'Nepalese <color=0.07, 0.68, 0.17>skirmisher</color> that is accurate' return "
+    "'<color=0.07, 0.68, 0.17>Hostigador</color> nepali certero', "
+    "NOT 'Hostigador nepali <color=0.07, 0.68, 0.17> </color> certero'."
+)
+
 STRICT_QUALITY_RULES = (
     "STRICT QUALITY RULE\n"
     "Do not leave ANY English articles/prepositions (the/of/to/through/enter/address/host/connect/original/version) "
@@ -126,14 +155,56 @@ STRICT_QUALITY_RULES = (
 
 
 def target_is_spanish(target_lang: str) -> bool:
+    """True for any way a user might name a Spanish target.
+
+    This one predicate gates the ENTIRE Spanish path (glossary, residue gate, LatAm gate), so a
+    name it fails to recognize silently turns all of it off. Locale codes and 'castellano' are
+    included for exactly that reason.
+    """
     tl = (target_lang or "").lower()
-    return ("spanish" in tl) or ("español" in tl) or ("espanol" in tl)
+    # Every marker is unambiguous on its own. A bare "latino"/"es-la" is deliberately NOT here:
+    # it would also fire on a target like "Português latino" and apply Spanish rules to it.
+    return any(marker in tl for marker in
+               ("spanish", "español", "espanol", "castellano", "es-419", "es_419"))
 
 def _strip_quality_tokens(text: str) -> str:
     cleaned = PROTECT_TOKEN_RE.sub(" ", text)
     cleaned = QUALITY_TOKEN_RE.sub(" ", cleaned)
     cleaned = PLACEHOLDER_RE.sub(" ", cleaned)
     return cleaned
+
+
+COLOR_OPEN_RE = re.compile(r"<color=[^>]*>", re.IGNORECASE)
+COLOR_CLOSE_RE = re.compile(r"</color>", re.IGNORECASE)
+# An opening tag followed by nothing but whitespace before its closing tag.
+EMPTY_COLOR_RE = re.compile(r"<color=[^>]*>\s*</color>", re.IGNORECASE)
+
+
+def markup_integrity_ok(src: str, out: str) -> bool:
+    """True when the candidate preserves the source's ``<color>`` markup.
+
+    In this game the coloured word is the counter keyword -- it tells the player what a unit is
+    strong against -- so losing the colour loses information, not just styling. Spanish reorders
+    adjective and noun ("Nepalese skirmisher" -> "Hostigador nepali"), and the model routinely
+    moves the word out of its tag, leaving `<color=...> </color>` empty or dropping the tag pair
+    altogether.
+
+    Language-agnostic on purpose: markup is identical in every target language, unlike
+    has_english_residue which only makes sense for a Spanish target.
+
+    Only DETECTS. A regex cannot repair this -- once the sentence is reordered we cannot know
+    where the word went -- so the caller retries with a stricter prompt instead.
+    """
+    src = src or ""
+    out = out or ""
+    if len(COLOR_OPEN_RE.findall(src)) != len(COLOR_OPEN_RE.findall(out)):
+        return False
+    if len(COLOR_CLOSE_RE.findall(src)) != len(COLOR_CLOSE_RE.findall(out)):
+        return False
+    # An empty pair is only a defect if the source did not already have one.
+    if EMPTY_COLOR_RE.search(out) and not EMPTY_COLOR_RE.search(src):
+        return False
+    return True
 
 
 def has_english_residue(src: str, out: str, target_lang: str) -> bool:
@@ -189,6 +260,10 @@ class GlossaryEntry:
     prompt_hint: str
     # Tuple of (compiled pattern, replacement); replacement is a str or a callable (re.sub style).
     output_fixes: Tuple[Tuple["re.Pattern[str]", object], ...]
+    # When this matches the ENGLISH original the whole entry is skipped. Needed where a term is
+    # only wrong in isolation: "Crates of 500 food and Chests of 500 coin" correctly yields both
+    # "Cajas" and "Cofres", so the crate rule must not rewrite Cofre there.
+    source_block: Optional["re.Pattern[str]"] = None
 
 
 SPANISH_GLOSSARY: List[GlossaryEntry] = [
@@ -243,21 +318,295 @@ SPANISH_GLOSSARY: List[GlossaryEntry] = [
             # Only the trailing 'Era' (the noun, never the verb 'era' here) is rewritten.
             (re.compile(r"((?:avanz|alcanz|sub|lleg)\w*\s+(?:de\s+|a\s+(?:la\s+)?))Era\b", re.IGNORECASE),
              lambda m: m.group(1) + "Edad"),
+            # Generic epoch sense ("By Age" was coming out as "Por Era", visible in game).
+            # Every pattern below REQUIRES a determiner, preposition or a following ordinal
+            # adjective, and the Spanish verb 'era' ("was") never takes one -- so the critical
+            # negative case in self_test_glossary still holds.
+            (re.compile(r"\bPor\s+Era\b"), "Por Edad"),
+            (re.compile(r"\bpor\s+Era\b"), "por Edad"),
+            (re.compile(r"\b(l|est|es|aquell|un|otr|primer|segund|nuev|mism)(a|as)\s+Era(s?)\b",
+                        re.IGNORECASE),
+             lambda m: m.group(1) + m.group(2) + (" Edades" if m.group(3) else " Edad")),
+            (re.compile(r"\bEra\s+(anterior|siguiente|actual|posterior|previa)\b", re.IGNORECASE),
+             lambda m: "Edad " + m.group(1).lower()),
+            # "Avanzar a la Siguiente Era": an adjective sits between the article and the noun.
+            (re.compile(r"\b(Siguiente|Pr[óo]xima|Anterior|Primera|[ÚU]ltima)\s+Era\b", re.IGNORECASE),
+             lambda m: m.group(1) + " Edad"),
+            (re.compile(r"\b(de|en|a|desde|hasta|entre)\s+Eras\b", re.IGNORECASE),
+             lambda m: m.group(1) + " Edades"),
         ),
+    ),
+    GlossaryEntry(
+        name="hitpoints",
+        source_trigger=re.compile(r"\bhit\s?points?\b", re.IGNORECASE),
+        prompt_hint="- Translate 'hitpoints'/'hit points' as 'Puntos de Vida' (never 'Puntos de Golpe').\n",
+        # Safe to rewrite deterministically: the head noun 'Puntos' is untouched, so no article
+        # or adjective agreement can break. One rule per casing keeps the original capitalization.
+        output_fixes=(
+            (re.compile(r"\bPuntos\s+de\s+(?:Golpe|Resistencia|Salud)\b"), "Puntos de Vida"),
+            (re.compile(r"\bpuntos\s+de\s+(?:golpe|resistencia|salud)\b"), "puntos de vida"),
+        ),
+    ),
+    GlossaryEntry(
+        name="settler",
+        source_trigger=re.compile(r"\bsettlers?\b", re.IGNORECASE),
+        # 'Aldeano' belongs to Villager; using it for Settler makes two units share one name.
+        source_block=re.compile(r"\bvillagers?\b", re.IGNORECASE),
+        prompt_hint=("- Translate 'Settler' as 'Colono' and 'Villager' as 'Aldeano'. "
+                     "They are different units; never use 'Aldeano' for 'Settler'.\n"),
+        output_fixes=(
+            (re.compile(r"\bAldeanos\b"), "Colonos"), (re.compile(r"\bAldeano\b"), "Colono"),
+            (re.compile(r"\baldeanos\b"), "colonos"), (re.compile(r"\baldeano\b"), "colono"),
+        ),
+    ),
+    GlossaryEntry(
+        name="shipment",
+        source_trigger=re.compile(r"\bshipments?\b", re.IGNORECASE),
+        prompt_hint="- Translate 'Shipment' as 'Envío'.\n",
+        output_fixes=(
+            (re.compile(r"\bCargamentos\b"), "Envíos"), (re.compile(r"\bCargamento\b"), "Envío"),
+            (re.compile(r"\bcargamentos\b"), "envíos"), (re.compile(r"\bcargamento\b"), "envío"),
+        ),
+    ),
+    GlossaryEntry(
+        name="potato",
+        source_trigger=re.compile(r"\bpotato(?:es)?\b", re.IGNORECASE),
+        prompt_hint="- Use Latin American vocabulary: 'potato' is 'papa', never 'patata'.\n",
+        output_fixes=(
+            (re.compile(r"\bPatatas\b"), "Papas"), (re.compile(r"\bPatata\b"), "Papa"),
+            (re.compile(r"\bpatatas\b"), "papas"), (re.compile(r"\bpatata\b"), "papa"),
+        ),
+    ),
+    # --- Prompt-only entries -------------------------------------------------------------
+    # These three change grammatical gender (Cofre/Puesto are masculine, Caja/Avanzada feminine;
+    # Baraja is feminine, Mazo masculine), so a regex swap would leave a broken article and
+    # adjective behind ("Crear una Mazo nueva", "los Avanzada"). Gemini conjugates correctly, so
+    # the rule is preventive only; strings already wrong are found by --audit-spanish and re-run.
+    GlossaryEntry(
+        name="crate",
+        source_trigger=re.compile(r"\bcrates?\b", re.IGNORECASE),
+        # "Crates of 500 food and Chests of 500 coin" correctly yields both Cajas and Cofres.
+        source_block=re.compile(r"\bchests?\b", re.IGNORECASE),
+        prompt_hint="- Translate 'Crate' as 'Caja' (and 'Chest' as 'Cofre'; they are different).\n",
+        output_fixes=(),
+    ),
+    GlossaryEntry(
+        name="outpost",
+        source_trigger=re.compile(r"\boutposts?\b", re.IGNORECASE),
+        prompt_hint="- Translate 'Outpost' as 'Avanzada' (not 'Puesto de Avanzada').\n",
+        output_fixes=(),
+    ),
+    GlossaryEntry(
+        name="deck",
+        source_trigger=re.compile(r"\bdecks?\b", re.IGNORECASE),
+        # A ship's 'Steel Decks' really is 'Cubiertas de Acero'.
+        source_block=re.compile(r"\bsteel\s+decks?\b", re.IGNORECASE),
+        prompt_hint="- Translate the card-game 'Deck' as 'Mazo' (never 'Baraja'), consistently.\n",
+        output_fixes=(),
+    ),
+    # --- Wars of Liberty unit/building names ------------------------------------------------
+    # Each of these shipped under several different Spanish names, so a player could not tell
+    # that the card, the unit and the upgrade were the same thing. The canon is the variant the
+    # community settled on; only same-gender, same-number swaps get output_fixes.
+    GlossaryEntry(
+        name="skirmisher",
+        source_trigger=re.compile(r"\bskirmishers?\b", re.IGNORECASE),
+        prompt_hint="- Translate the unit class 'Skirmisher' as 'Hostigador'.\n",
+        output_fixes=(
+            # "Escararuzador" (Escara+R+uzador) is a misspelling of "Escaramuzador"
+            # (Escara+M+uzador) that shipped in 9 strings; [mr] catches both.
+            (re.compile(r"\bEscara[mr]uzadores\b"), "Hostigadores"),
+            (re.compile(r"\bEscara[mr]uzador\b"), "Hostigador"),
+            (re.compile(r"\bescara[mr]uzadores\b"), "hostigadores"),
+            (re.compile(r"\bescara[mr]uzador\b"), "hostigador"),
+        ),
+    ),
+    GlossaryEntry(
+        name="hajduk",
+        source_trigger=re.compile(r"\bhajduks?\b", re.IGNORECASE),
+        prompt_hint="- Keep the unit name 'Hajduk' unchanged (never 'Hayduk').\n",
+        output_fixes=((re.compile(r"\bHayduk"), "Hajduk"), (re.compile(r"\bhayduk"), "hajduk")),
+    ),
+    GlossaryEntry(
+        name="boneguard",
+        source_trigger=re.compile(r"\bboneguards?\b", re.IGNORECASE),
+        prompt_hint="- Translate 'Boneguard' (the Circle's elite corps) as 'Guardia Ósea'.\n",
+        # Every variant is feminine, like the canon, so number/gender cannot break.
+        output_fixes=(
+            (re.compile(r"\bGuardia\s+de\s+Hueso\b", re.IGNORECASE), "Guardia Ósea"),
+            (re.compile(r"\bGuardahuesos?\b", re.IGNORECASE), "Guardia Ósea"),
+            (re.compile(r"\bGuarda[óo]sea\b", re.IGNORECASE), "Guardia Ósea"),
+        ),
+    ),
+    GlossaryEntry(
+        name="pasha",
+        source_trigger=re.compile(r"\bpashas?\b", re.IGNORECASE),
+        prompt_hint="- Keep the title 'Pasha' unchanged; it is part of a personal name.\n",
+        output_fixes=(
+            (re.compile(r"\bPash[áa]\b"), "Pasha"),
+            (re.compile(r"\bBaj[áa]\b"), "Pasha"),
+        ),
+    ),
+    GlossaryEntry(
+        name="madrasah",
+        source_trigger=re.compile(r"\bmadrasahs?\b", re.IGNORECASE),
+        prompt_hint="- Translate the building 'Madrasah' as 'Madrasa'.\n",
+        output_fixes=(
+            (re.compile(r"\bMadrazas\b"), "Madrasas"), (re.compile(r"\bMadraza\b"), "Madrasa"),
+            (re.compile(r"\bmadrazas\b"), "madrasas"), (re.compile(r"\bmadraza\b"), "madrasa"),
+        ),
+    ),
+    GlossaryEntry(
+        name="warlord",
+        source_trigger=re.compile(r"\bwarlords?\b", re.IGNORECASE),
+        prompt_hint="- Translate the hero unit 'Warlord' as 'Caudillo'.\n",
+        output_fixes=(
+            (re.compile(r"\bSeñores\s+de\s+la\s+[Gg]uerra\b"), "Caudillos"),
+            (re.compile(r"\bSeñor\s+de\s+la\s+[Gg]uerra\b"), "Caudillo"),
+            (re.compile(r"\bseñores\s+de\s+la\s+guerra\b"), "caudillos"),
+            (re.compile(r"\bseñor\s+de\s+la\s+guerra\b"), "caudillo"),
+        ),
+    ),
+    GlossaryEntry(
+        name="righteous-fighter",
+        source_trigger=re.compile(r"\brighteous\s+fighters?\b", re.IGNORECASE),
+        # Pairs with 'Righteous Army' -> 'Ejercito Justo', which already ships that way.
+        prompt_hint="- Translate 'Righteous Fighter' as 'Guerrero Justo'.\n",
+        output_fixes=(
+            (re.compile(r"\bCombatientes\s+Justos\b", re.IGNORECASE), "Guerreros Justos"),
+            (re.compile(r"\bCombatiente\s+Justo\b", re.IGNORECASE), "Guerrero Justo"),
+            (re.compile(r"\bLuchadores\s+Justicieros\b", re.IGNORECASE), "Guerreros Justos"),
+            (re.compile(r"\bLuchador\s+Justiciero\b", re.IGNORECASE), "Guerrero Justo"),
+            (re.compile(r"\bGuerreros\s+Justicieros\b", re.IGNORECASE), "Guerreros Justos"),
+            (re.compile(r"\bGuerrero\s+Justiciero\b", re.IGNORECASE), "Guerrero Justo"),
+        ),
+    ),
+    GlossaryEntry(
+        name="lodge",
+        source_trigger=re.compile(r"\blodges?\b", re.IGNORECASE),
+        # A Masonic lodge really would be a 'Logia'; the game's Lodge is the Hunter's Lodge.
+        source_block=re.compile(r"\bmasonic\s+lodges?\b", re.IGNORECASE),
+        prompt_hint="- Translate the building 'Lodge' as 'Cabaña' (never 'Logia', which is Masonic).\n",
+        output_fixes=(
+            (re.compile(r"\bLogias\b"), "Cabañas"), (re.compile(r"\bLogia\b"), "Cabaña"),
+            (re.compile(r"\blogias\b"), "cabañas"), (re.compile(r"\blogia\b"), "cabaña"),
+        ),
+    ),
+    GlossaryEntry(
+        name="square-formation",
+        source_trigger=re.compile(r"\bsquares?\b", re.IGNORECASE),
+        # A town square is a real 'plaza'; only the infantry formation is a 'cuadro'.
+        source_block=re.compile(r"\b(?:town|city|market|village)\s+squares?\b", re.IGNORECASE),
+        prompt_hint=("- 'Square' is the infantry square FORMATION: translate it as 'Cuadro', "
+                     "never 'Plaza' or 'Cuadrado'. 'Spanish Square' is the 'Tercio Español'.\n"),
+        # Only the masculine->masculine swap is safe; 'Plaza Española'(f) -> 'Tercio'(m) would
+        # need the article and adjective rewritten, so the prompt handles that one.
+        output_fixes=((re.compile(r"\bCuadrados\b"), "Cuadros"), (re.compile(r"\bCuadrado\b"), "Cuadro")),
+    ),
+    GlossaryEntry(
+        name="conscript",
+        source_trigger=re.compile(r"\bconscripts?\b", re.IGNORECASE),
+        # 'Conscript' is ALSO a verb: "Conscript Sepoys" -> "Reclutar Sepoys" is correct.
+        # Without this guard the rule would corrupt those action strings.
+        source_block=re.compile(r"\bconscript\s+[A-Z]", re.UNICODE),
+        prompt_hint=("- Translate the unit 'Conscript' as 'Conscripto' (not 'Recluta', which is "
+                     "the separate unit 'Recruit'). As a verb, 'to conscript' is 'reclutar'.\n"),
+        # 'Recluta' is deliberately NOT rewritten: it is another unit's name.
+        output_fixes=(
+            (re.compile(r"\bConscritos\b"), "Conscriptos"), (re.compile(r"\bConscrito\b"), "Conscripto"),
+            (re.compile(r"\bconscritos\b"), "conscriptos"), (re.compile(r"\bconscrito\b"), "conscripto"),
+        ),
+    ),
+    # --- Prompt-only: gender changes, so a regex swap would break the article/adjective ------
+    GlossaryEntry(
+        name="allotment",
+        source_trigger=re.compile(r"\ballotments?\b", re.IGNORECASE),
+        # 'Land Reallotment' is a different card and is correctly 'Reasignación de Tierras'.
+        source_block=re.compile(r"\breallotments?\b", re.IGNORECASE),
+        prompt_hint=("- An 'Allotment' is a BLOCK OF TROOPS mustered at once (Swedish allotment "
+                     "system), not a plot of land: translate it as 'Contingente', never "
+                     "'Parcela', 'Reparto' or 'Asignación'.\n"),
+        output_fixes=(),
+    ),
+    GlossaryEntry(
+        name="revolt",
+        source_trigger=re.compile(r"\brevolt(?:ing|s|ed)?\b", re.IGNORECASE),
+        prompt_hint=("- 'To revolt' (the Revolution mechanic) is 'sublevarse', never 'revolverse' "
+                     "(which means to stir). The noun 'Revolt' in a named uprising stays "
+                     "'Revuelta' ('Arab Revolt' -> 'Revuelta Árabe').\n"),
+        # Only the verb forms that are outright wrong. Deliberately NOT touched:
+        #   'Revuelta'  -- correct for the named uprisings (13 strings);
+        #   'Revólver'  -- the Colt Revolver weapon (7 strings), saved by the accent;
+        #   'repugnante'-- 'revolting' also means disgusting, and one line is a pun on both.
+        output_fixes=(
+            (re.compile(r"\bRevolverse\b"), "Sublevarse"),
+            (re.compile(r"\brevolverse\b"), "sublevarse"),
+            (re.compile(r"\bRevuélvanse\b"), "Sublévense"),
+            (re.compile(r"\brevuélvanse\b"), "sublévense"),
+            (re.compile(r"\bRevolucionarse\b"), "Sublevarse"),
+            (re.compile(r"\brevolucionarse\b"), "sublevarse"),
+        ),
+    ),
+    GlossaryEntry(
+        name="zapotec",
+        source_trigger=re.compile(r"\bzapotecs?\b", re.IGNORECASE),
+        prompt_hint="- Translate 'Zapotec' as 'Zapoteca', consistently.\n",
+        output_fixes=(),
     ),
 ]
 
 
-def terminology_overrides_for_target(target_lang: str) -> str:
+# Region rules for a Spanish target. The target language name alone ("Latin American Spanish")
+# was not enough: the model still produced peninsular forms and dropped opening punctuation.
+LATAM_SPANISH_RULES = (
+    "LATIN AMERICAN SPANISH (apply ONLY when the target language is Spanish)\n"
+    "- The target is Latin American Spanish (es-419), NOT peninsular Spanish. NEVER use "
+    "'vosotros', 'os' or 'vuestro' forms, nor the -ad/-ed/-id imperative; use 'ustedes' "
+    "(e.g. 'Atacad' -> 'Ataquen', '¿Qué os parece?' -> '¿Qué les parece?').\n"
+    "- Address the player with 'tú' (informal second person singular), consistently: "
+    "'Presiona', 'Selecciona', 'Haz clic' -- not 'Presione', 'Seleccione', 'Haga clic'.\n"
+    "- Use Latin American vocabulary: 'papa' (not 'patata'), 'computadora' (not 'ordenador'), "
+    "'jugo' (not 'zumo').\n"
+    "- Use complete Spanish punctuation: open every exclamation with '¡' and every question "
+    "with '¿'.\n"
+)
+
+# Preventive twin of STRICT_MARKUP_RULES: cheap enough to send on every request, and it is
+# language-agnostic, so unlike the Spanish blocks it is never gated on the target.
+MARKUP_PROMPT_RULE = (
+    "MARKUP\n"
+    "- Keep every <color=...>...</color> pair wrapping the SAME word it wraps in the source. "
+    "When the target language reorders the words, move the tags with the word: never leave a "
+    "pair empty and never drop one. The coloured word names the unit type the text is about.\n"
+)
+
+
+def terminology_overrides_for_target(
+    target_lang: str,
+    batch: Optional[Sequence[str]] = None,
+) -> str:
     """Extra instructions appended to the prompt, only when needed.
 
     Built from ``SPANISH_GLOSSARY`` so the prompt and the post-process fixes share one source
     of truth. Keep this language-conditional so the script remains global (multi-language).
+
+    When ``batch`` is given, only the entries whose ``source_trigger`` actually appears in it are
+    emitted (the same batch-filtering ``user_glossary_rules`` does). Sending every term on every
+    request wastes tokens and nudges the model toward that vocabulary in unrelated strings.
     """
-    if target_is_spanish(target_lang):
-        hints = "".join(entry.prompt_hint for entry in SPANISH_GLOSSARY)
-        return "TERMINOLOGY OVERRIDES (apply ONLY when target language is Spanish)\n" + hints
-    return ""
+    if not target_is_spanish(target_lang):
+        return ""
+
+    if batch is None:
+        entries = SPANISH_GLOSSARY
+    else:
+        joined = "\n".join(batch)
+        entries = [e for e in SPANISH_GLOSSARY if e.source_trigger.search(joined)]
+
+    hints = "".join(entry.prompt_hint for entry in entries)
+    if hints:
+        hints = "TERMINOLOGY OVERRIDES (apply ONLY when target language is Spanish)\n" + hints
+    return (LATAM_SPANISH_RULES + "\n" + hints) if hints else LATAM_SPANISH_RULES
 
 
 def apply_postprocess_overrides(original_text: str, translated_text: str, target_lang: str) -> str:
@@ -274,10 +623,81 @@ def apply_postprocess_overrides(original_text: str, translated_text: str, target
     for entry in SPANISH_GLOSSARY:
         if not entry.source_trigger.search(original_text):
             continue
+        if entry.source_block is not None and entry.source_block.search(original_text):
+            continue
         for pattern, replacement in entry.output_fixes:
             out = pattern.sub(replacement, out)
 
     return out
+
+
+# UI imperatives only. Every pair below is a regular -e/-a verb with no clitic attached, so the
+# swap can never break agreement. Deliberately NOT extended to general usted->tu conversion:
+# in "El juego puede fallar", "puede" is third person, not usted, and rewriting it is wrong.
+_LATAM_UI_IMPERATIVES: Tuple[Tuple["re.Pattern[str]", str], ...] = (
+    (re.compile(r"\bHaga\s+clic\b"), "Haz clic"),
+    (re.compile(r"\bhaga\s+clic\b"), "haz clic"),
+    (re.compile(r"\bPresione\b"), "Presiona"), (re.compile(r"\bpresione\b"), "presiona"),
+    (re.compile(r"\bPulse\b"), "Presiona"),    (re.compile(r"\bpulse\b"), "presiona"),
+    (re.compile(r"\bSeleccione\b"), "Selecciona"), (re.compile(r"\bseleccione\b"), "selecciona"),
+    (re.compile(r"\bElija\b"), "Elige"),       (re.compile(r"\belija\b"), "elige"),
+    (re.compile(r"\bEscriba\b"), "Escribe"),   (re.compile(r"\bescriba\b"), "escribe"),
+    (re.compile(r"\bIngrese\b"), "Ingresa"),   (re.compile(r"\bingrese\b"), "ingresa"),
+    (re.compile(r"\bIntroduzca\b"), "Introduce"), (re.compile(r"\bintroduzca\b"), "introduce"),
+)
+
+# Trailing decoration that may sit after the final '!' or '?': markup, escaped whitespace, spaces.
+_TRAILING_DECORATION_RE = re.compile(r"(?:</?[^>]*>|\\[ntr]|\s)+$")
+# Where the last sentence starts: after terminal punctuation, a line break or an opening tag.
+_SENTENCE_START_RE = re.compile(r"(?:^|[.!?:;]|\\n|>)\s*")
+
+
+def _add_opening_punctuation(text: str) -> str:
+    """Add the Spanish opening '¡'/'¿' when a sentence ends with '!'/'?' and lacks it.
+
+    Only the LAST sentence is considered, and only when its opening mark is absent, so a string
+    that is already correct is returned untouched.
+    """
+    if not text:
+        return text
+    body = _TRAILING_DECORATION_RE.sub("", text)
+    if not body:
+        return text
+    closing = body[-1]
+    if closing not in "!?":
+        return text
+    opening = "¡" if closing == "!" else "¿"
+    if opening in body:
+        return text
+
+    # Find where the final sentence begins; bail out if that leaves nothing but punctuation.
+    start = 0
+    for match in _SENTENCE_START_RE.finditer(body[:-1]):
+        start = match.end()
+    # Require real words: a sentence that is only placeholders/tokens ("%s!") is left alone,
+    # since we cannot know what the engine will substitute into it.
+    sentence = _strip_quality_tokens(body[start:])
+    if not any(ch.isalpha() for ch in sentence):
+        return text
+    return text[:start] + opening + text[start:]
+
+
+def normalize_latam_spanish(original_text: str, translated_text: str, target_lang: str) -> str:
+    """Latin-American Spanish fixes that are safe to apply deterministically.
+
+    Scope is deliberately narrow. Peninsular 'vosotros' forms are NOT rewritten here: the real
+    strings carry enclitics ("Atacadnos", "ponedlos") and irregulars ("sabed", "Despertad") that
+    a lookup table cannot conjugate, and the obvious markers are landmines -- 'sed' is the noun
+    *thirst*, 'os' appears as a Portuguese article in a deliberately Portuguese line, and 'id'
+    occurs in "ID de Passport". Those are handled by the prompt and reported by --audit-spanish.
+    """
+    if not target_is_spanish(target_lang) or not translated_text:
+        return translated_text
+
+    out = translated_text
+    for pattern, replacement in _LATAM_UI_IMPERATIVES:
+        out = pattern.sub(replacement, out)
+    return _add_opening_punctuation(out)
 
 
 def load_user_glossary(path: Optional[Path]) -> Dict[str, str]:
@@ -380,7 +800,10 @@ class PromptConfig:
             target_lang=target_lang,
             input_list=json.dumps(batch, ensure_ascii=False),
         )
-        overrides = terminology_overrides_for_target(target_lang)
+        # Only worth sending when the batch actually carries markup.
+        if any("<color=" in text for text in batch):
+            prompt = prompt + "\n\n" + MARKUP_PROMPT_RULE
+        overrides = terminology_overrides_for_target(target_lang, batch)
         if overrides:
             prompt = prompt + "\n\n" + overrides
         if extra_rules:
@@ -480,6 +903,12 @@ class TranslationStats:
     cache_used: int = 0
     api_translated: int = 0
     cache_empty_skipped: int = 0
+    # Several guards deliberately fall back to the untranslated source rather than emit a
+    # corrupted string. That is the right call, but it used to happen silently -- these counters
+    # make it visible how many strings actually shipped in the source language, and why.
+    quality_rejected: int = 0   # failed the English-residue gate after every retry
+    markup_rejected: int = 0    # <color> markup still broken after every retry
+    batch_failed: int = 0       # the whole batch errored out; kept retryable in the cache
 
 
 @dataclass(frozen=True)
@@ -699,7 +1128,9 @@ def protected_cache_key(
 # altered/missing %s or %1$s can crash it. Escaped whitespace (\n/\t/\r) is allowed
 # to move around (translations legitimately reorder it), so it is NOT compared here.
 # IGNORECASE so an old translation's %S/%D is treated as equivalent to %s/%d.
-_FORMAT_SPECIFIER_RE = re.compile(r"%\d+\$[sdif]|%[sdif]", re.IGNORECASE)
+# WoL also uses its own numbered form WITHOUT the dollar (%1s, %2d) and widths (%2.2f).
+# Those were invisible here, so the merge guard never fired on them.
+_FORMAT_SPECIFIER_RE = re.compile(r"%\d+\$[sdif]|%\d*\.?\d*[sdif]", re.IGNORECASE)
 
 
 def placeholders_compatible(new_source: str, candidate_translation: str) -> bool:
@@ -905,6 +1336,8 @@ def translate_batch_gemini(
     compact_prompt: bool,
     extra_rules: str = "",
     prompt_config: PromptConfig = DEFAULT_PROMPT_CONFIG,
+    temperature: float = DEFAULT_TEMPERATURE,
+    seed: Optional[int] = DEFAULT_SEED,
 ) -> List[str]:
 
     prompt = prompt_config.build(
@@ -921,14 +1354,32 @@ def translate_batch_gemini(
     config_kwargs = dict(
         response_mime_type="application/json",
         response_schema=list[str],
+        temperature=temperature,
     )
-    try:
+    # `seed` is not in every google-genai release, so it is added separately and dropped if the
+    # installed SDK rejects it -- losing the seed only costs reproducibility, not correctness.
+    seeded_kwargs = dict(config_kwargs)
+    if seed is not None:
+        seeded_kwargs["seed"] = seed
+
+    config = None
+    for kwargs in (seeded_kwargs, config_kwargs):
+        try:
+            config = types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+                **kwargs,
+            )
+            break
+        except (AttributeError, TypeError):  # older SDK: no ThinkingConfig and/or no seed
+            try:
+                config = types.GenerateContentConfig(**kwargs)
+                break
+            except TypeError:
+                continue
+    if config is None:
         config = types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-            **config_kwargs,
+            response_mime_type="application/json", response_schema=list[str]
         )
-    except (AttributeError, TypeError):  # older google-genai without ThinkingConfig
-        config = types.GenerateContentConfig(**config_kwargs)
 
     response = client.models.generate_content(
         model=DEFAULT_MODEL,
@@ -1033,9 +1484,12 @@ def translate_batch_with_retry(
     strict_no_english_residue: bool,
     max_quality_retries: int = DEFAULT_MAX_QUALITY_RETRIES,
     base_extra_rules: str = "",
+    temperature: float = DEFAULT_TEMPERATURE,
+    seed: Optional[int] = DEFAULT_SEED,
 ) -> List[str]:
     attempt = 0
     quality_attempt = 0
+    markup_attempt = 0
     last_partial: Optional[List[str]] = None
     quality_prompt_compact = compact_prompt
     extra_rules = base_extra_rules
@@ -1049,6 +1503,8 @@ def translate_batch_with_retry(
                 quality_prompt_compact,
                 extra_rules=extra_rules,
                 prompt_config=prompt_config,
+                temperature=temperature,
+                seed=seed,
             )
             # Quality gate: check for English residue and retry with stricter rules if needed.
             if strict_no_english_residue and target_is_spanish(target):
@@ -1075,6 +1531,32 @@ def translate_batch_with_retry(
                         residue[0],
                         residue[1],
                     )
+
+            # Markup gate: same shape as the residue gate above, but language-agnostic --
+            # a lost <color> tag costs the player the "strong against" cue in every language.
+            broken = None
+            for src_text, out_text in zip(batch, translations):
+                if not markup_integrity_ok(src_text, out_text):
+                    broken = (src_text, out_text)
+                    break
+            if broken:
+                if markup_attempt < max_quality_retries:
+                    markup_attempt += 1
+                    quality_prompt_compact = False
+                    extra_rules = (extra_rules + "\n\n" + STRICT_MARKUP_RULES).strip()
+                    logging.warning(
+                        "Markup retry %s/%s: <color> markup broken. src=%s out=%s",
+                        markup_attempt,
+                        max_quality_retries,
+                        broken[0],
+                        broken[1],
+                    )
+                    continue
+                logging.warning(
+                    "Markup retries exhausted; <color> markup still broken. src=%s out=%s",
+                    broken[0],
+                    broken[1],
+                )
             return translations
         except Exception as exc:
             attempt += 1
@@ -1158,6 +1640,8 @@ def translate_strings(
     batch_progress_callback: Optional[Callable[[int, int], None]] = None,
     cancel_event: Optional[threading.Event] = None,
     user_glossary: Optional[Dict[str, str]] = None,
+    temperature: float = DEFAULT_TEMPERATURE,
+    seed: Optional[int] = DEFAULT_SEED,
 ) -> Tuple[List[str], TranslationStats]:
     
     inners_list = list(inners)
@@ -1230,6 +1714,7 @@ def translate_strings(
                 )
                 restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
                 restored = apply_user_glossary_fixes(original_texts[idx], restored, user_glossary)
+                restored = normalize_latam_spanish(original_texts[idx], restored, target_lang)
                 restored = enforce_acronym_integrity(original_texts[idx], restored, exclude=acronym_exclude)
                 restored = apply_source_casing(original_texts[idx], restored)
                 translations[idx] = restored
@@ -1306,6 +1791,8 @@ def translate_strings(
                 prompt_config,
                 strict_no_english_residue,
                 base_extra_rules=user_glossary_rules(batch, user_glossary),
+                temperature=temperature,
+                seed=seed,
             ): idx
             for idx, batch in batch_map.items()
         }
@@ -1347,6 +1834,7 @@ def translate_strings(
                 # Mark these items as not-yet-translated (empty cache) so a rerun will retry them.
                 for original in original_batch:
                     cache[original] = ""
+                    stats.batch_failed += len(indexes_by_protected.get(original, []))
                 # Skip updating translations from this batch.
                 _batches_done += 1
                 if batch_progress_callback is not None:
@@ -1365,7 +1853,12 @@ def translate_strings(
                             translated_item,
                         )
                         cache[original] = ""
+                        stats.quality_rejected += len(indexes_by_protected.get(original, []))
                         continue
+                    if not markup_integrity_ok(original, translated_item):
+                        # Kept (a broken tag beats an untranslated string) but counted, so the
+                        # user can find them with --audit-spanish instead of never knowing.
+                        stats.markup_rejected += len(indexes_by_protected.get(original, []))
                     stats.api_translated += len(indexes_by_protected.get(original, []))
                     cache[original] = translated_item
                     for idx in indexes_by_protected.get(original, []):
@@ -1377,6 +1870,7 @@ def translate_strings(
                         )
                         restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
                         restored = apply_user_glossary_fixes(original_texts[idx], restored, user_glossary)
+                        restored = normalize_latam_spanish(original_texts[idx], restored, target_lang)
                         restored = enforce_acronym_integrity(original_texts[idx], restored, exclude=acronym_exclude)
                         restored = apply_source_casing(original_texts[idx], restored)
                         translations[idx] = restored
@@ -1904,6 +2398,120 @@ def merge_by_locid(
     return MergeReport(entries=entries, counts=counts)
 
 
+@dataclass(frozen=True)
+
+
+class BuildCacheStats:
+    """Outcome of building a cache from an already-translated file."""
+
+    paired: int = 0                # new-source strings matched to a translation
+    seeded_reused: int = 0         # a real translation (differs from the English)
+    seeded_identical: int = 0      # translation == English and judged safe (proper nouns, markup)
+    skipped_english: int = 0       # translation == English but it IS untranslated English
+    skipped_placeholder: int = 0   # %-format placeholders do not match; unsafe to reuse
+    skipped_unmatched: int = 0     # no translation found for this _locID / content
+
+    @property
+    def written(self) -> int:
+        return self.seeded_reused + self.seeded_identical
+
+
+def _identical_translation_is_safe(text: str, target_lang: str) -> bool:
+    """Decide whether a translation identical to its source may be cached.
+
+    Two very different things produce an identical string:
+      * a proper noun / pure markup that legitimately survives translation
+        ("Yamabushi", "Alexander von Humboldt", "<color=...>__TOK0__</color>") -- caching it
+        is valuable: it stops the next run from paying for it and from letting the model
+        "translate" a name it should have left alone;
+      * real source-language text the previous translator never got to -- caching that would
+        poison the cache, which is exactly what the cache contract forbids.
+
+    For a Spanish target we can tell them apart with has_english_residue (the gate already
+    used elsewhere for this). For any other target we have no such detector, so we fall back
+    to the conservative rule merge_by_locid already applies: only keep it when there is
+    nothing translatable in it at all.
+    """
+    if not _has_translatable_text(text):
+        return True
+    if target_is_spanish(target_lang):
+        return not has_english_residue(text, text, target_lang)
+    return False
+
+
+def build_cache_from_translation(
+    source_targets: Sequence[TranslationTarget],
+    translated_targets: Sequence[TranslationTarget],
+    *,
+    protected_terms: Optional[Sequence[str]] = None,
+    protected_regex: Optional[Sequence["re.Pattern[str]"]] = None,
+    acronym_exclude: Optional[Sequence[str]] = None,
+    target_lang: str = DEFAULT_TARGET_LANG,
+    existing_cache: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[str, str], BuildCacheStats]:
+    """Build a {cache_key: translation} cache from a source XML + its translated XML. No API.
+
+    Pairs the two files by ``_locID`` through merge_by_locid (passing the source file as both
+    the "new" and the "old" source, so every entry compares as unchanged and the seed is the
+    reusable translation, inheriting its duplicate-id and content fallbacks).
+
+    It deliberately does NOT reuse merge_by_locid's seeding policy wholesale. That policy
+    serves version updates, where a translation identical to the source means "still needs
+    translating". Here the same input usually means a proper noun we want to keep, so
+    _identical_translation_is_safe re-decides those -- see its docstring.
+
+    Keys come from protected_cache_key, so they are byte-identical to the ones
+    translate_strings reads (guarded by self_test_cache_key_parity).
+    """
+    report = merge_by_locid(source_targets, source_targets, translated_targets)
+
+    cache: Dict[str, str] = dict(existing_cache) if existing_cache else {}
+    paired = seeded_reused = seeded_identical = 0
+    skipped_english = skipped_placeholder = skipped_unmatched = 0
+
+    for entry in report.entries:
+        if entry.draft is None:
+            skipped_unmatched += 1
+            continue
+        paired += 1
+
+        if entry.reason == "placeholder-mismatch":
+            skipped_placeholder += 1
+            continue
+
+        if entry.seed is not None:
+            value, identical = entry.seed, (entry.reason == "kept-as-source")
+        elif entry.reason == "old-equals-source":
+            # merge_by_locid refuses these; re-decide with the target-aware rule.
+            if not _identical_translation_is_safe(entry.new_source, target_lang):
+                skipped_english += 1
+                continue
+            value, identical = entry.new_source, True
+        else:
+            skipped_unmatched += 1
+            continue
+
+        cache[protected_cache_key(
+            entry.new_source,
+            protected_terms=protected_terms,
+            protected_regex=protected_regex,
+            acronym_exclude=acronym_exclude,
+        )] = value
+        if identical:
+            seeded_identical += 1
+        else:
+            seeded_reused += 1
+
+    return cache, BuildCacheStats(
+        paired=paired,
+        seeded_reused=seeded_reused,
+        seeded_identical=seeded_identical,
+        skipped_english=skipped_english,
+        skipped_placeholder=skipped_placeholder,
+        skipped_unmatched=skipped_unmatched,
+    )
+
+
 def seed_list_from_report(report: MergeReport) -> List[str]:
     """Turn a MergeReport into an ``existing_translations`` list for translate_strings.
 
@@ -1969,6 +2577,29 @@ def self_test_quality_gate() -> None:
     _assert(has_english_residue(src2, out2_residue, target_lang), "expected residue for kept 'host'")
     _assert("IP" in out2_good, "expected IP to remain unchanged")
     _assert(not has_english_residue(src2, out2_good, target_lang), "expected no residue in Spanish translation")
+
+    # REGRESSION: the game title is not protected by name alone, so its "of" used to trip the
+    # gate and 144 correctly-translated strings shipped in English. The gate sees PROTECTED text,
+    # so reproduce that here rather than passing the raw string.
+    def _protected(text: str) -> str:
+        terms, regex, exclude = _normalize_protection(None, None, None)
+        key, _tok, _phr = protect_for_cache(text, terms, regex, exclude)
+        return key
+
+    for src_raw, out_raw, why in [
+        ("There is an updated version of Age of Empires III that is required to play.",
+         "Hay una versión actualizada de Age of Empires III que se requiere para jugar.",
+         "the bare game title must not count as English residue"),
+        ("Welcome to Age of Empires III: Wars of Liberty.",
+         "Bienvenido a Age of Empires III: Wars of Liberty.",
+         "the full mod title must not count as English residue"),
+        ("This is the original version.", "Esta es la versión original.",
+         "'original' and 'versión' are ordinary Spanish words"),
+    ]:
+        _assert(
+            not has_english_residue(_protected(src_raw), _protected(out_raw), target_lang),
+            f"false positive: {why} ({out_raw!r})",
+        )
 
     print("✅ Quality gate self-test passed.")
 
@@ -2047,7 +2678,337 @@ def self_test_glossary() -> None:
     _assert(f("II: National Age", "II: Era Nacional", "Portuguese") == "II: Era Nacional",
             "non-Spanish target must be left untouched")
 
+    # Generic epoch sense: "By Age" was shipping as "Por Era" (seen in-game).
+    for src, bad, expected in [
+        ("By Age", "Por Era", "Por Edad"),
+        ("You are still in the previous Age?", "¿Todavía estás en la Era anterior?", "Edad anterior"),
+        ("advance through the Ages", "avanzar por las Eras", "las Edades"),
+        ("Advance to the Next Age", "Avanzar a la Siguiente Era", "Siguiente Edad"),
+        ("Each card gives one unit per Age.", "Cada carta da una unidad por Era.", "por Edad"),
+    ]:
+        out = f(src, bad, target_lang)
+        _assert(expected in out, f"expected {expected!r} in {out!r} (source {src!r})")
+
+    # Terminology entries added from the measured corpus.
+    _assert("Puntos de Vida" in f("Settler hitpoints increased.", "Puntos de Golpe aumentados.", target_lang),
+            "hitpoints should become Puntos de Vida")
+    _assert(f("hitpoints increased", "puntos de resistencia aumentados", target_lang)
+            == "puntos de vida aumentados", "lowercase hitpoints must stay lowercase")
+    _assert(f("Train a Settler", "Entrena un Aldeano", target_lang) == "Entrena un Colono",
+            "Settler should become Colono")
+    _assert(f("Shipment has arrived.", "Cargamento ha llegado.", target_lang) == "Envío ha llegado.",
+            "Shipment should become Envío")
+    _assert(f("A patch of potatoes", "Un sembrado de patatas", target_lang) == "Un sembrado de papas",
+            "potatoes should become papas")
+
+    # NEGATIVE cases, every one taken from a real string in the shipped translation.
+    # A ship's deck really is a "cubierta"; the deck rule must never touch it.
+    _assert(f("Steel Decks", "Cubiertas de Acero", target_lang) == "Cubiertas de Acero",
+            "Steel Decks must stay Cubiertas de Acero")
+    # Crate and Chest coexist in one string and are correctly two different words.
+    both = "Cajas de 500 alimento y Cofres de 500 moneda"
+    _assert(f("Crates of 500 food and Chests of 500 coin", both, target_lang) == both,
+            "Cofres must survive when the source mentions Chests too")
+    # Settler and Villager are different units; when both appear, Aldeano is legitimate.
+    mixed = "Aldeanos y Colonos trabajan juntos"
+    _assert(f("Villagers and Settlers work together", mixed, target_lang) == mixed,
+            "Aldeano must survive when the source mentions Villager too")
+    # "Christmas Card" is a greeting card, not a game card.
+    _assert(f("Christmas Card", "Tarjeta de Navidad", target_lang) == "Tarjeta de Navidad",
+            "Christmas Card must stay Tarjeta de Navidad")
+
+    # --- Wars of Liberty unit/building names ------------------------------------------------
+    for src, bad, expected in [
+        # "Escararuzador" is Escara+R+uzador, a real misspelling shipped in 9 strings.
+        ("Light skirmisher", "Escararuzador ligero", "Hostigador ligero"),
+        ("Skirmisher attack", "Escaramuzador mejorado", "Hostigador mejorado"),
+        ("skirmishers shoot faster", "Los escararuzadores disparan", "Los hostigadores disparan"),
+        ("Hajduk attack increased", "Ataque de Hayduk aumentado", "Ataque de Hajduk aumentado"),
+        ("The Boneguard attack", "La Guardia de Hueso ataca", "La Guardia Ósea ataca"),
+        ("Boneguard Fort", "Fuerte Guardahuesos", "Fuerte Guardia Ósea"),
+        ("Ali Pasha revives", "Ali Pashá revive", "Ali Pasha revive"),
+        ("Muhammad Ali Pasha", "Muhammad Ali Bajá", "Muhammad Ali Pasha"),
+        ("Madrasah technologies", "Tecnologías de la Madraza", "Tecnologías de la Madrasa"),
+        ("Afghan warlord", "Señor de la guerra afgano", "Caudillo afgano"),
+        ("3 Righteous Fighters", "3 Combatientes Justos", "3 Guerreros Justos"),
+        ("Calls Righteous Fighters", "Invoca Luchadores Justicieros", "Invoca Guerreros Justos"),
+        ("Hunting Lodge", "Logia de Caza", "Cabaña de Caza"),
+        ("Square", "Cuadrado", "Cuadro"),
+        ("Argentine Conscript", "Conscrito Argentino", "Conscripto Argentino"),
+        # 'To revolt' is the Revolution mechanic, not 'revolverse' (to stir).
+        ("Revolting is cheaper", "Revolverse es más barato", "Sublevarse es más barato"),
+        ("Revolt!", "¡Revuélvanse!", "¡Sublévense!"),
+        ("Aging up and revolting is cheaper.", "Avanzar de edad y revolucionarse es más barato.",
+         "Avanzar de edad y sublevarse es más barato."),
+    ]:
+        out = f(src, bad, target_lang)
+        _assert(out == expected, f"expected {expected!r}, got {out!r} (source {src!r})")
+
+    # NEGATIVES for the new entries. Each one is a real string from the shipped translation
+    # that a careless rule would have corrupted.
+    for src, text, why in [
+        # 'Conscript' is also a verb; this action string is already correct.
+        ("Conscript Sepoys", "Reclutar Sepoys", "the verb sense must not be touched"),
+        # 'Recluta' is the separate unit 'Recruit' -- rewriting it would be a worse error.
+        ("Recruit and Hajduk range increased", "Se aumenta el alcance de Reclutas y Hajduk",
+         "Recluta is another unit and must survive"),
+        ("Town Square", "Plaza del Pueblo", "a town square really is a plaza"),
+        ("Land Reallotment", "Reasignación de Tierras", "Reallotment is a different card"),
+        ("Masonic Lodge", "Logia Masónica", "a Masonic lodge really is a Logia"),
+        # 'Revolt' has three senses here and only the verb one was wrong.
+        ("Colt Revolver", "Revólver Colt", "the Colt Revolver is a weapon, not a revolt"),
+        ("Revolver Hammer", "Martillo de Revólver", "same weapon sense"),
+        ("Arab Revolt", "Revuelta Árabe", "a named uprising really is a Revuelta"),
+        ("Bolívar's Revolt", "La Revuelta de Bolívar", "same"),
+        ("You have revolted from your mother country!", "¡Te has sublevado de tu metrópoli!",
+         "already the canonical verb"),
+        ("The King found me quite revolting.", "El Rey me encontró bastante repugnante.",
+         "'revolting' also means disgusting"),
+    ]:
+        out = f(src, text, target_lang)
+        _assert(out == text, f"{text!r} must stay untouched ({why}), got {out!r}")
+
+    # Gender-changing terms are prompt-only: they must never be rewritten here.
+    for src, text in [
+        ("Allotments are 10% cheaper.", "Las Parcelas son un 10% más baratas."),
+        ("Spanish Square", "Plaza Española"),
+        ("Zapotec Settlement", "Asentamiento zapoteco"),
+    ]:
+        _assert(f(src, text, target_lang) == text,
+                f"{text!r} changes gender; it must be left to the prompt layer")
+
     print("✅ Glossary self-test passed.")
+
+
+def self_test_markup_integrity() -> None:
+    def _assert(condition: bool, message: str) -> None:
+        if not condition:
+            raise SystemExit(f"Markup integrity self-test failed: {message}")
+
+    green = "<color=0.07, 0.68, 0.17>"
+    blue = "<color=0.19, 0.52, 0.76>"
+
+    # The two failure shapes actually observed in the shipped translation.
+    _assert(
+        not markup_integrity_ok(
+            f"Nepalese {green}skirmisher </color>that is accurate.",
+            f"Hostigador nepalí {green} </color>con precisión."),
+        "an emptied <color> pair must be rejected")
+    _assert(
+        not markup_integrity_ok(
+            f"Native Asian ranged {blue}line unit</color>",
+            "Unidad de línea a distancia asiática nativa"),
+        "a dropped <color> pair must be rejected")
+
+    # Correct markup, and text without any, must pass.
+    _assert(markup_integrity_ok(f"{green}Skirmisher </color>with low hitpoints.",
+                                f"{green}Hostigador </color>con pocos puntos de vida."),
+            "correctly moved markup must pass")
+    _assert(markup_integrity_ok("Plain text, no markup.", "Texto plano, sin markup."),
+            "text without markup must pass")
+    _assert(markup_integrity_ok(f"Good against {green}a</color> and {blue}b</color>",
+                                f"Bueno contra {green}a</color> y {blue}b</color>"),
+            "two intact pairs must pass")
+    # A source that is itself empty-tagged must not be flagged; we only catch NEW damage.
+    _assert(markup_integrity_ok(f"{green}</color>", f"{green}</color>"),
+            "an already-empty pair in the source is not our defect")
+
+    print("✅ Markup integrity self-test passed.")
+
+
+def self_test_misalignment() -> None:
+    def _assert(condition: bool, message: str) -> None:
+        if not condition:
+            raise SystemExit(f"Misalignment self-test failed: {message}")
+
+    # The real _locID 42595 pair from the shipped file: a description slot holding a name.
+    real = [("Upgraded version of the red and gold French New World Trade Center.",
+             "Suministros de J.C. Kiley")]
+    _assert(len(_audit_misaligned(real)) == 1, "the real 42595 misalignment must be detected")
+
+    # Its swapped partner at 42596: a short English name whose slot holds the long description.
+    # Both halves must be caught or a purge would fix one slot and leave the other wrong.
+    mirror = [("J.C. Kiley's Outfitters",
+               "Versión mejorada del Centro de Comercio francés del Nuevo Mundo azul y blanco.")]
+    _assert(len(_audit_misaligned(mirror)) == 1, "the mirror half of a swap must be detected too")
+
+    # The same shift between two SHORT labels, where the length rule is blind. These are the
+    # worst kind: the card promises one number of units and the game shows another.
+    _assert(len(_audit_misaligned([("8 Riflemen", "6 Fusileros")])) == 1,
+            "a shifted unit count must be detected")
+    _assert(not _audit_misaligned([("8 Riflemen", "8 Fusileros")]),
+            "a matching unit count must not be flagged")
+    # Legitimate cases the count rule must stay away from.
+    _assert(not _audit_misaligned([("1 Settler Wagon", "una Carreta de Colono")]),
+            "a number written as a word is not a mismatch")
+    _assert(not _audit_misaligned([
+        ("March 1421 - We sail with 300 ships and 20,000 crew aboard the fleet.",
+         "Marzo de 1421 - Zarpamos con 300 barcos y 20.000 tripulantes a bordo.")]),
+        "a thousands separator is formatting, not a changed quantity")
+
+    # NEGATIVES: everything a false positive would cost an unnecessary API call.
+    safe = [
+        # A normal, complete translation.
+        ("Villagers gather wood faster from Mills and Plantations everywhere.",
+         "Los Aldeanos recolectan madera más rápido de Molinos y Plantaciones en todas partes."),
+        # Spanish is legitimately more compact but still a sentence.
+        ("Upgraded version of the original Russian New World Trade Center.",
+         "Versión mejorada del Centro de Comercio ruso original."),
+        # Short label translated by a short label: the rule must not look at these at all.
+        ("Gang Saw", "Sierra de banda"),
+        # Long English WITHOUT a final period is out of scope (headings, list items).
+        ("An offensive army of swordsmen and skirmishers ready for the front",
+         "Ejército ofensivo"),
+    ]
+    for src, tgt in safe:
+        _assert(not _audit_misaligned([(src, tgt)]),
+                f"false positive on {tgt!r}: it would be re-translated for nothing")
+
+    # Markup and placeholders must not count toward the length comparison.
+    _assert(not _audit_misaligned([
+        ("<color=1.0, 1.0, 0.0>Ships %1s and %2s to your colony right away.</color>",
+         "<color=1.0, 1.0, 0.0>Envía %1s y %2s a tu colonia de inmediato.</color>")]),
+        "markup and placeholders must be stripped before measuring length")
+
+    print("✅ Misalignment self-test passed.")
+
+
+def self_test_repair_from() -> None:
+    """Pin the accept/reject rules that decide when a trusted cache value may be reused.
+
+    Mirrors the logic in run_audit_spanish_cli's --repair-from block. The negatives matter most:
+    a donor cache can be wrong too, and swapping one error for another would be worse than
+    leaving the string alone, because the audit would then stop flagging it.
+    """
+    def _assert(condition: bool, message: str) -> None:
+        if not condition:
+            raise SystemExit(f"Repair-from self-test failed: {message}")
+
+    def accepts(src: str, current: str, good: Optional[str]) -> bool:
+        if not good or not good.strip() or good.strip() == (current or "").strip():
+            return False
+        if _audit_misaligned([(src, good)]):
+            return False
+        return placeholders_compatible(src, good)
+
+    english = "Upgraded version of the red and gold French New World Trade Center."
+    broken = "Suministros de J.C. Kiley"
+    good = "Versión mejorada del Centro de Comercio francés rojo y dorado del Nuevo Mundo."
+
+    _assert(accepts(english, broken, good), "a sound trusted value must be accepted")
+    _assert(not accepts(english, broken, None), "a missing trusted value must be refused")
+    _assert(not accepts(english, broken, "   "), "a blank trusted value must be refused")
+    _assert(not accepts(english, broken, broken), "an identical value is not a repair")
+    # The donor is misaligned in the same way -> refusing keeps the string flagged for review.
+    _assert(not accepts(english, broken, "Otro Nombre Corto"),
+            "a trusted value that is itself misaligned must be refused")
+
+    # Placeholders are load-bearing for the game engine.
+    ph_src = "%1s has destroyed %2s!"
+    _assert(accepts(ph_src, "Texto equivocado", "¡%1s ha destruido %2s!"),
+            "a trusted value keeping both placeholders must be accepted")
+    _assert(not accepts(ph_src, "Texto equivocado", "¡%1s ha destruido algo!"),
+            "a trusted value that drops a placeholder must be refused")
+
+    # And the key written must be the one translate_strings reads.
+    terms, regex, exclude = _normalize_protection(None, None, None)
+    key, _tok, _phr = protect_for_cache(english, terms, regex, exclude)
+    _assert(key == protected_cache_key(english), "the repaired key must match the engine's key")
+
+    # --- Which defects may be repaired at all -----------------------------------------------
+    # Structural: the slot is objectively broken, so an older sound value is strictly better.
+    long_en = "Playback stopped because it is out of sync with the original game."
+    _assert(_structurally_broken(long_en, long_en),
+            "a long string left in the source language is structurally broken")
+    _assert(_structurally_broken(english, broken), "a misaligned slot is structurally broken")
+    _assert(_structurally_broken("Ranged <color=1>line unit</color>", "Unidad de línea"),
+            "a lost <color> pair is structurally broken")
+
+    # Wording: NOT structural, so --repair-from must leave it to the post-process / re-run,
+    # or an older cache would undo the newer terminology.
+    _assert(not _structurally_broken("Allotments are 10% cheaper.",
+                                     "Las Parcelas son un 10% más baratas."),
+            "wrong terminology is a wording problem, not a structural one")
+    # A proper noun that legitimately survives translation is not "untranslated".
+    _assert(not _structurally_broken("Yamabushi", "Yamabushi"),
+            "a proper noun identical in both languages is not structurally broken")
+
+    # --- Donor guards, each from a real entry in the July cache ------------------------------
+    def donor_ok(src: str, current_value: str, good: Optional[str]) -> bool:
+        if not good or not good.strip() or good.strip() == (current_value or "").strip():
+            return False
+        if not placeholders_compatible(src, good):
+            return False
+        if not _has_translatable_text(good):
+            return False
+        if _structurally_broken(src, good):
+            return False
+        return not has_english_residue(src, good, "Spanish")
+
+    _assert(donor_ok(long_en, long_en,
+                     "La reproducción se detuvo porque está desincronizada con la partida original."),
+            "a sound Spanish value for an untranslated string must be accepted")
+    # The July cache really does store a bare token as one "translation".
+    _assert(not donor_ok("Age of Empires III: Wars of Liberty",
+                         "Age of Empires III: Wars of Liberty", "__PROTECT_0__"),
+            "a donor value that is only a protect token must be refused")
+    _assert(not donor_ok(long_en, long_en, "Playback stopped because of the original game."),
+            "a donor value still in English must be refused")
+    _assert(not donor_ok("Ranged <color=1>line unit</color>", "Unidad de línea",
+                         "Unidad de línea a distancia"),
+            "a donor value that also lost the markup must be refused")
+
+    print("✅ Repair-from self-test passed.")
+
+
+def self_test_latam_spanish() -> None:
+    def _assert(condition: bool, message: str) -> None:
+        if not condition:
+            raise SystemExit(f"LatAm Spanish self-test failed: {message}")
+
+    def f(text: str, target: str = "Spanish") -> str:
+        return normalize_latam_spanish("", text, target)
+
+    # UI imperatives are unified on the tú form.
+    _assert(f("Presione ESC para cancelar.") == "Presiona ESC para cancelar.", "Presione -> Presiona")
+    _assert(f("Haga clic en una carta.") == "Haz clic en una carta.", "Haga clic -> Haz clic")
+    _assert(f("Seleccione una opción.") == "Selecciona una opción.", "Seleccione -> Selecciona")
+    _assert(f("Introduzca su nombre.") == "Introduce su nombre.", "Introduzca -> Introduce")
+
+    # Opening punctuation is added only where it is missing.
+    _assert(f("John Black ha colocado los explosivos!")
+            == "¡John Black ha colocado los explosivos!", "missing ¡ should be added")
+    _assert(f("Borrar permanentemente %s?") == "¿Borrar permanentemente %s?", "missing ¿ should be added")
+    _assert(f("Primera oración. Segunda es pregunta?")
+            == "Primera oración. ¿Segunda es pregunta?", "only the last sentence gets the mark")
+    _assert(f("¡Ya lo tiene!") == "¡Ya lo tiene!", "an existing ¡ must not be duplicated")
+    _assert(f("¿Y este también?") == "¿Y este también?", "an existing ¿ must not be duplicated")
+    _assert(f("Sin puntuación final") == "Sin puntuación final", "no terminal mark, no change")
+    _assert(f("%s!") == "%s!", "a placeholder-only sentence must be left alone")
+    # Trailing markup must not hide the terminal '!'.
+    _assert(f("Infantería a distancia! <color=1.0, 1.0, 0.0>")
+            == "¡Infantería a distancia! <color=1.0, 1.0, 0.0>", "trailing markup must be ignored")
+
+    # CRITICAL negatives: real strings that naive peninsular-form rules would have destroyed.
+    for text, why in [
+        ("La sed de venganza Cheyenne", "'sed' is the noun *thirst*, not a vosotros imperative"),
+        ("Los dioses tienen sed de su sangre.", "same: 'sed' must never be conjugated away"),
+        ("ID de Passport existente:", "'id' here is ID, not the imperative of 'ir'"),
+        ("Gaucho: Até que enfim os castelhanos cansaram.", "'os' is Portuguese, deliberately"),
+        ("Estos blancos móviles son un buen objetivo.", "'móviles' is the adjective *moving*"),
+        ("Todos los edificios se reemplazan por caravanas móviles.", "same adjective sense"),
+        ("El juego puede fallar.", "'puede' is third person, not usted"),
+    ]:
+        _assert(f(text) == text, f"{text!r} must stay untouched: {why}")
+
+    # Other targets are never touched.
+    _assert(normalize_latam_spanish("", "Presione ESC!", "Portuguese") == "Presione ESC!",
+            "non-Spanish target must be left alone")
+    # Locale-style target names must still enable the gate.
+    _assert(normalize_latam_spanish("", "Presione ESC.", "es-419") == "Presiona ESC.",
+            "es-419 must be recognized as Spanish")
+
+    print("✅ LatAm Spanish self-test passed.")
 
 
 def self_test_user_glossary() -> None:
@@ -2235,6 +3196,98 @@ def self_test_merge() -> None:
     print("✅ Merge self-test passed.")
 
 
+def self_test_build_cache() -> None:
+    def _assert(condition: bool, message: str) -> None:
+        if not condition:
+            raise SystemExit(f"Build-cache self-test failed: {message}")
+
+    def _t(text: str, loc_id: Optional[str] = None) -> TranslationTarget:
+        return TranslationTarget(
+            element=ET.Element("String"),
+            text=text,
+            symbol=None,
+            skip=False,
+            reason=None,
+            loc_id=loc_id,
+        )
+
+    english = [
+        _t("Villagers gather wood faster.", "1"),   # normal translation
+        _t("Yamabushi", "2"),                       # proper noun, identical in Spanish
+        _t("Convento de San Felipe Neri", "3"),     # already-Spanish name, identical
+        _t("The Asian Dynasties", "4"),             # real English left untranslated
+        _t("%s is not ready.", "5"),                # translation drops the placeholder
+        _t("<color=1.0, 1.0, 0.0>", "6"),           # pure markup, nothing translatable
+        _t("Only in the new file", "7"),            # no counterpart in the translation
+    ]
+    spanish = [
+        _t("Los Aldeanos recolectan madera mas rapido.", "1"),
+        _t("Yamabushi", "2"),
+        _t("Convento de San Felipe Neri", "3"),
+        _t("The Asian Dynasties", "4"),
+        _t("no esta listo.", "5"),
+        _t("<color=1.0, 1.0, 0.0>", "6"),
+    ]
+
+    cache, stats = build_cache_from_translation(english, spanish, target_lang="Spanish")
+
+    def _key(text: str) -> str:
+        return protected_cache_key(text)
+
+    # A real translation is stored under exactly the key translate_strings would read.
+    _assert(cache.get(_key("Villagers gather wood faster.")) == "Los Aldeanos recolectan madera mas rapido.",
+            "a normal translation must be cached under its protected key")
+
+    # THE FIX: a translation identical to the source is kept when it is a name, not English.
+    _assert(cache.get(_key("Yamabushi")) == "Yamabushi",
+            "an identical proper noun must be cached (it is not untranslated English)")
+    _assert(cache.get(_key("Convento de San Felipe Neri")) == "Convento de San Felipe Neri",
+            "an identical Spanish place name must be cached")
+
+    # CRITICAL negative case: never cache real untranslated English as if it were a translation.
+    _assert(_key("The Asian Dynasties") not in cache,
+            "untranslated English must NEVER be cached")
+    _assert(stats.skipped_english == 1, f"expected 1 English skip, got {stats.skipped_english}")
+
+    # A translation that lost a %-placeholder is unsafe to reuse.
+    _assert(_key("%s is not ready.") not in cache, "placeholder mismatch must not be cached")
+    _assert(stats.skipped_placeholder == 1,
+            f"expected 1 placeholder skip, got {stats.skipped_placeholder}")
+
+    # Pure markup has nothing to translate: kept as-is (merge_by_locid already allows this).
+    _assert(_key("<color=1.0, 1.0, 0.0>") in cache, "pure markup should be kept as-is")
+
+    # A string with no counterpart is not invented.
+    _assert(_key("Only in the new file") not in cache, "unmatched string must not be cached")
+    _assert(stats.skipped_unmatched == 1,
+            f"expected 1 unmatched, got {stats.skipped_unmatched}")
+
+    _assert(stats.seeded_reused == 1, f"expected 1 reused seed, got {stats.seeded_reused}")
+    _assert(stats.seeded_identical == 3, f"expected 3 identical seeds, got {stats.seeded_identical}")
+    _assert(stats.written == len(cache), "written count must match the cache size")
+
+    # Non-Spanish target: has_english_residue cannot help, so identical text with real words
+    # must fall back to the conservative rule and be refused.
+    de_cache, de_stats = build_cache_from_translation(
+        [_t("Yamabushi", "2"), _t("<color=1.0, 1.0, 0.0>", "6")],
+        [_t("Yamabushi", "2"), _t("<color=1.0, 1.0, 0.0>", "6")],
+        target_lang="German",
+    )
+    _assert(_key("Yamabushi") not in de_cache,
+            "non-Spanish target must not seed identical text that has real words")
+    _assert(_key("<color=1.0, 1.0, 0.0>") in de_cache,
+            "non-Spanish target should still keep pure markup")
+    _assert(de_stats.skipped_english == 1,
+            f"expected 1 skip for German, got {de_stats.skipped_english}")
+
+    # An existing cache is merged into, not replaced.
+    seeded, _ = build_cache_from_translation(
+        english, spanish, target_lang="Spanish", existing_cache={"pre-existing": "value"})
+    _assert(seeded.get("pre-existing") == "value", "existing cache entries must be preserved")
+
+    print("✅ Build-cache self-test passed.")
+
+
 def self_test_cache_key_parity() -> None:
     """The public cache-key helper must produce the exact key translate_strings stores."""
     def _assert(condition: bool, message: str) -> None:
@@ -2302,6 +3355,21 @@ def parse_args() -> argparse.Namespace:
     )
 
     # --- Language group ---
+    api_group.add_argument(
+        "--temperature",
+        type=float,
+        default=DEFAULT_TEMPERATURE,
+        help="Model sampling temperature. Low values keep terminology consistent across the "
+             "independent parallel batches (default: %(default)s).",
+    )
+    api_group.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help="Sampling seed, for reproducible runs. Ignored by older google-genai SDKs "
+             "(default: %(default)s).",
+    )
+
     lang_group = parser.add_argument_group("Language")
     lang_group.add_argument("--source", default=DEFAULT_SOURCE_LANG, help="Source language name.")
     lang_group.add_argument("--target", default=DEFAULT_TARGET_LANG, help="Target language name.")
@@ -2409,6 +3477,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help='Retry translations that were cached as empty ("").',
     )
+    cache_group.add_argument(
+        "--build-cache-from",
+        type=Path,
+        metavar="TRANSLATED_XML",
+        help="Build a cache from an ALREADY-TRANSLATED XML instead of translating. "
+             "Pair it with the matching source XML as the 'input' positional and send the "
+             "result to --cache-file. Matches by _locID and never calls the API; 'output' "
+             "is not required.",
+    )
 
     # --- Merge group (carry an old translation onto a new source version by _locID) ---
     merge_group = parser.add_argument_group("Merge (version update by _locID)")
@@ -2437,6 +3514,32 @@ def parse_args() -> argparse.Namespace:
     # --- Diagnostics group ---
     diag_group = parser.add_argument_group("Diagnostics")
     diag_group.add_argument(
+        "--audit-spanish",
+        type=Path,
+        metavar="TRANSLATED_XML",
+        help="Audit a Spanish translation for terminology, peninsular forms, untranslated "
+             "strings and punctuation. Takes the source XML as the 'input' positional; "
+             "'output' is not required and the API is never called.",
+    )
+    diag_group.add_argument(
+        "--repair-from",
+        type=Path,
+        metavar="GOOD_CACHE_JSON",
+        help="With --audit-spanish and --purge-audited: recover STRUCTURALLY BROKEN strings "
+             "(slot holding another string, lost <color> markup, still in the source "
+             "language) from a known-good cache instead of paying to re-translate them. "
+             "Wording problems like terminology are never taken from it -- the audited "
+             "cache is newer there. A donor value is refused unless it keeps the "
+             "placeholders, has real text and is not broken itself. Never written to.",
+    )
+    diag_group.add_argument(
+        "--purge-audited",
+        type=Path,
+        metavar="CACHE_JSON",
+        help="With --audit-spanish: delete the flagged strings from this cache so the next run "
+             "re-translates them with the current prompt and glossary.",
+    )
+    diag_group.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose (DEBUG) logging output.",
@@ -2458,10 +3561,532 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
-    if not (args.self_test_quality_gate or args.self_test_merge) and (
+    if args.audit_spanish is not None:
+        if args.input is None:
+            parser.error("--audit-spanish also requires the source XML as 'input'")
+        if args.repair_from is not None and args.purge_audited is None:
+            # --purge-audited names the cache that gets repaired; without it there is no target.
+            parser.error("--repair-from also requires --purge-audited (the cache to repair)")
+    elif args.purge_audited is not None or args.repair_from is not None:
+        parser.error("--purge-audited/--repair-from only make sense together with --audit-spanish")
+    elif args.build_cache_from is not None:
+        # Building a cache needs the source XML (input) but produces no translated XML.
+        if args.input is None:
+            parser.error("--build-cache-from also requires the source XML as 'input'")
+        if args.cache_file is None:
+            parser.error("--build-cache-from requires --cache-file (where to write the cache)")
+    elif not (args.self_test_quality_gate or args.self_test_merge) and (
             args.input is None or args.output is None):
         parser.error("the following arguments are required: input, output")
     return args
+
+
+def _audit_pairs(
+    source_targets: Sequence[TranslationTarget],
+    translated_targets: Sequence[TranslationTarget],
+) -> List[Tuple[str, str]]:
+    """Align a source XML with its translation by _locID and return the (source, target) pairs."""
+    report = merge_by_locid(source_targets, source_targets, translated_targets)
+    return [(e.new_source, e.draft) for e in report.entries if e.draft]
+
+
+def _audit_term_consistency(
+    pairs: Sequence[Tuple[str, str]],
+    term: str,
+    canonical: str,
+    variants: Sequence[str],
+    source_block: Optional["re.Pattern[str]"] = None,
+) -> Tuple[int, Dict[str, List[Tuple[str, str]]]]:
+    """Count how a source term was rendered: canonical vs each known-wrong variant."""
+    # Allow the plural but nothing else, so "conscripted" (the verb) is not counted as a
+    # variant of the noun "Conscript" -- that inflates the report and the purge list.
+    trigger = re.compile(r"\b" + re.escape(term) + r"(?:e?s)?\b", re.IGNORECASE)
+    canon_re = re.compile(r"\b" + re.escape(canonical), re.IGNORECASE)
+    variant_res = [(v, re.compile(r"\b" + re.escape(v), re.IGNORECASE)) for v in variants]
+
+    ok = 0
+    found: Dict[str, List[Tuple[str, str]]] = {}
+    for src, tgt in pairs:
+        if not trigger.search(src):
+            continue
+        if source_block is not None and source_block.search(src):
+            continue
+        matched = False
+        for name, rx in variant_res:
+            if rx.search(tgt):
+                found.setdefault(name, []).append((src, tgt))
+                matched = True
+        if not matched and canon_re.search(tgt):
+            ok += 1
+    return ok, found
+
+
+# Digits only, after dropping thousands separators so "20,000" and "20.000" compare equal.
+_AUDIT_THOUSANDS_RE = re.compile(r"(?<=\d)[.,](?=\d{3}\b)")
+_AUDIT_NUM_RE = re.compile(r"\d+")
+
+
+def _audit_strip_all(text: str) -> str:
+    """Drop markup, placeholders and escapes so only the readable text is measured."""
+    cleaned = re.sub(r"<[^>]*>|\{[^}]*\}", " ", text or "")
+    cleaned = re.sub(r"%\d*\$?[sdif]|\\[ntr]", " ", cleaned)
+    # "20,000" and "20.000" are the same number written two ways; normalize so a formatting
+    # difference is never mistaken for a changed quantity.
+    cleaned = _AUDIT_THOUSANDS_RE.sub("", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _audit_misaligned(pairs: Sequence[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """Find strings whose Spanish is not a translation of their English at all.
+
+    These come from a cache rebuilt by POSITION rather than by ``_locID``: if the two files ever
+    differed by one element, the whole following block shifted, and a building's name landed in
+    its description's slot. Both the XML and the cache then hold the same wrong pairing, so the
+    cache cannot be used as ground truth here -- it agrees with the error.
+
+    The rule is deliberately narrow, because a false positive sends a correct string back to the
+    API for no reason: the English must READ LIKE A SENTENCE (long, ends in a period) while the
+    Spanish READS LIKE A LABEL (much shorter, no final period). A looser rule based on shared
+    proper nouns was tried and rejected -- neighbouring entries share names constantly, so it
+    produced ten times as many hits and most were correct translations.
+
+    The check is SYMMETRIC, and that matters: these defects come in swapped pairs, so the mirror
+    case (a short English name whose slot holds a long Spanish description) has to be caught too.
+    Purging only one half would re-translate one slot correctly and leave the other still wrong.
+    """
+    def sentence_vs_label(a: str, b: str) -> bool:
+        # `a` reads like a sentence, `b` like a label sitting where a sentence belongs.
+        return (len(a) >= 45 and a.endswith(".")
+                and len(b) < len(a) * 0.6 and not b.endswith("."))
+
+    def counts_differ(english: str, spanish: str) -> bool:
+        """A short card label whose numbers do not match: '8 Riflemen' -> '6 Fusileros'.
+
+        These are the same shift, but between two short labels, so the length rule cannot see
+        them -- and they are the worst kind, because the card promises the player one number of
+        units and the game shows another. Restricted to SHORT strings and to strings with digits
+        on BOTH sides: that drops the legitimate cases where English spells a number and Spanish
+        writes it as a word ('1 Settler Wagon' -> 'una Carreta'), and long narrative text where a
+        date or a thousands separator differs in formatting.
+        """
+        if len(english.split()) > 6:
+            return False
+        a, b = _AUDIT_NUM_RE.findall(english), _AUDIT_NUM_RE.findall(spanish)
+        return bool(a) and bool(b) and sorted(a) != sorted(b)
+
+    found: List[Tuple[str, str]] = []
+    for src, tgt in pairs:
+        english = _audit_strip_all(src)
+        spanish = _audit_strip_all(tgt)
+        if not english or not spanish:
+            continue
+        if (sentence_vs_label(english, spanish) or sentence_vs_label(spanish, english)
+                or counts_differ(english, spanish)):
+            found.append((src, tgt))
+    return found
+
+
+def _structurally_broken(src: str, value: Optional[str]) -> bool:
+    """True when a translation is objectively broken, not merely worded differently.
+
+    The distinction decides what --repair-from may overwrite:
+
+      * STRUCTURAL -- the slot holds another string's text, a ``<color>`` pair was lost, or the
+        text is still in the source language. A sound older value is strictly better here, so
+        reusing one is safe.
+      * WORDING -- terminology, register, punctuation. The audited cache is the newer and better
+        translation; the deterministic post-process fixes it for free or it gets re-translated.
+        Overwriting it with an older value would be a regression, so these are NOT repaired.
+
+    The "still in the source language" test uses the audit's own threshold of five real words:
+    without it the 4463 proper nouns that legitimately survive translation ("Yamabushi") would
+    all count as untranslated.
+    """
+    if not value or not value.strip():
+        return True
+    if _audit_misaligned([(src, value)]):
+        return True
+    if not markup_integrity_ok(src, value):
+        return True
+    if (src.strip() == value.strip() and _has_translatable_text(src)
+            and len(re.findall(r"[A-Za-z]{3,}", src)) >= 5):
+        return True
+    return False
+
+
+def _audit_discover_candidates(
+    pairs: Sequence[Tuple[str, str]],
+    limit: int = 25,
+) -> List[Tuple[str, str, int, int]]:
+    """Heuristic sweep for terms that are NOT in any glossary yet.
+
+    Short English label strings (unit/tech/building names) are treated as the game's own
+    glossary; their own translation is the presumed canon, and every longer string containing
+    the term is checked for it. This is noisy by nature -- casing, inflection and proper nouns
+    all show up -- so callers must present it as "candidates", never as findings.
+    """
+    def strip_accents(text: str) -> str:
+        decomposed = unicodedata.normalize("NFD", text.lower())
+        return "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
+
+    en_norm = [strip_accents(src) for src, _ in pairs]
+    es_norm = [strip_accents(tgt) for _, tgt in pairs]
+
+    index: Dict[str, set] = {}
+    for i, text in enumerate(en_norm):
+        for word in set(re.findall(r"[a-z]{4,}", text)):
+            index.setdefault(word, set()).add(i)
+
+    labels: Dict[str, "collections.Counter[str]"] = {}
+    for src, tgt in pairs:
+        label = src.strip()
+        if 1 <= len(label.split()) <= 3 and re.fullmatch(r"[^\W\d_][\w \-']+", label, re.UNICODE):
+            labels.setdefault(label, collections.Counter())[tgt.strip()] += 1
+
+    def stem(word: str) -> str:
+        word = strip_accents(word)
+        if word.endswith("es") and len(word) > 5:
+            return word[:-2]
+        return word[:-1] if word.endswith("s") and len(word) > 4 else word
+
+    results: List[Tuple[str, str, int, int]] = []
+    for label, counter in labels.items():
+        if len(label) < 5:
+            continue
+        canonical = counter.most_common(1)[0][0]
+        words = [strip_accents(w) for w in label.split() if len(w) >= 4]
+        if not words:
+            continue
+        candidates: Optional[set] = None
+        for word in words:
+            hits = index.get(word, set())
+            candidates = hits if candidates is None else (candidates & hits)
+            if not candidates:
+                break
+        if not candidates or len(candidates) > 3000:
+            continue
+        stems = [stem(w) for w in canonical.split() if len(w) > 3]
+        if not stems:
+            continue
+        label_norm = strip_accents(label)
+        ok = diverging = 0
+        for i in candidates:
+            if pairs[i][0].strip() == label or label_norm not in en_norm[i]:
+                continue
+            if all(s in es_norm[i] for s in stems):
+                ok += 1
+            else:
+                diverging += 1
+        if diverging and ok >= 1 and diverging <= 30:
+            results.append((label, canonical, ok, diverging))
+
+    results.sort(key=lambda r: -r[3])
+    return results[:limit]
+
+
+def run_audit_spanish_cli(
+    args: argparse.Namespace,
+    skip_rules: SkipRules,
+    user_glossary: Dict[str, str],
+) -> None:
+    """Handle --audit-spanish: report translation-quality problems. No API calls.
+
+    Works on the XML PAIR (source + translation) rather than a cache file, because most checks
+    must be triggered by the English source. Without it we would flag "Tarjeta de Navidad"
+    (correct for "Christmas Card") and miss that "Cofre" is right next to "Chest".
+    """
+    source_path: Path = args.input
+    translated_path: Path = args.audit_spanish
+    for path, label in ((source_path, "source"), (translated_path, "translated")):
+        if not path.exists():
+            raise SystemExit(f"File does not exist ({label}): {path}")
+
+    def load(path: Path) -> List[TranslationTarget]:
+        tree, _fmt = parse_strings_xml(path)
+        return [t for t in iter_translatable_elements(tree.getroot(), skip_rules) if not t.skip]
+
+    pairs = _audit_pairs(load(source_path), load(translated_path))
+    print(f"\n📋 Spanish audit — {len(pairs)} aligned string pair(s)\n" + "=" * 72)
+
+    flagged: List[str] = []
+
+    # --- 1) Glossary-driven consistency (precise) --------------------------------------
+    print("\n1. TERMINOLOGY (from SPANISH_GLOSSARY + glossary.txt)")
+    known: List[Tuple[str, str, List[str], Optional[re.Pattern[str]]]] = [
+        ("hitpoints", "Puntos de Vida",
+         ["Puntos de Golpe", "Puntos de Resistencia", "Puntos de Salud"], None),
+        ("shipment", "Envío", ["Cargamento"], None),
+        ("settler", "Colono", ["Aldeano"], re.compile(r"\bvillagers?\b", re.IGNORECASE)),
+        ("crate", "Caja", ["Cofre", "Cajones", "Cajón"], re.compile(r"\bchests?\b", re.IGNORECASE)),
+        ("outpost", "Avanzada", ["Puesto de Avanzada", "Puesto Avanzado"], None),
+        ("deck", "Mazo", ["Baraja"], re.compile(r"\bsteel\s+decks?\b", re.IGNORECASE)),
+        ("potato", "papa", ["patata"], None),
+        # Wars of Liberty names. The variants are the ones actually found in the shipped file.
+        ("allotment", "Contingente", ["Parcela", "Reparto", "Asignación"],
+         re.compile(r"\breallotments?\b", re.IGNORECASE)),
+        ("boneguard", "Guardia Ósea",
+         ["Boneguard", "Guardia de Hueso", "Guardahueso", "Guardaósea"], None),
+        ("conscript", "Conscripto", ["Recluta", "Conscrito"],
+         re.compile(r"\bconscript\s+[A-Z]", re.UNICODE)),
+        ("skirmisher", "Hostigador", ["Escaramuzador", "Escararuzador"], None),
+        ("warlord", "Caudillo", ["Señor de la guerra"], None),
+        ("pasha", "Pasha", ["Pashá", "Bajá"], None),
+        ("madrasah", "Madrasa", ["Madraza", "Madrasah"], None),
+        ("hajduk", "Hajduk", ["Hayduk"], None),
+        ("righteous fighter", "Guerrero Justo", ["Combatiente Justo", "Luchador Justiciero"], None),
+        ("lodge", "Cabaña", ["Logia", "Pabellón"],
+         re.compile(r"\bmasonic\s+lodges?\b", re.IGNORECASE)),
+        ("square", "Cuadro", ["Cuadrado", "Plaza"],
+         re.compile(r"\b(?:town|city|market|village)\s+squares?\b", re.IGNORECASE)),
+        ("zapotec", "Zapoteca", ["Zapoteco"], None),
+    ]
+    # Anything the user added to glossary.txt that is not already covered above.
+    covered = {term.lower() for term, _c, _v, _b in known}
+    for term, target_term in sorted(user_glossary.items()):
+        if term.lower() not in covered:
+            known.append((term, target_term, [], None))
+
+    for term, canonical, variants, block in known:
+        ok, found = _audit_term_consistency(pairs, term, canonical, variants, block)
+        total_wrong = sum(len(v) for v in found.values())
+        if not ok and not total_wrong:
+            continue
+        status = "✅" if not total_wrong else "⚠️ "
+        detail = ", ".join(f"{name}: {len(items)}" for name, items in sorted(found.items()))
+        print(f"  {status} {term:<12} {canonical!r}: {ok} ok" + (f" | {detail}" if detail else ""))
+        for name, items in sorted(found.items()):
+            for src, tgt in items[:2]:
+                print(f"        EN: {src[:78]}")
+                print(f"        ES: {tgt[:78]}")
+            flagged.extend(src for src, _ in items)
+
+    # --- 2) Strings that shipped in the source language ---------------------------------
+    print("\n2. UNTRANSLATED (shipped in English)")
+    untranslated = [
+        (src, tgt) for src, tgt in pairs
+        if src.strip() == tgt.strip()
+        and _has_translatable_text(src)
+        and len(re.findall(r"[A-Za-z]{3,}", src)) >= 5
+    ]
+    print(f"  {len(untranslated)} string(s) with 5+ real words are identical to the English.")
+    for src, _tgt in untranslated[:5]:
+        print(f"        {src[:78]}")
+    flagged.extend(src for src, _ in untranslated)
+
+    # --- 3) Peninsular forms and register (report only, never rewritten) ----------------
+    print("\n3. PENINSULAR FORMS (reported, never auto-rewritten — see normalize_latam_spanish)")
+    peninsular = re.compile(
+        r"\b(vosotros|vuestr[oa]s?|sois|ten[ée]is|pod[ée]is|hab[ée]is|est[áa]is|quer[ée]is"
+        r"|deb[ée]is|patatas?|ordenador(?:es)?|zumos?)\b", re.IGNORECASE)
+    hits = [(src, tgt) for src, tgt in pairs if peninsular.search(tgt)]
+    print(f"  {len(hits)} string(s).")
+    for src, tgt in hits[:5]:
+        print(f"        {tgt[:78]}")
+    flagged.extend(src for src, _ in hits)
+
+    tu_re = re.compile(r"\b(debes|puedes|tienes|tus|haz|eres|quieres|selecciona|presiona)\b", re.I)
+    usted_re = re.compile(r"\b(usted|debe |puede |tiene |haga|seleccione|presione|elija)\b", re.I)
+    print(f"  register: {sum(1 for _s, t in pairs if tu_re.search(t))} tú / "
+          f"{sum(1 for _s, t in pairs if usted_re.search(t))} usted")
+
+    # --- 4) Missing opening punctuation --------------------------------------------------
+    print("\n4. PUNCTUATION")
+    punct = [(src, tgt) for src, tgt in pairs
+             if normalize_latam_spanish(src, tgt, args.target) != tgt]
+    print(f"  {len(punct)} string(s) would be fixed by the LatAm gate (¡/¿ and UI imperatives).")
+    for _src, tgt in punct[:5]:
+        print(f"        {tgt[:78]}")
+
+    # --- 5) Markup integrity -------------------------------------------------------------
+    print("\n5. MARKUP (<color> tags)")
+    print("   The coloured word names the unit type a description is about, so a lost tag")
+    print("   costs the player the 'strong against' cue. Cannot be repaired automatically.")
+    broken_markup = [(src, tgt) for src, tgt in pairs if not markup_integrity_ok(src, tgt)]
+    empty_pairs = [(s, t) for s, t in broken_markup if EMPTY_COLOR_RE.search(t)]
+    print(f"  {len(broken_markup)} string(s) with broken markup "
+          f"({len(empty_pairs)} of them left an empty tag pair).")
+    for src, tgt in broken_markup[:5]:
+        print(f"        EN: {src[:78]}")
+        print(f"        ES: {tgt[:78]}")
+    flagged.extend(src for src, _ in broken_markup)
+
+    # --- 6) Misaligned strings -----------------------------------------------------------
+    print("\n6. MISALIGNED (the Spanish belongs to a different string)")
+    misaligned = _audit_misaligned(pairs)
+    print(f"  {len(misaligned)} string(s) where the Spanish is not a translation of this English.")
+    if misaligned:
+        print("   Cause: a cache rebuilt by POSITION instead of by _locID, so a block shifted and")
+        print("   names landed in description slots. The CACHE holds the same wrong pairing, so")
+        print("   re-running alone will not fix it -- you must --purge-audited first, then")
+        print("   re-translate. Building a cache with --build-cache-from prevents it happening again.")
+    for src, tgt in misaligned[:8]:
+        print(f"        EN: {_audit_strip_all(src)[:78]}")
+        print(f"        ES: {_audit_strip_all(tgt)[:78]}")
+    flagged.extend(src for src, _ in misaligned)
+
+    # --- 7) Discovery (noisy on purpose) -------------------------------------------------
+    print("\n7. CANDIDATES TO REVIEW — auto-detected, NOISY")
+    print("   Terms not in any glossary whose rendering varies. Expect false positives from")
+    print("   casing, inflection and proper nouns. Add the real ones to glossary.txt.")
+    for label, canonical, ok, diverging in _audit_discover_candidates(pairs):
+        print(f"  · {label!r} → {canonical!r}: {ok} consistent, {diverging} diverging")
+
+    print("\n" + "=" * 72)
+    print(f"Total strings flagged for re-translation: {len(set(flagged))}")
+    if args.purge_audited or args.repair_from:
+        terms, regex, exclude = _normalize_protection(
+            args.protect, compile_regex_list(args.protect_regex), args.acronym_exclude)
+
+        def _key(text: str) -> str:
+            key, _tok, _phr = protect_for_cache(text, terms, regex, exclude)
+            return key
+
+        # --purge-audited names the cache being fixed; --repair-from is only a read-only donor.
+        cache_path: Path = args.purge_audited
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"Could not read cache {cache_path}: {exc}")
+
+        current = {src: tgt for src, tgt in pairs}
+        repaired = 0
+        # Keys just repaired must be exempt from the purge below: they are already correct, and
+        # the post-process has nothing to change in them, so the purge loop would delete them.
+        repaired_keys: set[str] = set()
+
+        # --- Repair first: purging first would delete what we are about to fix. ------------
+        # Only STRUCTURALLY broken strings are repaired (see _structurally_broken): the slot
+        # holds another string's text, a <color> pair was lost, or it is still in the source
+        # language. Wording problems -- terminology, register, punctuation -- are NOT repaired:
+        # there the audited cache is the newer and better translation, and reaching back to an
+        # older one would undo recent work.
+        by_kind: "collections.Counter[str]" = collections.Counter()
+        if args.repair_from:
+            try:
+                trusted = json.loads(args.repair_from.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise SystemExit(f"Could not read trusted cache {args.repair_from}: {exc}")
+            for src, tgt in pairs:
+                if not _structurally_broken(src, tgt):
+                    continue
+                good = trusted.get(_key(src))
+                if not good or not good.strip() or good.strip() == (tgt or "").strip():
+                    continue
+                # The donor is not infallible either: the July cache stores a bare
+                # "__PROTECT_0__" as one "translation". Take a value only if it fixes the defect
+                # and introduces none of its own.
+                if not placeholders_compatible(src, good):
+                    continue
+                if not _has_translatable_text(good):
+                    continue
+                if _structurally_broken(src, good):
+                    continue
+                if has_english_residue(src, good, args.target):
+                    continue
+                if _audit_misaligned([(src, tgt)]):
+                    by_kind["misaligned"] += 1
+                elif not markup_integrity_ok(src, tgt):
+                    by_kind["markup"] += 1
+                else:
+                    by_kind["still in source language"] += 1
+                cache[_key(src)] = good
+                current[src] = good
+                repaired_keys.add(_key(src))
+                repaired += 1
+            detail = ", ".join(f"{n} {k}" for k, n in sorted(by_kind.items())) or "none"
+            print(f"\n🔧 Repaired {repaired} entry(ies) from {args.repair_from.name} ({detail}).")
+
+        # --- Then purge, but only what is not already fixed for free ----------------------
+        removed = free = 0
+        if args.purge_audited:
+            for src in set(flagged):
+                key = _key(src)
+                if key not in cache or key in repaired_keys:
+                    continue
+                tgt = current.get(src)
+                if tgt is not None:
+                    fixed = apply_postprocess_overrides(src, tgt, args.target)
+                    fixed = apply_user_glossary_fixes(src, fixed, user_glossary)
+                    fixed = normalize_latam_spanish(src, fixed, args.target)
+                    if fixed != tgt:
+                        # The deterministic post-process already repairs this one on export;
+                        # purging it would throw away a good translation and pay for it again.
+                        free += 1
+                        continue
+                del cache[key]
+                removed += 1
+            _write_cache_atomic(cache_path, cache)
+            print(f"🧹 Purged {removed} entry(ies) from {cache_path.name}; "
+                  f"kept {free} that the post-process already fixes for free.")
+
+        if repaired or removed:
+            print("   Next: re-export with --cache-only to apply the free fixes, then run a "
+                  "normal translation to redo the purged strings.")
+    elif flagged:
+        print("Use --purge-audited CACHE.json to drop these from the cache and re-translate them,")
+        print("and --repair-from GOOD_CACHE.json to recover structurally broken ones without the API.")
+
+
+def run_build_cache_cli(
+    args: argparse.Namespace,
+    skip_rules: SkipRules,
+    protected_terms: Sequence[str],
+    protected_regex: Sequence["re.Pattern[str]"],
+    acronym_exclude: Sequence[str],
+) -> None:
+    """Handle --build-cache-from: pair a source XML with its translation and write the cache.
+
+    Never touches the API. The protection settings are threaded through so the keys match the
+    ones translate_strings would read for the same run.
+    """
+    source_path: Path = args.input
+    translated_path: Path = args.build_cache_from
+    cache_path: Path = args.cache_file
+
+    for path, label in ((source_path, "source"), (translated_path, "translated")):
+        if not path.exists():
+            raise SystemExit(f"File does not exist ({label}): {path}")
+
+    def _load(path: Path) -> List[TranslationTarget]:
+        tree, _fmt = parse_strings_xml(path)
+        return [t for t in iter_translatable_elements(tree.getroot(), skip_rules) if not t.skip]
+
+    source_targets = _load(source_path)
+    translated_targets = _load(translated_path)
+    print(f"📄 {source_path.name}: {len(source_targets)} translatable string(s)")
+    print(f"📄 {translated_path.name}: {len(translated_targets)} translatable string(s)")
+
+    existing: Dict[str, str] = {}
+    if cache_path.exists():
+        try:
+            loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+                print(f"💾 Merging into existing cache: {len(existing)} entry(ies)")
+        except (OSError, json.JSONDecodeError) as exc:
+            logging.warning("Could not read existing cache %s: %s", cache_path, exc)
+
+    cache, stats = build_cache_from_translation(
+        source_targets,
+        translated_targets,
+        protected_terms=protected_terms,
+        protected_regex=protected_regex,
+        acronym_exclude=acronym_exclude,
+        target_lang=args.target,
+        existing_cache=existing,
+    )
+
+    _write_cache_atomic(cache_path, cache)
+    print(
+        f"✅ Cache written to {cache_path} ({len(cache)} total entry(ies); "
+        f"{stats.written} from this pair)."
+    )
+    print(
+        f"   reused: {stats.seeded_reused} | kept identical: {stats.seeded_identical} | "
+        f"skipped untranslated: {stats.skipped_english} | "
+        f"skipped placeholder mismatch: {stats.skipped_placeholder} | "
+        f"unmatched: {stats.skipped_unmatched}"
+    )
 
 
 def main() -> None:
@@ -2473,10 +4098,15 @@ def main() -> None:
         self_test_source_casing()
         self_test_glossary()
         self_test_user_glossary()
+        self_test_latam_spanish()
+        self_test_markup_integrity()
+        self_test_misalignment()
+        self_test_repair_from()
         return
     if args.self_test_merge:
         self_test_merge()
         self_test_cache_key_parity()
+        self_test_build_cache()
         return
     skip_rules = build_skip_rules(args)
     protected_terms = list(DEFAULT_PROTECTED_TERMS)
@@ -2486,6 +4116,18 @@ def main() -> None:
     acronym_exclude = list(DEFAULT_ACRONYM_EXCLUDE)
     if args.acronym_exclude:
         acronym_exclude.extend([t.strip() for t in args.acronym_exclude if t and t.strip()])
+
+    if args.build_cache_from is not None:
+        run_build_cache_cli(args, skip_rules, protected_terms, protected_regex, acronym_exclude)
+        return
+
+    if args.audit_spanish is not None:
+        audit_glossary_path = args.glossary_file
+        if audit_glossary_path is None:
+            default_glossary = Path(__file__).with_name("glossary.txt")
+            audit_glossary_path = default_glossary if default_glossary.exists() else None
+        run_audit_spanish_cli(args, skip_rules, load_user_glossary(audit_glossary_path))
+        return
 
     glossary_path = args.glossary_file
     if glossary_path is None:
@@ -2640,6 +4282,8 @@ def main() -> None:
             max_budget_bytes=args.max_budget_bytes,
             compact_prompt=args.compact_prompt,
             prompt_config=DEFAULT_PROMPT_CONFIG,
+            temperature=args.temperature,
+            seed=args.seed,
             progress_callback=progress_callback,
             protected_terms=protected_terms,
             protected_regex=protected_regex,
@@ -2672,6 +4316,13 @@ def main() -> None:
         ]
         if _pending > 0:
             summary.append(f"  ⚠️  Pending        : {_pending} (not yet translated)")
+        # These used to happen silently: the string ships in the SOURCE language.
+        if stats.quality_rejected:
+            summary.append(f"  ⚠️  Quality-rejected: {stats.quality_rejected} (left in source language)")
+        if stats.batch_failed:
+            summary.append(f"  ⚠️  Batch failures  : {stats.batch_failed} (left in source language)")
+        if stats.markup_rejected:
+            summary.append(f"  ⚠️  Markup broken   : {stats.markup_rejected} (<color> tags lost; see --audit-spanish)")
         print("\n".join(summary))
 
         # Loud warning if the job finished with untranslated material.

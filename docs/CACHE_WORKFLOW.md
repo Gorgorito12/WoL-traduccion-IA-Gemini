@@ -87,17 +87,28 @@ If you have:
 You can recreate/populate a cache file with:
 
 ```bat
-python translate_gemini.py "stringtabley.xml" "stringtabley_es_latam.xml" --cache-file "wol_es.cache.json" --cache-only
+python translate_gemini.py "stringtabley.xml" --build-cache-from "stringtabley_es_latam.xml" --cache-file "wol_es.cache.json"
 ```
 
 Important notes:
 
-- You must provide **both** source and translated output so the script can pair strings.
-- If the translated file is from a different version (different counts/order), rebuild may not be possible or may be partial.
+- You must provide **both** files: the cache key is the *source* string, so the translated file
+  alone cannot tell you which English string a translation came from.
+- Pairing is by the stable `_locID` attribute, so reordering and count mismatches are fine.
+- Pass the same `--protect` / `--protect-regex` / `--target` you translate with, or the keys
+  will not match the ones the engine reads.
+- Strings whose translation equals the source are kept when they are proper nouns or pure
+  markup (*Yamabushi*, `<color=…>`) and refused when they are genuinely untranslated English
+  (*The Asian Dynasties*) — the latter would poison the cache. On the WoL Spanish table this
+  keeps roughly 7% of the corpus that would otherwise be re-sent to Gemini.
+- An existing cache at `--cache-file` is merged into, not overwritten.
 
-> **Preferred method:** the GUI's Compare tab has a **“Generar caché (sin API)…”** button that
-> rebuilds the cache by pairing the two XMLs on the stable `_locID` attribute instead of by
-> position — it tolerates reordering and count mismatches, which the CLI method above does not.
+> **In the GUI:** the **Generar… / Generate…** button next to the *Cache file* field on the
+> Translator tab, or **“Generar caché (sin API)…”** on the Compare tab. Both run the same engine
+> function as the CLI.
+>
+> The legacy `--cache-only` rebuild (passing the translated XML as the `output` positional)
+> pairs **by position** and discards everything on a count mismatch. Prefer the command above.
 
 ---
 

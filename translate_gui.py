@@ -400,6 +400,9 @@ TR = {
         "status_building": "Generando caché…",
         "status_build_done": "Caché generada ✔",
         "log_build_summary": "💾 Caché generada: {n} entradas escritas (0 API).",
+        "log_left_in_source": "  ⚠️  Sin traducir (quedaron en el idioma de origen): {q} por control de calidad, {b} por fallo de lote.",
+        "log_build_detail": "   reutilizadas: {reused} | idénticas conservadas: {ident} | omitidas sin traducir: {eng} | omitidas por placeholder: {ph} | sin pareja: {un}",
+        "btn_build_cache_short": "Generar…",
         "mb_build_done_title": "Caché generada",
         "mb_build_done_msg": "Se escribieron {n} entradas en:\n{path}\n\n(sin usar Gemini)",
         "mb_build_err": "No se pudo generar la caché:\n{exc}",
@@ -415,6 +418,7 @@ TR = {
         "tip_output_folder": "Carpeta donde se escriben los XML traducidos (como <nombre>_translated.xml). Vacío = junto al original.",
         "tip_cache_file": "Archivo de caché a usar (origen→destino). Reutiliza traducciones y ahorra API. Usa UN caché por par de idiomas. Vacío = uno automático por archivo y par.",
         "tip_cache_auto": "Volver al caché automático (<salida>.cache.json, separado por par de idiomas).",
+        "tip_build_cache_short": "Genera el archivo de caché a partir de un XML ya traducido, SIN usar Gemini: elige el XML original y su XML traducido; se emparejan por _locID.",
         "tip_source_lang": "Idioma original del XML de entrada (ej. inglés, chino, japonés).",
         "tip_target_lang": "Idioma al que se traduce el texto (ej. español latino). Distinto del idioma de la interfaz.",
         "tip_api_key": "Tu clave de Google Gemini. Solo se necesita para cadenas que NO estén en el caché. No se guarda en disco.",
@@ -616,6 +620,9 @@ TR = {
         "status_building": "Building cache…",
         "status_build_done": "Cache built ✔",
         "log_build_summary": "💾 Cache built: {n} entries written (0 API).",
+        "log_left_in_source": "  ⚠️  Untranslated (left in the source language): {q} quality-rejected, {b} batch failures.",
+        "log_build_detail": "   reused: {reused} | kept identical: {ident} | skipped untranslated: {eng} | skipped placeholder: {ph} | unmatched: {un}",
+        "btn_build_cache_short": "Generate…",
         "mb_build_done_title": "Cache built",
         "mb_build_done_msg": "Wrote {n} entries to:\n{path}\n\n(no Gemini used)",
         "mb_build_err": "Could not build the cache:\n{exc}",
@@ -631,6 +638,7 @@ TR = {
         "tip_output_folder": "Folder where translated XML is written (as <name>_translated.xml). Empty = next to the original.",
         "tip_cache_file": "Cache file to use (source→target). Reuses translations and saves API. Use ONE cache per language pair. Empty = one automatic per file and pair.",
         "tip_cache_auto": "Revert to the automatic cache (<output>.cache.json, split per language pair).",
+        "tip_build_cache_short": "Build the cache file from an already-translated XML WITHOUT Gemini: pick the original XML and its translated XML; they are paired by _locID.",
         "tip_source_lang": "The original language of the input XML (e.g. English, Chinese, Japanese).",
         "tip_target_lang": "The language the text is translated into (e.g. Latin American Spanish). Separate from the UI language.",
         "tip_api_key": "Your Google Gemini key. Needed only for strings NOT in the cache. Not saved to disk.",
@@ -1017,6 +1025,9 @@ class TranslatorGUI:
         ttk.Button(cache_buttons, text=self.t("btn_browse"), command=self._browse_cache).pack(side="left")
         _b = ttk.Button(cache_buttons, text=self.t("btn_auto"), command=lambda: self.cache_file_path.set(""))
         _b.pack(side="left", padx=(4, 0)); self._tip(_b, "tip_cache_auto")
+        # Same handler as the Compare tab's button: this is just where users look for it.
+        _b = ttk.Button(cache_buttons, text=self.t("btn_build_cache_short"), command=self._on_build_cache)
+        _b.pack(side="left", padx=(4, 0)); self._tip(_b, "tip_build_cache_short")
 
         ttk.Label(io_frame, text=self.t("hint_auto_paths"),
                   style="Muted.TLabel").grid(row=2, column=1, sticky="w", padx=8)
@@ -1959,9 +1970,12 @@ class TranslatorGUI:
         es = filedialog.askopenfilename(title=self.t("title_build_pick_es"), filetypes=xml_types)
         if not es:
             return
+        # Prefer the Cache file field, so the button fills the cache this tab will actually use.
+        configured = (self.cache_file_path.get() or "").strip()
         out = filedialog.asksaveasfilename(
             title=self.t("title_build_save"), defaultextension=".json",
-            initialfile=Path(es).stem + ".cache.json",
+            initialdir=str(Path(configured).parent) if configured else None,
+            initialfile=Path(configured).name if configured else Path(es).stem + ".cache.json",
             filetypes=[(self.t("ft_json"), "*.json")])
         if not out:
             return
@@ -2001,26 +2015,30 @@ class TranslatorGUI:
                            if not t.skip]
             es_targets = [t for t in tg.iter_translatable_elements(es_tree.getroot(), skip_rules)
                           if not t.skip]
-            # new == old_source == English, so every entry is "unchanged"; the seed is the
-            # reusable Spanish (with the same placeholder / not-still-English safety guards).
-            report = tg.merge_by_locid(eng_targets, eng_targets, es_targets)
 
             out = Path(out_path)
-            cache = {}
+            existing = {}
             if out.exists():
                 try:
-                    cache = json.loads(out.read_text(encoding="utf-8"))
+                    loaded = json.loads(out.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        existing = loaded
                 except Exception:
-                    cache = {}
-            written = 0
-            custom_regex = self._custom_protected_regex()
-            for entry in report.entries:
-                if entry.seed:
-                    cache[tg.protected_cache_key(
-                        entry.new_source, protected_regex=custom_regex)] = entry.seed
-                    written += 1
+                    existing = {}
+            # The seeding policy (including keeping proper nouns whose translation equals the
+            # source) lives in the engine, so the CLI and both tabs agree.
+            cache, stats = tg.build_cache_from_translation(
+                eng_targets, es_targets,
+                protected_regex=self._custom_protected_regex(),
+                target_lang=self.target_lang.get(),
+                existing_cache=existing,
+            )
+            written = stats.written
             tg._write_cache_atomic(out, cache)
             print(self.t("log_build_summary", n=written), flush=True)
+            print(self.t("log_build_detail", reused=stats.seeded_reused,
+                         ident=stats.seeded_identical, eng=stats.skipped_english,
+                         ph=stats.skipped_placeholder, un=stats.skipped_unmatched), flush=True)
 
             def _finish() -> None:
                 self._set_run_buttons(running=False)
@@ -2029,6 +2047,8 @@ class TranslatorGUI:
                     self.cmp_counts_label.configure(text=self.t("log_build_summary", n=written))
                 self.last_output_path = out
                 self.open_folder_button.configure(state="normal")
+                # So the next Translate/Cache-only run uses the cache just generated.
+                self.cache_file_path.set(str(out))
                 messagebox.showinfo(self.t("mb_build_done_title"),
                                     self.t("mb_build_done_msg", n=written, path=out))
             self.root.after(0, _finish)
@@ -2243,6 +2263,11 @@ class TranslatorGUI:
                       f"API: {stats.api_translated} | Skipped: {stats.cache_empty_skipped}", flush=True)
                 if pending > 0:
                     print(f"  ⚠️  Pending: {pending}", flush=True)
+                    had_warnings = True
+                if stats.quality_rejected or stats.batch_failed:
+                    # Surfaced explicitly: these strings ship in the source language.
+                    print(self.t("log_left_in_source", q=stats.quality_rejected,
+                                 b=stats.batch_failed), flush=True)
                     had_warnings = True
                 if stats.cache_empty_skipped > 0:
                     had_warnings = True

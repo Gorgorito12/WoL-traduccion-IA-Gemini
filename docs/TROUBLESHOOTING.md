@@ -210,3 +210,110 @@ When reporting an issue, include:
 - Python version
 - Error output snippet
 - Whether `--cache-only` succeeds on the same files
+
+---
+
+## 10) Strings shipped in English instead of Spanish
+
+**Symptom.** Some strings appear in English in the game even though the run reported no errors.
+
+**Cause.** The English-residue quality gate rejected the translation, so the engine kept the
+source string rather than emit something it judged broken. Historically the gate's word list was
+too broad: any Spanish sentence mentioning "Age of Empires III" tripped on its `of`, and words
+that are ordinary Spanish ("original", "versión") counted as English. 144 strings shipped in
+English for that reason alone.
+
+**Fix.** Both the protected-terms list and the stopword list were narrowed. If it still happens:
+
+* The run summary now prints `Quality-rejected` and `Batch failures` counters — these are the
+  strings that stayed in the source language. They used to be invisible.
+* Find them with `--audit-spanish` (section 2, "UNTRANSLATED").
+* Add any product/proper name the gate keeps tripping on via `--protect "Some Name"`, then
+  `--purge-audited` the cache and re-run. Protecting a term changes its cache key, so those
+  strings are translated once more.
+
+---
+
+## 11) The same English term is translated inconsistently
+
+**Symptom.** One term appears as two or three different Spanish words, sometimes on the same
+screen (`Deck` → "Mazo" and "baraja"; `Allotment` → "Parcela", "Reparto" and "Asignación").
+
+**Cause.** Batches are translated in parallel and independently, so nothing made two batches
+agree; the model also sampled at temperature 1.0 by default.
+
+**Fix.**
+
+1. `--temperature 0.2` (now the default) sharply reduces the variance.
+2. Run `--audit-spanish` to list every term whose rendering varies.
+3. Add the term to `glossary.txt` (`Allotment = Asignación`). The rule is injected into the
+   prompt only for batches containing the term, and a term the model leaves untranslated is
+   replaced deterministically.
+4. `--purge-audited CACHE.json` to drop the affected strings, then re-run. A glossary entry
+   cannot rewrite a wrong-but-translated synonym, so already-cached wording needs a re-translation.
+
+---
+
+## 12) The colour disappears from unit descriptions
+
+**Symptom.** A unit description that is coloured in English comes out plain in Spanish, or shows
+an empty gap where the coloured word should be.
+
+**Cause.** The coloured word is the counter keyword — it tells the player what the unit is strong
+against. Spanish reorders adjective and noun ("Nepalese skirmisher" → "Hostigador nepalí"), and
+the model moves the word out of its `<color=...>` tag, leaving the pair empty or dropping it.
+
+**Fix.** The engine now detects this (`markup_integrity_ok`) and retries with a stricter prompt,
+and sends a preventive markup rule for any batch containing tags. For strings already translated:
+
+1. `--audit-spanish` lists them in section 5, separating the empty-tag cases.
+2. `--purge-audited CACHE.json` drops them, then re-run the translation.
+
+It cannot be repaired automatically: once the sentence is reordered there is no way to know where
+the word went, so the string has to be translated again.
+
+---
+
+## 13) The same unit has several different names
+
+**Symptom.** A card, a unit and an upgrade that are the same thing in English read as three
+different things in Spanish.
+
+**Cause.** Independent parallel batches plus a mod-specific term nobody pinned down. `Allotment`
+shipped as *Parcela*, *Reparto* and *Asignación* at once; `Boneguard` had five names.
+
+**Fix.** Add the term to `glossary.txt`. **Read the full English string first** — `Allotment`
+looked like a plot of land, but the English says it "musters" and "contains units", so it is a
+block of troops (*Contingente*). Then `--audit-spanish` to find the affected strings and
+`--purge-audited` to re-translate them.
+
+---
+
+## 14) A string shows a completely different text
+
+**Symptom.** A building's tooltip shows its *name* where the description should be (or the
+reverse). The Spanish is well written — it just belongs to a different string.
+
+**Cause.** A cache rebuilt **by position** instead of by `_locID`. If the English and translated
+XML ever differed by one element, every entry after that point shifted by one, and the wrong
+translation was stored under each key. The XML and the cache then hold the same wrong pairing.
+
+**Why re-running does not fix it.** The cache is poisoned, so the engine finds a "hit" and writes
+the same wrong text again. It also means the cache cannot be used to detect the problem: it agrees
+with the error.
+
+**Fix.**
+
+1. `--audit-spanish` reports them in section 6. It checks both directions, because these come in
+   swapped pairs and fixing only one half leaves the other wrong.
+2. `--repair-from GOOD_CACHE.json` recovers them from an older cache that predates the damage —
+   free, and better than re-translating, because the old text was already correct. It covers all
+   three *structural* defects (wrong slot, lost markup, still in the source language) but never
+   terminology, so it cannot undo newer wording. It refuses a donor value that drops a
+   placeholder, has no real text, or is broken itself.
+3. `--purge-audited CACHE.json` drops whatever could not be repaired, then re-run the translation.
+4. Build future caches with `--build-cache-from`, which pairs by `_locID` and cannot shift.
+
+**Watch for the worst variant: shifted numbers.** The same damage between two short labels shows
+up as `8 Riflemen` → `6 Fusileros` — the card promises one number of units and the game shows
+another. The audit checks for this separately, since the length rule cannot see it.

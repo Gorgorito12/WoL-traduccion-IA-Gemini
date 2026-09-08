@@ -31,10 +31,11 @@ REM sibling pythonw.exe. Every failure path prints a message and pauses.
 python translate_gui.py
 ```
 
-There is no build, lint, or external test framework. "Tests" = the six `self_test_*` functions in
-`translate_gemini.py`: `--self-test-quality-gate` runs four (quality gate, source casing, glossary,
-user glossary) and `--self-test-merge` runs two (merge by `_locID`, cache-key parity). Both flags
-work without the `input output` positionals. The API key falls back to the
+There is no build, lint, or external test framework. "Tests" = the eleven `self_test_*` functions
+in `translate_gemini.py`: `--self-test-quality-gate` runs eight (quality gate, source casing,
+glossary, user glossary, LatAm Spanish, markup integrity, misalignment, repair-from) and
+`--self-test-merge` runs three (merge by `_locID`, cache-key parity, build-cache). Both flags work
+without the `input output` positionals. The API key falls back to the
 `GEMINI_API_KEY` / `GOOGLE_API_KEY` env vars.
 
 ## Architecture
@@ -77,6 +78,44 @@ when touching them.
    adding a term is one entry. `output_fixes` run only when the entry's `source_trigger` matches the
    English original, and are anchored to whole phrases (e.g. `(Era|Edad) Nacional`→`Edad Nacional`) —
    never a bare `Era`→`Edad`, since `Era` is also the verb *was*. Guarded by `self_test_glossary`.
+
+   `GlossaryEntry` also has an optional **`source_block`**: when it matches the English original the
+   whole entry is skipped. It is load-bearing, not a nicety — *"Crates of 500 food and Chests of 500
+   coin"* correctly yields both *Cajas* and *Cofres*, `Steel Decks` really is *Cubiertas de Acero*,
+   and `Aldeano` is legitimate when the source mentions `Villager` alongside `Settler`.
+
+   **Some entries carry a `prompt_hint` but an EMPTY `output_fixes` on purpose** (`crate`,
+   `outpost`, `deck`). Those terms change grammatical gender (`Baraja` f → `Mazo` m), so a regex
+   swap leaves a broken article and adjective behind (*"Crear una Mazo nueva"*). Gemini conjugates
+   correctly, so the rule is preventive only; strings already wrong are found by `--audit-spanish`
+   and re-translated after `--purge-audited`. **Do not "helpfully" add `output_fixes` to them.**
+
+   **`normalize_latam_spanish`** runs at both postprocess points, gated by `target_is_spanish()`.
+   Scope is deliberately tiny: a closed list of UI imperatives moved to *tú* (`Presione`→`Presiona`)
+   and the missing opening `¡`/`¿`. Peninsular `vosotros` forms are **reported, never rewritten** —
+   the real strings carry enclitics (`Atacadnos`, `ponedlos`) and irregulars (`sabed`, `Despertad`)
+   that a table cannot conjugate, and the obvious markers are landmines: `sed` is the noun *thirst*,
+   `os` appears as a **Portuguese** article in a deliberately Portuguese line, and `id` occurs in
+   *"ID de Passport"*. `self_test_latam_spanish` pins every one of those negatives.
+
+   **`markup_integrity_ok`** is the one gate that is NOT language-gated: `<color=...>` markup is
+   identical in every target. In this game the coloured word is the *counter keyword* (what a unit
+   is strong against), so losing it loses information, not styling. Spanish reorders adjective and
+   noun ("Nepalese skirmisher" → "Hostigador nepalí") and the model routinely leaves the pair empty
+   or drops it — 61 strings in the shipped translation. It only **detects**: once the sentence is
+   reordered a regex cannot know where the word went, so `translate_batch_with_retry` retries with
+   `STRICT_MARKUP_RULES` exactly the way the residue gate retries, and `MARKUP_PROMPT_RULE` is sent
+   up front (only for batches that actually contain markup) to prevent it. Strings that survive all
+   retries are kept — a broken tag still beats an untranslated string — but counted in
+   `TranslationStats.markup_rejected` and listed by `--audit-spanish`. Guarded by
+   `self_test_markup_integrity`.
+
+   **`has_english_residue` fails INTO the source language**: a flagged string is not written and not
+   cached, so the English ships. Its stopword list must therefore stay narrow — `original` and
+   `versión` are ordinary Spanish, and `of` inside the game title made 144 correct translations ship
+   in English until `"Age of Empires III"` (not just the full mod title) was added to
+   `DEFAULT_PROTECTED_TERMS`. `TranslationStats.quality_rejected` / `.batch_failed` now count these
+   so they stop being silent.
 
    **User glossary (pair-agnostic, NOT Spanish-gated).** `glossary.txt` next to the script (or CLI
    `--glossary-file`): `source term = target term` lines, `#` comments. Loaded by
@@ -201,16 +240,33 @@ combobox to the detected language). Deliberately conservative and failure-proof:
 guesses and detector exceptions never block a run. Translator tab only — the CLI and the Compare
 tab are untouched.
 
-**Build cache (no API).** The **Compare tab's** "Generar caché (sin API)…" button (`_on_build_cache`
-/ `_run_build_cache`) pairs an English XML with its already-translated XML and writes the
-English→Spanish cache — `merge_by_locid(eng, eng, es)` (every entry "unchanged", so `seed` = the
-reusable Spanish, reusing the placeholder / not-still-English guards) then
-`cache[protected_cache_key(eng)] = seed`. No Gemini. This is the robust, by-`_locID` replacement for
-the fragile index-based rebuild on this tab (which needs English-in + matching translated-output and
-silently discards everything on a length mismatch). Note: `_normalize_protection` now always
-prepends `DEFAULT_PROTECTED_TERMS`, so `protected_cache_key()` (used by the builder and the compare
-tab) yields the same key `translate_strings` consumes — Translator/CLI keys are unchanged
-(`protect_phrases` is idempotent).
+**Build cache (no API).** Building a cache from an already-translated XML lives in ONE engine
+function, `build_cache_from_translation(source_targets, translated_targets, ...)`, with three
+callers: the CLI flag `--build-cache-from` (via `run_build_cache_cli`), the **Translator tab's**
+"Generar…" button next to the *Cache file* field, and the **Compare tab's** "Generar caché (sin
+API)…" button — the last two share `_on_build_cache` / `_run_build_cache`, which is now a thin
+wrapper. No Gemini. It pairs by `_locID` through `merge_by_locid(src, src, translated)` (every
+entry compares "unchanged", so `seed` = the reusable translation) and writes
+`cache[protected_cache_key(src)] = value`.
+
+**It deliberately does NOT reuse `merge_by_locid`'s seeding policy wholesale.** That policy serves
+version updates, where a translation equal to its source means "still needs translating"
+(`old-equals-source`, never seeded). When *building* a cache the same input usually means a proper
+noun that legitimately survives translation, so `_identical_translation_is_safe` re-decides those:
+keep it if `_has_translatable_text` is false (pure markup), else — for a Spanish target only — keep
+it unless `has_english_residue` says it is real untranslated English. For non-Spanish targets there
+is no such detector, so it falls back to the conservative markup-only rule. On the real WoL Spanish
+table this recovers ~7% of the corpus (≈3.2k proper nouns) that the old seed-only loop dropped and
+that would otherwise be re-sent to Gemini. **Do not "fix" this by changing `_classify_merge_entry`**
+— that would break the version-update flow and `self_test_merge`. Guarded by
+`self_test_build_cache`; returns a `BuildCacheStats` (reused / kept-identical / skipped-English /
+skipped-placeholder / unmatched) that both the CLI and the GUI print.
+
+Note: `_normalize_protection` always prepends `DEFAULT_PROTECTED_TERMS`, so `protected_cache_key()`
+(used by the builder and the compare tab) yields the same key `translate_strings` consumes —
+Translator/CLI keys are unchanged (`protect_phrases` is idempotent). The legacy index-based rebuild
+(English-in + matching translated-output, `--cache-only`) still exists but pairs by position and
+silently discards everything on a length mismatch.
 
 **Hover tooltips.** Every control in both tabs has a `Tooltip` (a hover `Toplevel`) attached via
 `self._tip(widget, key)`, where the text is `lambda: self.t(key)` so it follows the language. Tooltip
@@ -239,10 +295,70 @@ retries, token protection, XML I/O) is provider-agnostic. Adding another backend
 OpenAI-compatible provider) means adding a parallel pair of functions and a `--provider` switch,
 not touching the pipeline.
 
+`translate_batch_gemini` also pins **`temperature=DEFAULT_TEMPERATURE` (0.2) and
+`seed=DEFAULT_SEED`** (CLI `--temperature`/`--seed`). This is not a micro-optimization: batches run
+in 8 parallel threads with no shared state, so the prompt's "translate identical strings
+identically" is unenforceable and the SDK's default temperature of 1.0 made one term come out two
+ways *on the same screen* (`deck` → both "mazo" and "baraja"). `seed` is added in its own
+try/except because not every `google-genai` release accepts it.
+
 `translate_batch_gemini` sets `thinking_config=ThinkingConfig(thinking_budget=0)`: 2.5 Flash's
 default *dynamic thinking* bills its hidden reasoning tokens at the output price and adds nothing
 to mechanical translation — do not remove this without a reason (it silently multiplies cost). The
 config is built in a try/except so older `google-genai` SDKs without `ThinkingConfig` still work.
+
+### Auditing (`--audit-spanish`)
+
+`run_audit_spanish_cli` takes the XML **pair** (source as `input`, translation as the flag value),
+never a lone cache file — most checks must be triggered by the English, or "Tarjeta de Navidad"
+(correct for *Christmas Card*) gets flagged and "Cofre" next to *Chest* gets missed. It reports
+glossary terminology, strings that shipped untranslated, peninsular forms and tú/usted balance,
+punctuation, and finally `_audit_discover_candidates` — a heuristic sweep for terms in **no**
+glossary yet. That last section is noisy by construction (casing, inflection, proper nouns), so it
+is printed separately and labelled as candidates; never merge it into the precise section.
+`--purge-audited CACHE.json` drops the flagged strings from a cache so the next run redoes them —
+the escape hatch for terminology that cannot be fixed by regex.
+
+`_audit_misaligned` catches a different failure: strings whose Spanish is **not a translation of
+their English at all**, because a cache was once rebuilt **by position** instead of by `_locID` and
+a whole block shifted, putting a building's name in its description's slot. The XML and the cache
+hold the same wrong pairing, so **the cache cannot be ground truth here** — it agrees with the
+error, and re-running alone re-writes it. Only `--purge-audited` + a re-translation fixes it;
+`--build-cache-from` prevents it recurring. The rule is deliberately narrow (one side reads like a
+sentence, the other like a label) and **symmetric**: these defects come in swapped pairs, so
+catching only one half would fix one slot and leave its partner wrong. A looser rule based on
+shared proper nouns was tried and rejected — neighbouring entries share names constantly, so it
+produced ten times the hits and most were correct translations. It also checks **shifted numbers
+between short labels** (`8 Riflemen` → `6 Fusileros`), which the length rule cannot see and which
+are the worst variant: the card promises one number of units and the game shows another.
+
+`--repair-from GOOD_CACHE.json` is the remedy: take the value from an older known-good cache
+instead of paying to re-translate. `_structurally_broken` decides what qualifies — the slot holds
+another string, a `<color>` pair was lost, or the text is still in the source language. **Wording
+problems are excluded on purpose**: there the audited cache is the newer, better translation, and
+reaching back to an older one would undo recent terminology work. The donor is refused unless it
+keeps the placeholders, has real translatable text (the WoL July cache stores a bare
+`__PROTECT_0__` as one "translation") and is not broken itself; the donor file is never written
+to. Note `_structurally_broken` reuses the audit's five-real-words threshold for "still in the
+source language", or the 4463 proper nouns that survive translation would all qualify.
+**Repair before purging, and exempt the repaired keys from the purge**, or the purge deletes what
+was just fixed. `--purge-audited` also now skips anything the deterministic post-process already
+repairs on export — purging those would discard a good translation and pay for it again.
+
+Note `_FORMAT_SPECIFIER_RE` was widened to cover WoL's own `%1s`/`%2.2f` forms (it only matched
+`%s` and `%1$s`), so `placeholders_compatible` — and with it the merge guard and the repair
+guard — finally sees them.
+
+**Mod terminology lives in `glossary.txt`, not in code.** Twelve Wars of Liberty terms were each
+shipping under several Spanish names (`Allotment` alone had four: *Parcela*, *Reparto*,
+*Asignación* — the card, the unit and the upgrade looked like three different things). The English
+decides the meaning: an *Allotment* "musters" and "contains units", so it is a block of troops
+(*Contingente*), never a plot of land. `Lodge` is the Hunter's Lodge (*Cabaña*), never a Masonic
+*Logia*; `Square` is the infantry formation (*Cuadro*), and "Spanish Square" is the *Tercio*, not a
+plaza. **Read the full English string before adding a term** — picking by frequency alone is
+exactly how `Allotment = Asignación` went wrong. Entries whose canon changes grammatical gender
+(`Allotment`, `Square`, `Zapotec`) or whose wrong variant is another unit's name (`Conscript` vs
+the `Recruit` unit → never rewrite *Recluta*) are prompt-only, with `output_fixes=()`.
 
 ## Docs
 

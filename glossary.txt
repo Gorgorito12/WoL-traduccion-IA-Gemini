@@ -2,11 +2,87 @@
 # Se aplica al traducir: fuerza la terminología oficial en el idioma destino.
 # Applied while translating: forces official terminology in the target language.
 #
-# Ejemplos (chino → inglés) / Examples (Chinese → English):
-# 主城 = Home City
-# 设置 = Settings
+# CÓMO FUNCIONA / HOW IT WORKS
+#   1. La regla se inyecta en el prompt SOLO en los lotes que contienen el término.
+#      The rule is injected into the prompt ONLY for batches containing the term.
+#   2. Después, si el modelo dejó el término SIN traducir, se reemplaza automáticamente.
+#      Afterwards, if the model left the term untranslated, it is replaced automatically.
+#   NO puede arreglar un sinónimo mal elegido (p. ej. "Parcela" en vez de "Contingente"):
+#   para eso usa  --audit-spanish  y luego  --purge-audited  para retraducir esas cadenas.
+#   It canNOT fix a wrong-but-translated synonym; use --audit-spanish + --purge-audited.
 #
-# Ejemplo (inglés → español) / Example (English → Spanish):
-# Home City = Metrópoli
+#   Cambiar este archivo NO invalida el caché: lo ya traducido conserva su texto.
+#   Editing this file does NOT invalidate the cache; already-cached strings keep their wording.
+#
+# ANTES DE AÑADIR UN TÉRMINO, LEE LA CADENA INGLESA COMPLETA.
+# BEFORE ADDING A TERM, READ THE FULL ENGLISH STRING.
+#   "Allotment" se tradujo como "Parcela" porque parece un terreno, pero el inglés dice
+#   "Allotments quickly train armies of units" y "Allotments contain more units": es un
+#   BLOQUE DE TROPAS. Traducir por el sentido equivocado confunde más que no traducir.
 #
 # Las líneas que empiezan con # se ignoran. / Lines starting with # are ignored.
+
+# --- Terminología de Wars of Liberty verificada contra el inglés ----------------------
+# Verified against the English source. The comment says WHAT the term is, so nobody
+# "corrects" it back to a literal but wrong translation.
+
+# Bloque de tropas reclutado de una vez (sistema sueco de asignación militar).
+# NO es una parcela de terreno: el Torp y el Rusthåll son los edificios, esto es la tropa.
+Allotment = Contingente
+
+# Cuerpo de élite del Círculo de Ossus ("the Circle's elite soldiers").
+Boneguard = Guardia Ósea
+
+# Unidad de infantería de leva. "Conscripto" es el término latinoamericano.
+# OJO: como VERBO ("Conscript Sepoys") es "reclutar"; el motor ya lo protege.
+# NO usar "Recluta": es el nombre de otra unidad distinta ("Recruit").
+Conscript = Conscripto
+
+# Clase de unidad estándar de AoE3 (la palabra en verde de las descripciones).
+Skirmisher = Hostigador
+
+# Héroe tipo Explorador de las civilizaciones de Oriente Medio.
+Warlord = Caudillo
+
+# Título otomano pegado a un nombre propio: "Muhammad Ali Pasha", "Ali Pasha".
+Pasha = Pasha
+
+# Edificio de investigación islámico. Forma recogida por la RAE.
+Madrasah = Madrasa
+
+# Combatiente irregular balcánico. Nombre propio, no se traduce.
+Hajduk = Hajduk
+
+# Unidad invocada. Concuerda con "Righteous Army" = "Ejército Justo".
+Righteous Fighter = Guerrero Justo
+
+# La Hunter's Lodge / Hunting Lodge: cabaña de caza.
+# NO es "Logia" (eso es la logia masónica).
+Lodge = Cabaña
+
+# Formación de infantería en cuadro. "Spanish Square" es el Tercio Español.
+# NO es "Plaza" (eso es una plaza urbana) ni "Cuadrado" (la figura geométrica).
+Square = Cuadro
+
+# Etnónimo. Ambas formas son válidas en español; se fija la mayoritaria.
+Zapotec = Zapoteca
+
+# OJO, "revolt" tiene TRES sentidos en este archivo y solo uno estaba mal:
+#   verbo, la mecánica de Revolución  -> "sublevarse"   (era "revolverse", incorrecto)
+#   sustantivo, levantamiento con nombre -> "Revuelta"  ("Arab Revolt" = "Revuelta Árabe") CORRECTO
+#   adjetivo "revolting" = repugnante                                                      CORRECTO
+# Y "Revolver" es además el arma (Colt Revolver = Revólver Colt): no tocar.
+Revolt = sublevarse
+
+# --- Sugerencias SIN VERIFICAR contra el inglés (revisa antes de descomentar) ---------
+# UNVERIFIED suggestions from --audit-spanish. Read the full English string first:
+# these were picked by frequency alone, which is exactly how "Allotment = Asignación"
+# went wrong. Confirm the real meaning with the community before enabling any of them.
+# Fighter = Luchador
+# Youth = Joven
+# Harbor = Puerto
+# Transport = Transporte
+
+# --- Ejemplos para otros pares de idiomas / Examples for other language pairs ---------
+# 主城 = Home City
+# Home City = Metrópoli

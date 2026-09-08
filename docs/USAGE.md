@@ -129,10 +129,32 @@ If you already have:
 You can rebuild/populate a cache file without spending API:
 
 ```bat
-python translate_gemini.py "stringtabley.xml" "stringtabley_es_latam.xml" --cache-file "wol_es.cache.json" --cache-only
+python translate_gemini.py "stringtabley.xml" --build-cache-from "stringtabley_es_latam.xml" --cache-file "wol_es.cache.json"
 ```
 
-> Important: rebuilding requires BOTH input (source) and output (translated). The cache maps `source_string -> translated_string`.
+`--build-cache-from` pairs the two files on the stable `_locID` attribute, so it tolerates
+reordering and count mismatches. No `output` argument is needed and the API is never called.
+It honours `--protect` / `--protect-regex` / `--target`, which must match the settings you
+translate with, otherwise the keys will not line up.
+
+What it writes, and what it deliberately refuses:
+
+| Case | Cached? |
+| ---- | ------- |
+| A real translation (differs from the source) | yes |
+| Translation identical to the source but a proper noun / pure markup (*Yamabushi*, `<color=…>`) | yes — this is what stops the next run from paying to "translate" a name |
+| Translation identical to the source but actually untranslated English (*The Asian Dynasties*) | no — caching it would poison the cache |
+| Translation that lost a `%s` / `%1$s` placeholder | no |
+| String with no counterpart in the translated file | no |
+
+The run prints a breakdown of all five buckets so you can see what was skipped and why.
+
+> The older `--cache-only` rebuild (passing the translated XML as the `output` positional)
+> still works, but it pairs strings **by position** and silently discards everything on a
+> count mismatch. Prefer `--build-cache-from`.
+>
+> In the **GUI**, the same thing is the **Generar… / Generate…** button next to the
+> *Cache file* field on the Translator tab (and *Generar caché (sin API)…* on the Compare tab).
 
 ---
 
@@ -199,6 +221,69 @@ python translate_gemini.py --self-test-merge
 * `--cache-file "PATH"`: use a specific cache file instead of the default `<output>.cache.json`.
 * `--cache-only`: never call the API; only apply cache.
 * `--retry-empty-cache`: retry entries cached as empty (`""`). Use this only if you want to force retries.
+* `--build-cache-from "TRANSLATED.xml"`: build the cache from an already-translated XML instead
+  of translating. Takes the source XML as the `input` positional and writes to `--cache-file`;
+  `output` is not required and the API is never called. See "Rebuild cache" above.
+
+### Model sampling
+
+* `--temperature`: sampling temperature (default `0.2`). Batches are translated in parallel and
+  independently, so only low-variance sampling can keep the same term consistent between them.
+  This is what stopped `deck` from coming out as both "mazo" and "baraja" on one screen.
+* `--seed`: sampling seed (default `12345`) for reproducible runs. Ignored by older SDKs.
+
+### Auditing a finished Spanish translation (0 API calls)
+
+```bat
+python translate_gemini.py "stringtabley.xml" --audit-spanish "stringtabley_es_latam.xml"
+```
+
+Takes the XML **pair** — the source as `input`, the translation as the flag value — because most
+checks have to be triggered by the English. Without the source you would flag "Tarjeta de Navidad"
+(correct for "Christmas Card") and miss that "Cofre" is right when "Chest" is in the source.
+
+It reports seven things: glossary terminology (canon vs each wrong variant), strings that shipped
+untranslated, peninsular forms and tú/usted balance, punctuation the LatAm gate would fix, broken
+`<color>` markup, strings whose Spanish belongs to a *different* string (see Troubleshooting 14),
+and a final **noisy** "candidates to review" list of terms whose rendering varies but that are in
+no glossary yet — add the real ones to `glossary.txt`.
+
+When adding a term to `glossary.txt`, read the full English string first: `Allotment` looks like a
+plot of land but the English says it "musters" and "contains units", so it is a block of troops.
+
+Add `--purge-audited wol_es.cache.json` to delete the flagged strings from a cache so the next
+run re-translates them with the current prompt and glossary. It **keeps** the strings the
+deterministic post-process already repairs on export — purging those would throw away a good
+translation and pay for it again.
+
+Add `--repair-from GOOD_CACHE.json` alongside it to recover **structurally broken** strings from
+an older, known-good cache instead of re-translating them. "Structural" means the slot holds
+another string's text, a `<color>` pair was lost, or the text is still in the source language —
+cases where an older sound value is strictly better. Wording problems (terminology, register,
+punctuation) are deliberately **not** taken from the donor: there the audited cache is newer and
+better, and the deterministic post-process fixes it for free anyway.
+
+A donor value is refused unless it keeps the placeholders, contains real text and is not broken
+itself — the WoL July cache really does store a bare `__PROTECT_0__` as one "translation", and a
+handful of values that are still English. On the WoL Spanish table this recovered **190 strings
+for free** (89 misaligned, 100 untranslated, 1 markup) and cut the purge from 487 to 155.
+
+```bat
+python translate_gemini.py "stringtabley.xml" ^
+  --audit-spanish  "stringtabley_es_latam.xml" ^
+  --repair-from    "wol_es_known_good.cache.json" ^
+  --purge-audited  "wol_es.cache.json"
+```
+
+Then re-export with `--cache-only` to apply the free fixes, and run a normal translation for what
+was purged.
+
+**Expect the intermediate export to look worse before it looks better.** A purged string has no
+cache entry, so `--cache-only` writes the source text for it. On the WoL table the count of
+English strings goes 167 → 182 at that point: 124 of those are the ones purged on purpose. They
+disappear on the next real translation run. This is how you fix terms whose
+gender changes (`Baraja`→`Mazo`), which cannot be swapped by regex without breaking the article
+and adjective around them.
 
 ### Quality rules (Spanish-target specific)
 
