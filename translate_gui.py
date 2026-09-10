@@ -401,6 +401,7 @@ TR = {
         "status_build_done": "Caché generada ✔",
         "log_build_summary": "💾 Caché generada: {n} entradas escritas (0 API).",
         "log_left_in_source": "  ⚠️  Sin traducir (quedaron en el idioma de origen): {q} por control de calidad, {b} por fallo de lote.",
+        "log_wrong_class": "  ⚠️  Clase de unidad equivocada en {n} cadena(s): la palabra de color nombra otra clase. Revisa con --audit-spanish.",
         "log_build_detail": "   reutilizadas: {reused} | idénticas conservadas: {ident} | omitidas sin traducir: {eng} | omitidas por placeholder: {ph} | sin pareja: {un}",
         "btn_build_cache_short": "Generar…",
         "mb_build_done_title": "Caché generada",
@@ -621,6 +622,7 @@ TR = {
         "status_build_done": "Cache built ✔",
         "log_build_summary": "💾 Cache built: {n} entries written (0 API).",
         "log_left_in_source": "  ⚠️  Untranslated (left in the source language): {q} quality-rejected, {b} batch failures.",
+        "log_wrong_class": "  ⚠️  Wrong unit class in {n} string(s): the coloured word names another class. Check with --audit-spanish.",
         "log_build_detail": "   reused: {reused} | kept identical: {ident} | skipped untranslated: {eng} | skipped placeholder: {ph} | unmatched: {un}",
         "btn_build_cache_short": "Generate…",
         "mb_build_done_title": "Cache built",
@@ -2268,6 +2270,11 @@ class TranslatorGUI:
                     # Surfaced explicitly: these strings ship in the source language.
                     print(self.t("log_left_in_source", q=stats.quality_rejected,
                                  b=stats.batch_failed), flush=True)
+                    had_warnings = True
+                if stats.counter_keyword_rejected:
+                    # The <color> tags survived but the word inside names the wrong unit class,
+                    # so the card states a counter the game does not apply.
+                    print(self.t("log_wrong_class", n=stats.counter_keyword_rejected), flush=True)
                     had_warnings = True
                 if stats.cache_empty_skipped > 0:
                     had_warnings = True

@@ -21,6 +21,17 @@
 #   BLOQUE DE TROPAS. Traducir por el sentido equivocado confunde más que no traducir.
 #
 # Las líneas que empiezan con # se ignoran. / Lines starting with # are ignored.
+#
+# CONDICIONES POR CONTEXTO / PER-CONTEXT CONDITIONS
+#   Una palabra inglesa puede necesitar dos términos distintos según el contexto. Se añaden
+#   condiciones separadas por "|" antes del "=", y se comprueban contra el TEXTO INGLÉS:
+#     Termino | si:TEXTO = destino     ("si:", "solo si:", "if:", "only if:")  exige TEXTO
+#     Termino | no:TEXTO = destino     ("no:", "not:", "unless:")              prohíbe TEXTO
+#   Ejemplo real (ya resuelto en el código, aquí solo como muestra de la sintaxis):
+#     Skirmisher | si:<color=0.07, 0.68, 0.17> = infantería a distancia
+#     Skirmisher | no:<color=0.07, 0.68, 0.17> = Hostigador
+#   A word may need two different terms depending on context; conditions are checked against
+#   the ENGLISH source text.
 
 # --- Terminología de Wars of Liberty verificada contra el inglés ----------------------
 # Verified against the English source. The comment says WHAT the term is, so nobody
@@ -38,8 +49,15 @@ Boneguard = Guardia Ósea
 # NO usar "Recluta": es el nombre de otra unidad distinta ("Recruit").
 Conscript = Conscripto
 
-# Clase de unidad estándar de AoE3 (la palabra en verde de las descripciones).
-Skirmisher = Hostigador
+# "Skirmisher" NO se pone aquí: son DOS cosas distintas según el color de la etiqueta.
+#   Dentro de <color=0.07, 0.68, 0.17> es la CLASE de contraataque, la que el motor imprime
+#   como "Infantería a Distancia" (_locID 430207)  ->  "infantería a distancia"
+#   Fuera de la etiqueta es la unidad que se llama Skirmisher          ->  "Hostigador"
+# Una carta que decía "hostigadores" mientras el tooltip decía "Infantería a Distancia" hizo
+# creer que la Legión Peruana (infantería de línea) no recibía el bono que sí recibe.
+# Las dos reglas viven en COUNTER_KEYWORDS y SPANISH_GLOSSARY (translate_gemini.py) porque
+# necesitan el código de color y correcciones deterministas. Si alguna vez hiciera falta
+# expresarlo aquí, la sintaxis con condición de abajo lo permite.
 
 # Héroe tipo Explorador de las civilizaciones de Oriente Medio.
 Warlord = Caudillo

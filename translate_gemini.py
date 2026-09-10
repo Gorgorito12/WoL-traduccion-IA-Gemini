@@ -8,6 +8,8 @@ import io
 import logging
 import os
 import re
+import sys
+import hashlib
 import time
 import json
 import random
@@ -22,6 +24,27 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from google import genai
 from google.genai import types
 from tqdm import tqdm
+
+def _force_utf8_console() -> None:
+    """Make stdout/stderr able to print the report's emoji and accents on Windows.
+
+    A default Windows console is cp1252, and the audit died with
+    ``UnicodeEncodeError: 'charmap' codec can't encode character '📋'`` before printing
+    a single line. ``errors="replace"`` keeps a legacy console usable instead of crashing, and
+    the whole thing is guarded because under ``pythonw.exe`` there is no stdout at all.
+    """
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_force_utf8_console()
 
 # --- POWER CONFIGURATION ---
 DEFAULT_MODEL = "gemini-2.5-flash"
@@ -142,8 +165,17 @@ STRICT_MARKUP_RULES = (
     "pair empty and never drop a pair: the coloured word tells the player what the unit is "
     "strong against, so losing the colour loses meaning, not just styling.\n"
     "For 'Nepalese <color=0.07, 0.68, 0.17>skirmisher</color> that is accurate' return "
-    "'<color=0.07, 0.68, 0.17>Hostigador</color> nepali certero', "
-    "NOT 'Hostigador nepali <color=0.07, 0.68, 0.17> </color> certero'."
+    "'<color=0.07, 0.68, 0.17>infanteria a distancia</color> nepali certera', "
+    "NOT 'infanteria a distancia nepali <color=0.07, 0.68, 0.17> </color> certera'."
+)
+
+STRICT_COUNTER_KEYWORD_RULES = (
+    "STRICT UNIT-CLASS RULE\n"
+    "A coloured unit-class keyword came back naming the WRONG class, or empty. The word inside "
+    "each <color=...> pair must be exactly the term listed for that colour: it is the class name "
+    "the game prints in its own effect tooltips, so swapping it for another class tells the "
+    "player the wrong counter, and an empty pair tells them nothing. Re-translate keeping every "
+    "keyword exact and inside its own tags.\n"
 )
 
 STRICT_QUALITY_RULES = (
@@ -167,10 +199,20 @@ def target_is_spanish(target_lang: str) -> bool:
     return any(marker in tl for marker in
                ("spanish", "español", "espanol", "castellano", "es-419", "es_419"))
 
+# Everything inside a markup tag: <color=...>, <font=Arial 96>, <icon="(58)(War of the Triple
+# Alliance\Icons\...)">. A translator never touches these, but they are full of English words and
+# file paths, and the residue gate was reading them as untranslated prose -- "War of the Triple
+# Alliance" alone trips the "of the" rule. Since that gate fails INTO the source language, 19
+# correctly translated strings were shipping in English because of an icon path.
+_MARKUP_TAG_RE = re.compile(r"<[^>]*>")
+
+
 def _strip_quality_tokens(text: str) -> str:
     cleaned = PROTECT_TOKEN_RE.sub(" ", text)
     cleaned = QUALITY_TOKEN_RE.sub(" ", cleaned)
     cleaned = PLACEHOLDER_RE.sub(" ", cleaned)
+    # Only the tags themselves; the text they wrap sits between them and is still checked.
+    cleaned = _MARKUP_TAG_RE.sub(" ", cleaned)
     return cleaned
 
 
@@ -178,6 +220,219 @@ COLOR_OPEN_RE = re.compile(r"<color=[^>]*>", re.IGNORECASE)
 COLOR_CLOSE_RE = re.compile(r"</color>", re.IGNORECASE)
 # An opening tag followed by nothing but whitespace before its closing tag.
 EMPTY_COLOR_RE = re.compile(r"<color=[^>]*>\s*</color>", re.IGNORECASE)
+# Every <color=...>...</color> span, with its colour code and its inner text.
+_COLOR_SPAN_RE = re.compile(r"<color=([^>]*)>(.*?)</color>", re.IGNORECASE | re.DOTALL)
+
+
+def _normalize_color_code(code: str) -> str:
+    """'0.07, 0.68, 0.17' and '0.07,0.68,0.17' are the same colour."""
+    return re.sub(r"\s+", "", code or "").lower()
+
+
+def _color_open_pattern(code: str) -> "re.Pattern[str]":
+    """Compile an opening-tag matcher for one colour code, tolerant of spacing."""
+    parts = [re.escape(part.strip()) for part in code.split(",")]
+    return re.compile(r"<color=\s*" + r"\s*,\s*".join(parts) + r"\s*>", re.IGNORECASE)
+
+
+# --- Wars of Liberty's counter-keyword system -------------------------------------------------
+# WoL does NOT use vanilla AoE3 counter wording: it defines its own set of unit classes and codes
+# each one with a colour. The coloured word is therefore VOCABULARY, not decoration -- it names
+# the class the text is about, and the engine prints that same class in its effect tooltips
+# ("Ranged Infantry: Changes Melee ATK Damage by 15.00%").
+#
+# Nothing used to check WHAT was inside the tag -- markup_integrity_ok only counts tags -- so the
+# class vocabulary rotted silently: 15 strings called `shock units` "unidades de asalto" (the name
+# of a DIFFERENT class), `standing units` shipped under four names, and the green class shipped as
+# "hostigador", a word the game never displays anywhere else.
+#
+# The green colour is special: it wraps only the word "skirmisher" in all 475 of its occurrences,
+# so its presence is an exact signal for "this is the CLASS, not the unit called Skirmisher".
+# Its canon is "infanteria a distancia" -- what the engine itself prints for that class
+# (_locID 430207 "Ranged Infantry") -- which is also the only rendering consistent with the other
+# six classes, all of which are functional descriptions rather than unit names.
+COUNTER_COLOR_SKIRMISHER = "0.07, 0.68, 0.17"
+
+COUNTER_KEYWORDS: Dict[str, Dict[str, str]] = {
+    COUNTER_COLOR_SKIRMISHER: {
+        "skirmisher": "infantería a distancia",
+        "skirmishers": "infantería a distancia",
+        # In 6 strings the tag wraps the bare ADJECTIVE, as half of a compound class:
+        # "<green>skirmish</green>-<orange>maneuver cavalry</orange>". Forcing the noun canon
+        # there produces nonsense ("Caballería de infantería a distancia-maniobra"), so the
+        # adjective gets its own canon. "hostigamiento" is an action, not a unit, so unlike
+        # "hostigador" it collides with nothing the game displays.
+        "skirmish": "hostigamiento",
+    },
+    "0.19, 0.52, 0.76": {
+        "line unit": "unidad de línea",
+        "line units": "unidades de línea",
+    },
+    "0.92, 0.84, 0.09": {
+        "shock unit": "unidad de choque",
+        "shock units": "unidades de choque",
+        "shock cavalry": "caballería de choque",
+    },
+    "0.74, 0.11, 0.58": {
+        "standing unit": "unidad estática",
+        "standing units": "unidades estáticas",
+    },
+    "0.78, 0.35, 0.13": {
+        "maneuver unit": "unidad de maniobra",
+        "maneuver units": "unidades de maniobra",
+        "maneuver cavalry": "caballería de maniobra",
+        "maneuver infantry": "infantería de maniobra",
+    },
+    "0.74, 0.25, 0.11": {
+        "assault unit": "unidad de asalto",
+        "assault units": "unidades de asalto",
+        "assault infantry": "infantería de asalto",
+    },
+    "0.82, 0.80, 0.60": {
+        "scout unit": "unidad de exploración",
+        "scout units": "unidades de exploración",
+        "scout cavalry": "caballería de exploración",
+        "scout infantry": "infantería de exploración",
+    },
+}
+
+# Deterministic repairs, applied ONLY inside a span of the matching colour and ONLY where the
+# swap keeps gender and number ("unidades estacionarias" -> "unidades estaticas"). Being
+# colour-scoped is load-bearing: "unidades de asalto" is the CORRECT canon under the assault
+# colour and a wrong-class defect under the shock colour, so this can never be a global regex.
+#
+# The green class is deliberately absent: "hostigador" (m.) -> "infanteria a distancia" (f.)
+# changes gender and head noun, so a regex would leave "los infanteria a distancia". Same rule as
+# crate/outpost/deck below -- prompt-only, and existing strings are re-translated instead.
+COUNTER_KEYWORD_REPAIRS: Dict[str, Tuple[Tuple["re.Pattern[str]", str], ...]] = {
+    "0.92, 0.84, 0.09": (
+        (re.compile(r"unidades\s+de\s+asalto", re.IGNORECASE), "unidades de choque"),
+        (re.compile(r"unidad\s+de\s+asalto", re.IGNORECASE), "unidad de choque"),
+    ),
+    "0.74, 0.11, 0.58": (
+        (re.compile(r"unidades\s+(?:estacionarias|fijas|estacionadas)", re.IGNORECASE),
+         "unidades estáticas"),
+        (re.compile(r"unidad\s+(?:estacionaria|fija|estacionada)", re.IGNORECASE),
+         "unidad estática"),
+    ),
+    "0.82, 0.80, 0.60": (
+        (re.compile(r"caballer[íi]a\s+exploradora", re.IGNORECASE), "caballería de exploración"),
+        (re.compile(r"unidades\s+exploradoras", re.IGNORECASE), "unidades de exploración"),
+        (re.compile(r"unidad\s+exploradora", re.IGNORECASE), "unidad de exploración"),
+    ),
+}
+
+_COUNTER_KEYWORDS_BY_CODE = {
+    _normalize_color_code(code): lexicon for code, lexicon in COUNTER_KEYWORDS.items()
+}
+_COUNTER_REPAIRS_BY_CODE = {
+    _normalize_color_code(code): fixes for code, fixes in COUNTER_KEYWORD_REPAIRS.items()
+}
+# The opening tag of the green class, used to tell the CLASS apart from the unit named
+# "Skirmisher" (see the two SPANISH_GLOSSARY entries below).
+GREEN_SKIRMISHER_RE = _color_open_pattern(COUNTER_COLOR_SKIRMISHER)
+
+
+def _counter_spans(text: str) -> List[Tuple[str, str]]:
+    """[(normalized colour code, inner text)] for every counter-keyword span in `text`."""
+    spans = []
+    for match in _COLOR_SPAN_RE.finditer(text or ""):
+        code = _normalize_color_code(match.group(1))
+        if code in _COUNTER_KEYWORDS_BY_CODE:
+            spans.append((code, match.group(2)))
+    return spans
+
+
+def _fold(text: str) -> str:
+    """Lowercase and strip accents, so 'Infanteria' matches 'infantería'."""
+    decomposed = unicodedata.normalize("NFD", (text or "").lower())
+    return "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
+
+
+def counter_keyword_ok(src: str, out: str, target_lang: str) -> bool:
+    """True when every counter-keyword span still names the RIGHT unit class.
+
+    The twin of ``markup_integrity_ok``: that one checks the tags survived, this one checks the
+    word inside them is still the class the source named. A span that ends up empty, holding the
+    name of another class, or holding a synonym the game never displays, costs the player the
+    "strong against" cue even though the markup is intact.
+
+    Accepts any canon of the same colour, so an English singular rendered as a Spanish plural is
+    not a defect -- only naming the wrong class, or no class at all, is.
+
+    Spanish-gated, unlike markup_integrity_ok: the canon table is Spanish. Other targets pass.
+    """
+    if not target_is_spanish(target_lang):
+        return True
+    out_spans = _counter_spans(out)
+    for code, inner in _counter_spans(src):
+        lexicon = _COUNTER_KEYWORDS_BY_CODE.get(code, {})
+        if _fold(inner).strip() not in {_fold(k) for k in lexicon}:
+            continue  # not a keyword we hold a canon for; nothing to assert
+        accepted = [_fold(v) for v in lexicon.values()]
+        same_colour = [_fold(text) for c, text in out_spans if c == code]
+        if not any(any(canon in text for canon in accepted) for text in same_colour):
+            return False
+    return True
+
+
+def counter_keyword_rules(batch: Sequence[str], target_lang: str) -> str:
+    """Prompt rules for the counter-keyword colours that actually occur in `batch`.
+
+    Same batch-filtering as ``user_glossary_rules``: strings without coloured keywords pay zero
+    extra tokens.
+    """
+    if not target_is_spanish(target_lang):
+        return ""
+    joined = "\n".join(batch)
+    lines = []
+    for code, lexicon in COUNTER_KEYWORDS.items():
+        if not _color_open_pattern(code).search(joined):
+            continue
+        pairs = "; ".join(f"'{en}' -> '{es}'" for en, es in lexicon.items())
+        lines.append(f"- Inside <color={code}>...</color>: {pairs}")
+    if not lines:
+        return ""
+    return (
+        "UNIT-CLASS KEYWORDS (Wars of Liberty counter system -- these are fixed terms)\n"
+        "The coloured word names a unit CLASS the game also prints in its effect tooltips, so it "
+        "must use the exact term below and stay inside its own <color> tags. Never swap in the "
+        "name of another class and never leave the tag empty.\n" + "\n".join(lines)
+    )
+
+
+def apply_counter_keyword_fixes(original_text: str, translated_text: str, target_lang: str) -> str:
+    """Deterministic, colour-scoped repair of same-gender counter-keyword variants.
+
+    Only rewrites text INSIDE a coloured span, and only for the swaps listed in
+    ``COUNTER_KEYWORD_REPAIRS``, which all keep gender and number. Leading and trailing
+    whitespace inside the tag is preserved: many spans are written
+    ``<color=...>skirmisher </color>`` and that space is part of the sentence.
+    """
+    if not target_is_spanish(target_lang) or not translated_text:
+        return translated_text
+    if not _counter_spans(original_text):
+        return translated_text
+
+    def repair(match: "re.Match[str]") -> str:
+        code = _normalize_color_code(match.group(1))
+        fixes = _COUNTER_REPAIRS_BY_CODE.get(code)
+        if not fixes:
+            return match.group(0)
+        inner = match.group(2)
+        core = inner.strip()
+        if not core:
+            return match.group(0)
+        for pattern, replacement in fixes:
+            if pattern.fullmatch(core):
+                lead = inner[: len(inner) - len(inner.lstrip())]
+                trail = inner[len(inner.rstrip()):]
+                return f"<color={match.group(1)}>{lead}{replacement}{trail}</color>"
+        return match.group(0)
+
+    return _COLOR_SPAN_RE.sub(repair, translated_text)
+
+
 
 
 def markup_integrity_ok(src: str, out: str) -> bool:
@@ -185,9 +440,9 @@ def markup_integrity_ok(src: str, out: str) -> bool:
 
     In this game the coloured word is the counter keyword -- it tells the player what a unit is
     strong against -- so losing the colour loses information, not just styling. Spanish reorders
-    adjective and noun ("Nepalese skirmisher" -> "Hostigador nepali"), and the model routinely
-    moves the word out of its tag, leaving `<color=...> </color>` empty or dropping the tag pair
-    altogether.
+    adjective and noun ("Nepalese skirmisher" -> "infanteria a distancia nepali"), and the model
+    routinely moves the word out of its tag, leaving `<color=...> </color>` empty or dropping the
+    tag pair altogether.
 
     Language-agnostic on purpose: markup is identical in every target language, unlike
     has_english_residue which only makes sense for a Spanish target.
@@ -408,10 +663,59 @@ SPANISH_GLOSSARY: List[GlossaryEntry] = [
     # Each of these shipped under several different Spanish names, so a player could not tell
     # that the card, the unit and the upgrade were the same thing. The canon is the variant the
     # community settled on; only same-gender, same-number swaps get output_fixes.
+    # "Skirmisher" is TWO different things in this file and they need two different Spanish
+    # words. Inside the green counter colour it is WoL's unit CLASS -- the one the engine labels
+    # "Ranged Infantry" in its effect tooltips -- and a card reading "hostigadores" while the
+    # tooltip reads "Infanteria a Distancia" is what the community reported: the Peruvian Legion
+    # is line infantry, yet it gets the bonus. Outside the tag it is the unit actually named
+    # Skirmisher. The green tag wraps nothing but this word in all 475 of its occurrences, so it
+    # separates the two cases exactly.
+    # "Hand infantry/cavalry" is the melee class paired with "ranged infantry/cavalry", and the
+    # game labels it "Caballeria de cuerpo a cuerpo" itself (_locID 430105). "de mano" is a
+    # calque that had already split the corpus in half (113 vs 111) before this rule existed.
+    # Unlike the skirmisher class the swap keeps gender AND head noun -- only the modifier
+    # changes -- so the deterministic fix is safe here, anchored to the whole phrase so that
+    # "canon de mano" (hand cannon) and "armas de mano" are never touched.
     GlossaryEntry(
-        name="skirmisher",
+        name="hand-unit",
+        source_trigger=re.compile(r"\bhand\s+(?:infantry|cavalry|units?)\b", re.IGNORECASE),
+        prompt_hint=(
+            "- 'Hand infantry' / 'hand cavalry' is the melee class: translate them 'infantería "
+            "cuerpo a cuerpo' / 'caballería cuerpo a cuerpo', never 'de mano'.\n"
+        ),
+        output_fixes=(
+            # IGNORECASE, and the backreference keeps whatever case the noun had: the phrase
+            # appears both as a title ("Caballería de Mano") and mid-sentence ("la infantería
+            # de mano"), and a case-sensitive pattern only repaired the first form.
+            (re.compile(r"\b(Infanter[íi]as?|Caballer[íi]as?)\s+de\s+[Mm]ano\b", re.IGNORECASE),
+             r"\1 cuerpo a cuerpo"),
+        ),
+    ),
+    GlossaryEntry(
+        name="skirmisher-class",
+        source_trigger=GREEN_SKIRMISHER_RE,
+        prompt_hint=(
+            "- The green <color=0.07, 0.68, 0.17>skirmisher(s)</color> is a unit CLASS, the one "
+            "the game labels 'Ranged Infantry'. Translate it 'infantería a distancia' -- "
+            "FEMININE SINGULAR -- and make the articles and adjectives agree: 'la infantería a "
+            "distancia', 'contra la infantería a distancia', never 'los hostigadores' or 'los "
+            "infantería'. Keep the <color> tags wrapping those same words.\n"
+        ),
+        # Gender and head noun both change (hostigador m. -> infantería f.), so a regex would
+        # leave "los infantería a distancia". Prompt-only, exactly like crate/outpost/deck above;
+        # strings already wrong are found by --audit-spanish and re-translated.
+        output_fixes=(),
+    ),
+    GlossaryEntry(
+        name="skirmisher-unit",
         source_trigger=re.compile(r"\bskirmishers?\b", re.IGNORECASE),
-        prompt_hint="- Translate the unit class 'Skirmisher' as 'Hostigador'.\n",
+        # When the green tag is present this is the class, handled by the entry above.
+        source_block=GREEN_SKIRMISHER_RE,
+        prompt_hint=(
+            "- Translate the unit name 'Skirmisher' as 'Hostigador'. Never 'Guerrillero' (that "
+            "is Wars of Liberty's own 'Guerrilla' unit) and never 'Cazador' (that is the "
+            "'Cacadore' unit).\n"
+        ),
         output_fixes=(
             # "Escararuzador" (Escara+R+uzador) is a misspelling of "Escaramuzador"
             # (Escara+M+uzador) that shipped in 9 strings; [mr] catches both.
@@ -593,6 +897,11 @@ def terminology_overrides_for_target(
     When ``batch`` is given, only the entries whose ``source_trigger`` actually appears in it are
     emitted (the same batch-filtering ``user_glossary_rules`` does). Sending every term on every
     request wastes tokens and nudges the model toward that vocabulary in unrelated strings.
+
+    ``source_block`` is honoured here too, and PER STRING rather than per batch: two entries can
+    cover the same word in different contexts (the green counter tag makes 'skirmisher' the unit
+    CLASS, its absence makes it the unit NAME), and testing the joined batch would let a single
+    blocked string silence the rule for every other string travelling with it.
     """
     if not target_is_spanish(target_lang):
         return ""
@@ -600,8 +909,14 @@ def terminology_overrides_for_target(
     if batch is None:
         entries = SPANISH_GLOSSARY
     else:
-        joined = "\n".join(batch)
-        entries = [e for e in SPANISH_GLOSSARY if e.source_trigger.search(joined)]
+        def fires(entry: GlossaryEntry) -> bool:
+            return any(
+                entry.source_trigger.search(text)
+                and not (entry.source_block is not None and entry.source_block.search(text))
+                for text in batch
+            )
+
+        entries = [e for e in SPANISH_GLOSSARY if fires(e)]
 
     hints = "".join(entry.prompt_hint for entry in entries)
     if hints:
@@ -700,6 +1015,57 @@ def normalize_latam_spanish(original_text: str, translated_text: str, target_lan
     return _add_opening_punctuation(out)
 
 
+@dataclass(frozen=True)
+class UserGlossaryEntry:
+    """One glossary.txt line: a term pair plus the context it is allowed to fire in.
+
+    A flat 'source = target' map cannot express a word that needs two different translations
+    depending on context -- which is exactly what broke the counter keywords, where 'Skirmisher'
+    is a unit CLASS inside the green colour tag and a unit NAME outside it. The conditions make
+    the distinction expressible in the file instead of only in code.
+    """
+
+    source_term: str
+    target_term: str
+    require: Tuple[str, ...] = ()   # every one of these must appear in the English original
+    exclude: Tuple[str, ...] = ()   # none of these may appear in the English original
+
+    def applies_to(self, text: str) -> bool:
+        if any(needle not in text for needle in self.require):
+            return False
+        return not any(needle in text for needle in self.exclude)
+
+    def describe_condition(self) -> str:
+        parts = [f"the text contains {needle!r}" for needle in self.require]
+        parts += [f"the text does NOT contain {needle!r}" for needle in self.exclude]
+        return " and ".join(parts)
+
+
+class UserGlossary(Dict[str, str]):
+    """A plain {source term: target term} mapping, with the per-line conditions on ``.entries``.
+
+    Subclassing dict keeps every existing caller working unchanged (the GUI prints ``len()``,
+    the audit iterates ``.items()``, tests compare against ``{}``).
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.entries: List[UserGlossaryEntry] = []
+
+
+def _glossary_entries(glossary: Optional[Dict[str, str]]) -> List[UserGlossaryEntry]:
+    """Entries of a UserGlossary, or unconditional ones for a plain dict."""
+    if not glossary:
+        return []
+    entries = getattr(glossary, "entries", None)
+    if entries is not None:
+        return entries
+    return [UserGlossaryEntry(source, target) for source, target in glossary.items()]
+
+
+_GLOSSARY_CONDITION_RE = re.compile(r"^(si|if|solo si|only if|no|not|unless)\s*:\s*(.+)$", re.I)
+
+
 def load_user_glossary(path: Optional[Path]) -> Dict[str, str]:
     """Parse a user glossary file: one 'source term = target term' per line.
 
@@ -707,8 +1073,16 @@ def load_user_glossary(path: Optional[Path]) -> Dict[str, str]:
     skipped with a warning. Returns {} when the file is missing/unreadable.
     Unlike SPANISH_GLOSSARY this is pair-agnostic: entries simply never fire
     when their source term does not appear in the strings being translated.
+
+    A line may carry '|'-separated conditions before the '=', checked against the ENGLISH
+    original, so one word can map to different terms in different contexts::
+
+        Skirmisher | si:<color=0.07, 0.68, 0.17> = infanteria a distancia
+        Skirmisher | no:<color=0.07, 0.68, 0.17> = Hostigador
+
+    'si:'/'if:'/'solo si:'/'only if:' require the text; 'no:'/'not:'/'unless:' forbid it.
     """
-    glossary: Dict[str, str] = {}
+    glossary = UserGlossary()
     if not path:
         return glossary
     try:
@@ -722,12 +1096,42 @@ def load_user_glossary(path: Optional[Path]) -> Dict[str, str]:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        source_term, sep, target_term = line.partition("=")
-        source_term, target_term = source_term.strip(), target_term.strip()
+        # A condition can itself contain '=' (a colour code is "<color=0.07, 0.68, 0.17>"), so a
+        # conditional line splits at its LAST '='. Plain lines keep splitting at the first one,
+        # so nothing that parsed before parses differently now.
+        if "|" in line:
+            left, sep, target_term = line.rpartition("=")
+        else:
+            left, sep, target_term = line.partition("=")
+        target_term = target_term.strip()
+        chunks = [chunk.strip() for chunk in left.split("|")]
+        source_term = chunks[0]
         if not sep or not source_term or not target_term:
             logging.warning("Glossary line %s ignored (expected 'source = target'): %s", line_no, line)
             continue
+        require: List[str] = []
+        exclude: List[str] = []
+        malformed = False
+        for chunk in chunks[1:]:
+            match = _GLOSSARY_CONDITION_RE.match(chunk)
+            if not match:
+                logging.warning(
+                    "Glossary line %s ignored (condition must be 'si:TEXT' or 'no:TEXT'): %s",
+                    line_no, line,
+                )
+                malformed = True
+                break
+            keyword, needle = match.group(1).lower(), match.group(2).strip()
+            if not needle:
+                malformed = True
+                break
+            (exclude if keyword in {"no", "not", "unless"} else require).append(needle)
+        if malformed:
+            continue
         glossary[source_term] = target_term
+        glossary.entries.append(
+            UserGlossaryEntry(source_term, target_term, tuple(require), tuple(exclude))
+        )
     return glossary
 
 
@@ -739,11 +1143,24 @@ def user_glossary_rules(batch: Sequence[str], glossary: Optional[Dict[str, str]]
     """
     if not glossary:
         return ""
-    lines = [
-        f"- Translate '{source_term}' as '{target_term}' (official game term); use it consistently."
-        for source_term, target_term in glossary.items()
-        if any(source_term in text for text in batch)
-    ]
+    lines = []
+    for entry in _glossary_entries(glossary):
+        if not any(entry.source_term in text and entry.applies_to(text) for text in batch):
+            continue
+        rule = (
+            f"- Translate '{entry.source_term}' as '{entry.target_term}' (official game term); "
+            "use it consistently."
+        )
+        condition = entry.describe_condition()
+        if condition:
+            # A batch can carry both contexts of the same word, so the condition has to travel
+            # with the rule -- otherwise two contradictory rules would arrive with no way to
+            # tell which string each applies to.
+            rule = (
+                f"- When {condition}, translate '{entry.source_term}' as "
+                f"'{entry.target_term}' (official game term)."
+            )
+        lines.append(rule)
     if not lines:
         return ""
     return "MANDATORY TERMINOLOGY (user glossary)\n" + "\n".join(lines)
@@ -763,8 +1180,11 @@ def apply_user_glossary_fixes(
     if not glossary:
         return translated_text
     out = translated_text
-    for source_term, target_term in glossary.items():
+    for entry in _glossary_entries(glossary):
+        source_term, target_term = entry.source_term, entry.target_term
         if source_term == target_term or source_term not in original_text or source_term not in out:
+            continue
+        if not entry.applies_to(original_text):
             continue
         if re.search(r"[A-Za-z]", source_term):
             out = re.sub(
@@ -908,6 +1328,9 @@ class TranslationStats:
     # make it visible how many strings actually shipped in the source language, and why.
     quality_rejected: int = 0   # failed the English-residue gate after every retry
     markup_rejected: int = 0    # <color> markup still broken after every retry
+    counter_keyword_rejected: int = 0  # a coloured keyword still named the wrong unit class
+    terms_stale: int = 0        # re-translated because its terminology rules changed
+    consistency_fixed: int = 0  # re-translated by the post-run consistency sweep
     batch_failed: int = 0       # the whole batch errored out; kept retryable in the cache
 
 
@@ -1490,6 +1913,7 @@ def translate_batch_with_retry(
     attempt = 0
     quality_attempt = 0
     markup_attempt = 0
+    keyword_attempt = 0
     last_partial: Optional[List[str]] = None
     quality_prompt_compact = compact_prompt
     extra_rules = base_extra_rules
@@ -1557,6 +1981,35 @@ def translate_batch_with_retry(
                     broken[0],
                     broken[1],
                 )
+
+            # Unit-class gate: the tags may be intact and the word inside them still wrong.
+            # markup_integrity_ok cannot see this -- it only counts tags -- and naming another
+            # class is worse than losing the tag, because the text then states a false counter.
+            wrong_class = None
+            for src_text, out_text in zip(batch, translations):
+                if not counter_keyword_ok(src_text, out_text, target):
+                    wrong_class = (src_text, out_text)
+                    break
+            if wrong_class:
+                if keyword_attempt < max_quality_retries:
+                    keyword_attempt += 1
+                    quality_prompt_compact = False
+                    # The lexicon itself is already in base_extra_rules; only the emphasis is new.
+                    extra_rules = (extra_rules + "\n\n" + STRICT_COUNTER_KEYWORD_RULES).strip()
+                    logging.warning(
+                        "Unit-class retry %s/%s: coloured keyword names the wrong class. "
+                        "src=%s out=%s",
+                        keyword_attempt,
+                        max_quality_retries,
+                        wrong_class[0],
+                        wrong_class[1],
+                    )
+                    continue
+                logging.warning(
+                    "Unit-class retries exhausted; coloured keyword still wrong. src=%s out=%s",
+                    wrong_class[0],
+                    wrong_class[1],
+                )
             return translations
         except Exception as exc:
             attempt += 1
@@ -1584,6 +2037,78 @@ def translate_batch_with_retry(
             backoff += random.uniform(0, BACKOFF_SECONDS)
             logging.info("Retrying batch in %.1fs...", backoff)
             time.sleep(backoff)
+
+
+def terminology_fingerprint(
+    original_text: str,
+    target_lang: str,
+    user_glossary: Optional[Dict[str, str]] = None,
+) -> str:
+    """A short hash of every terminology rule that applies to this one string.
+
+    Editing glossary.txt or a canon does not invalidate the cache -- by design, since the key is
+    the source text -- so a wording decision used to reach only the strings that happened to be
+    re-translated afterwards, and the only way to force the rest was to purge everything the
+    audit flagged. Recording which rules produced a string makes the narrow question answerable:
+    "whose rules changed since?".
+
+    Only the rules that actually fire for this string go into the hash, so adding an unrelated
+    term does not invalidate the whole cache.
+    """
+    parts: List[str] = [target_lang or ""]
+    if target_is_spanish(target_lang):
+        for entry in SPANISH_GLOSSARY:
+            if not entry.source_trigger.search(original_text):
+                continue
+            if entry.source_block is not None and entry.source_block.search(original_text):
+                continue
+            fixes = "|".join(f"{pat.pattern}=>{rep}" for pat, rep in entry.output_fixes)
+            parts.append(f"{entry.name}:{entry.prompt_hint}:{fixes}")
+        for code, inner in _counter_spans(original_text):
+            lexicon = _COUNTER_KEYWORDS_BY_CODE.get(code, {})
+            parts.append(f"kw:{code}:{inner.strip().lower()}:" + ",".join(sorted(lexicon.values())))
+    for entry in _glossary_entries(user_glossary):
+        if entry.source_term in original_text and entry.applies_to(original_text):
+            parts.append(f"ug:{entry.source_term}={entry.target_term}")
+    digest = hashlib.blake2s("\x1f".join(parts).encode("utf-8"), digest_size=8)
+    return digest.hexdigest()
+
+
+def _terms_sidecar_path(cache_path: Path) -> Path:
+    """Where the fingerprints live: next to the cache, never inside it.
+
+    The cache format ({protected source: translation}, "" meaning "retry me") is the project's
+    load-bearing invariant, and every key in it is a real source string. Adding a metadata key
+    would put a non-string in that namespace, so the fingerprints get their own file. A missing
+    sidecar simply means "unknown", which behaves exactly like the old code.
+    """
+    return cache_path.with_name(cache_path.stem + ".terms.json")
+
+
+def _load_terms_sidecar(cache_path: Optional[Path]) -> Dict[str, str]:
+    if not cache_path:
+        return {}
+    path = _terms_sidecar_path(cache_path)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logging.warning("Unable to load terminology fingerprints (%s): %s", path, exc)
+        return {}
+
+
+def _write_terms_sidecar(cache_path: Optional[Path], fingerprints: Dict[str, str]) -> None:
+    if not cache_path or not fingerprints:
+        return
+    path = _terms_sidecar_path(cache_path)
+    try:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(fingerprints, ensure_ascii=False, indent=0), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception as exc:
+        logging.warning("Could not write terminology fingerprints (%s): %s", path, exc)
 
 
 def _prune_empty_cache(cache: Dict[str, str]) -> Dict[str, str]:
@@ -1617,6 +2142,113 @@ def _write_cache_atomic(cache_path: Path, cache: Dict[str, str]) -> None:
         raise
 
 
+def finalize_translation(
+    original_text: str,
+    translated_text: str,
+    target_lang: str,
+    user_glossary: Optional[Dict[str, str]] = None,
+    acronym_exclude: Optional[Sequence[str]] = None,
+) -> str:
+    """The deterministic last mile, shared by every path that produces a finished string.
+
+    Cache hits, fresh translations and the consistency sweep must all end up identical, so the
+    order of these gates lives in exactly one place.
+    """
+    out = apply_postprocess_overrides(original_text, translated_text, target_lang)
+    out = apply_counter_keyword_fixes(original_text, out, target_lang)
+    out = apply_user_glossary_fixes(original_text, out, user_glossary)
+    out = normalize_latam_spanish(original_text, out, target_lang)
+    out = enforce_acronym_integrity(original_text, out, exclude=acronym_exclude)
+    return apply_source_casing(original_text, out)
+
+
+def run_consistency_sweep(
+    client,
+    originals: Sequence[str],
+    translations: Sequence[str],
+    source_lang: str,
+    target_lang: str,
+    *,
+    max_retries: int,
+    prompt_config: PromptConfig,
+    strict_no_english_residue: bool,
+    max_budget_bytes: int,
+    user_glossary: Optional[Dict[str, str]] = None,
+    temperature: float = DEFAULT_TEMPERATURE,
+    seed: Optional[int] = DEFAULT_SEED,
+    limit: int = 400,
+) -> Dict[str, str]:
+    """One bounded pass that re-translates the minority renderings of a repeated term.
+
+    Batches run in eight independent threads with no shared state, so "translate identical
+    strings identically" is unenforceable across them -- that is why temperature and seed are
+    pinned. What neither can fix is one TERM coming out two ways in different batches, because
+    no batch ever sees the other's choice.
+
+    This closes that loop after the fact: the game's own short label strings say what each thing
+    is called, so any longer string that disagrees with its label is re-translated once with the
+    label's wording passed in as an explicit rule.
+
+    Deliberately ONE pass and capped at ``limit`` strings: it is a cleanup, not a search, and it
+    must never turn into an unbounded spend. Returns {original text: new translation}.
+    """
+    pairs = list(zip(originals, translations))
+    divergences = [row for row in _audit_discover_candidates(pairs, limit=60) if row[4]]
+    if not divergences:
+        return {}
+
+    # One string can diverge on several terms; collect every rule that applies to it.
+    rules_by_source: Dict[str, List[str]] = {}
+    for label, canonical, _ok, _count, sources in divergences:
+        for src in sources:
+            rules = rules_by_source.setdefault(src, [])
+            rule = f"- Translate '{label}' as '{canonical}' (this is the name the game shows)."
+            if rule not in rules:
+                rules.append(rule)
+        if len(rules_by_source) >= limit:
+            break
+
+    targets = list(rules_by_source)[:limit]
+    print(f"🔁 Consistency sweep: {len(targets)} string(s) disagree with their own label; "
+          f"re-translating them once with the label's wording.")
+
+    fixed: Dict[str, str] = {}
+    # Group by identical rule set so each batch carries one coherent instruction block.
+    by_rules: Dict[Tuple[str, ...], List[str]] = {}
+    for src in targets:
+        by_rules.setdefault(tuple(rules_by_source[src]), []).append(src)
+
+    for rules, group in by_rules.items():
+        extra = "CONSISTENCY (use the game's own names)\n" + "\n".join(rules)
+        base = "\n\n".join(part for part in (
+            counter_keyword_rules(group, target_lang),
+            user_glossary_rules(group, user_glossary),
+            extra,
+        ) if part)
+        for batch in yield_batches(group, max_budget_bytes):
+            try:
+                out = translate_batch_with_retry(
+                    client, batch, source_lang, target_lang, max_retries,
+                    False, prompt_config, strict_no_english_residue,
+                    base_extra_rules=base, temperature=temperature, seed=seed,
+                )
+            except Exception as exc:
+                logging.warning("Consistency sweep batch failed, keeping the old wording: %s", exc)
+                continue
+            for src_text, out_text in zip(batch, out):
+                # Same guards as the main path: never take a candidate that is worse.
+                if not out_text or not out_text.strip():
+                    continue
+                if strict_no_english_residue and has_english_residue(src_text, out_text, target_lang):
+                    continue
+                if not markup_integrity_ok(src_text, out_text):
+                    continue
+                if not counter_keyword_ok(src_text, out_text, target_lang):
+                    continue
+                fixed[src_text] = out_text
+    return fixed
+
+
 def translate_strings(
     inners: Iterable[str],
     api_key: Optional[str],
@@ -1636,6 +2268,8 @@ def translate_strings(
     strict_no_english_residue: Optional[bool] = None,
     cache_only: bool = False,
     retry_empty_cache: bool = False,
+    retranslate_stale_terms: bool = False,
+    consistency_sweep: bool = False,
     api_timeout_seconds: int = DEFAULT_API_TIMEOUT,
     batch_progress_callback: Optional[Callable[[int, int], None]] = None,
     cancel_event: Optional[threading.Event] = None,
@@ -1690,6 +2324,20 @@ def translate_strings(
 
         translations.append(initial_translation)
         indexes_by_protected.setdefault(protected_text, []).append(idx)
+    # Cached strings whose terminology rules changed since they were translated. Unknown
+    # fingerprints are never stale, so a cache with no sidecar behaves exactly as before.
+    term_fingerprints: Dict[str, str] = _load_terms_sidecar(cache_path)
+    stale_keys: set[str] = set()
+    if retranslate_stale_terms and term_fingerprints:
+        for key, idxs in indexes_by_protected.items():
+            stored = term_fingerprints.get(key)
+            if stored is None or not idxs:
+                continue
+            if stored != terminology_fingerprint(original_texts[idxs[0]], target_lang, user_glossary):
+                stale_keys.add(key)
+        if stale_keys:
+            print(f"♻️  {len(stale_keys)} cached string(s) have stale terminology; re-translating.")
+
     unique_to_translate: List[str] = []
     already_enqueued: set[str] = set()
 
@@ -1705,6 +2353,23 @@ def translate_strings(
 
         cached_value = cache.get(text)
 
+        # This loop walks the SLOTS, so the same string arrives once per occurrence. Once a
+        # string is queued its cache entry holds our own "" placeholder, and every later
+        # occurrence used to fall into the "cached empty" branch below and be counted as a
+        # previous failure -- one real run reported 4646 unresolved strings when 37 were.
+        # Its slots are filled from the batch result either way, so skip it here.
+        if text in already_enqueued:
+            continue
+
+        if cached_value and cached_value.strip() and text in stale_keys:
+            # Its terminology rules changed: drop the cached wording and re-translate it.
+            stats.terms_stale += len(indexes_by_protected.get(text, []))
+            cache[text] = ""
+            if text not in already_enqueued:
+                already_enqueued.add(text)
+                unique_to_translate.append(text)
+            continue
+
         if cached_value and cached_value.strip():
             # We already had a cached translation: reuse it everywhere and skip re-translation.
             stats.cache_used += len(indexes_by_protected.get(text, []))
@@ -1712,12 +2377,9 @@ def translate_strings(
                 restored = restore_all_tokens(
                     cached_value, token_maps[idx], phrase_maps[idx], original_texts[idx]
                 )
-                restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
-                restored = apply_user_glossary_fixes(original_texts[idx], restored, user_glossary)
-                restored = normalize_latam_spanish(original_texts[idx], restored, target_lang)
-                restored = enforce_acronym_integrity(original_texts[idx], restored, exclude=acronym_exclude)
-                restored = apply_source_casing(original_texts[idx], restored)
-                translations[idx] = restored
+                translations[idx] = finalize_translation(
+                    original_texts[idx], restored, target_lang, user_glossary, acronym_exclude
+                )
             continue
 
         if cached_value is not None and not cached_value.strip():
@@ -1746,12 +2408,57 @@ def translate_strings(
             already_enqueued.add(text)
             unique_to_translate.append(text)
 
+    def _apply_consistency_sweep(active_client) -> None:
+        """Re-translate the strings that disagree with the game's own labels, once."""
+        keys = [key for key in indexes_by_protected if (cache.get(key) or "").strip()]
+        if not keys:
+            return
+        fixed = run_consistency_sweep(
+            active_client,
+            keys,
+            [cache[key] for key in keys],
+            source_lang,
+            target_lang,
+            max_retries=max_retries,
+            prompt_config=prompt_config,
+            strict_no_english_residue=strict_no_english_residue,
+            max_budget_bytes=max_budget_bytes,
+            user_glossary=user_glossary,
+            temperature=temperature,
+            seed=seed,
+        )
+        for key, value in fixed.items():
+            idxs = indexes_by_protected.get(key, [])
+            if not idxs:
+                continue
+            cache[key] = value
+            stats.consistency_fixed += len(idxs)
+            term_fingerprints[key] = terminology_fingerprint(
+                original_texts[idxs[0]], target_lang, user_glossary
+            )
+            for idx in idxs:
+                restored = restore_all_tokens(
+                    value, token_maps[idx], phrase_maps[idx], original_texts[idx]
+                )
+                translations[idx] = finalize_translation(
+                    original_texts[idx], restored, target_lang, user_glossary, acronym_exclude
+                )
+
     if cache_only or not unique_to_translate:
+        # A fully cached run still deserves the sweep when it was asked for.
+        if consistency_sweep and api_key and not cache_only:
+            try:
+                _apply_consistency_sweep(
+                    setup_gemini(api_key, timeout_seconds=api_timeout_seconds)
+                )
+            except Exception as exc:
+                logging.warning("Consistency sweep skipped: %s", exc)
         if cache_path:
             try:
                 _write_cache_atomic(cache_path, cache)
             except Exception as exc:
                 logging.warning("Failed to write cache file: %s", exc)
+            _write_terms_sidecar(cache_path, term_fingerprints)
         return translations, stats
 
     if not api_key:
@@ -1790,7 +2497,12 @@ def translate_strings(
                 compact_prompt,
                 prompt_config,
                 strict_no_english_residue,
-                base_extra_rules=user_glossary_rules(batch, user_glossary),
+                base_extra_rules="\n\n".join(
+                    part for part in (
+                        counter_keyword_rules(batch, target_lang),
+                        user_glossary_rules(batch, user_glossary),
+                    ) if part
+                ),
                 temperature=temperature,
                 seed=seed,
             ): idx
@@ -1859,8 +2571,22 @@ def translate_strings(
                         # Kept (a broken tag beats an untranslated string) but counted, so the
                         # user can find them with --audit-spanish instead of never knowing.
                         stats.markup_rejected += len(indexes_by_protected.get(original, []))
+                    if not counter_keyword_ok(original, translated_item, target_lang):
+                        # Same policy: kept, counted, and listed by --audit-spanish. The
+                        # deterministic repair below still fixes the same-gender variants.
+                        stats.counter_keyword_rejected += len(
+                            indexes_by_protected.get(original, [])
+                        )
                     stats.api_translated += len(indexes_by_protected.get(original, []))
                     cache[original] = translated_item
+                    # Record which rules produced this wording. Only freshly translated strings
+                    # are stamped: back-filling the whole cache with today's rules would mark
+                    # the very strings a rule change is meant to catch as already up to date.
+                    idxs = indexes_by_protected.get(original, [])
+                    if idxs:
+                        term_fingerprints[original] = terminology_fingerprint(
+                            original_texts[idxs[0]], target_lang, user_glossary
+                        )
                     for idx in indexes_by_protected.get(original, []):
                         restored = restore_all_tokens(
                             translated_item,
@@ -1868,12 +2594,10 @@ def translate_strings(
                             phrase_maps[idx],
                             original_texts[idx],
                         )
-                        restored = apply_postprocess_overrides(original_texts[idx], restored, target_lang)
-                        restored = apply_user_glossary_fixes(original_texts[idx], restored, user_glossary)
-                        restored = normalize_latam_spanish(original_texts[idx], restored, target_lang)
-                        restored = enforce_acronym_integrity(original_texts[idx], restored, exclude=acronym_exclude)
-                        restored = apply_source_casing(original_texts[idx], restored)
-                        translations[idx] = restored
+                        translations[idx] = finalize_translation(
+                            original_texts[idx], restored, target_lang, user_glossary,
+                            acronym_exclude,
+                        )
 
             _batches_done += 1
             if batch_progress_callback is not None:
@@ -1901,6 +2625,12 @@ def translate_strings(
             if progress_callback:
                 progress_callback(list(translations))
 
+    if consistency_sweep:
+        try:
+            _apply_consistency_sweep(client)
+        except Exception as exc:
+            logging.warning("Consistency sweep skipped: %s", exc)
+
     # Final cache flush after all batches complete so we never lose the last in-memory updates.
     if cache_path:
         with _cache_lock:
@@ -1908,6 +2638,7 @@ def translate_strings(
                 _write_cache_atomic(cache_path, cache)
             except Exception as exc:
                 logging.warning("Failed final cache write: %s", exc)
+            _write_terms_sidecar(cache_path, term_fingerprints)
 
     return translations, stats
 
@@ -2601,6 +3332,16 @@ def self_test_quality_gate() -> None:
             f"false positive: {why} ({out_raw!r})",
         )
 
+    # Markup internals are not prose: an icon path carrying "War of the Triple Alliance" must
+    # not make a perfectly translated string ship in English.
+    icon = ('Cada Cuartel genera 2 Klephts.<font=Arial 96>'
+            '<icon="(58)(War of the Triple Alliance\\Icons\\huntinglodge)"></font>')
+    _assert(not has_english_residue("Each Barracks spawns 2 Klephts.", icon, target_lang),
+            "English inside a markup tag must not be read as residue")
+    _assert(has_english_residue("x", "<color=1,1,1>Increases the attack of the unit</color>",
+                                target_lang),
+            "residue in the text a tag WRAPS must still be caught")
+
     print("✅ Quality gate self-test passed.")
 
 
@@ -2723,6 +3464,10 @@ def self_test_glossary() -> None:
         ("Light skirmisher", "Escararuzador ligero", "Hostigador ligero"),
         ("Skirmisher attack", "Escaramuzador mejorado", "Hostigador mejorado"),
         ("skirmishers shoot faster", "Los escararuzadores disparan", "Los hostigadores disparan"),
+        ("Hand cavalry, good against skirmishers",
+         "Caballería de mano, buena contra hostigadores",
+         "Caballería cuerpo a cuerpo, buena contra hostigadores"),
+        ("Hand infantry unit", "Infantería de Mano", "Infantería cuerpo a cuerpo"),
         ("Hajduk attack increased", "Ataque de Hayduk aumentado", "Ataque de Hajduk aumentado"),
         ("The Boneguard attack", "La Guardia de Hueso ataca", "La Guardia Ósea ataca"),
         ("Boneguard Fort", "Fuerte Guardahuesos", "Fuerte Guardia Ósea"),
@@ -2792,7 +3537,7 @@ def self_test_markup_integrity() -> None:
     _assert(
         not markup_integrity_ok(
             f"Nepalese {green}skirmisher </color>that is accurate.",
-            f"Hostigador nepalí {green} </color>con precisión."),
+            f"infantería a distancia nepalí {green} </color>con precisión."),
         "an emptied <color> pair must be rejected")
     _assert(
         not markup_integrity_ok(
@@ -2802,7 +3547,7 @@ def self_test_markup_integrity() -> None:
 
     # Correct markup, and text without any, must pass.
     _assert(markup_integrity_ok(f"{green}Skirmisher </color>with low hitpoints.",
-                                f"{green}Hostigador </color>con pocos puntos de vida."),
+                                f"{green}infantería a distancia </color>con pocos puntos de vida."),
             "correctly moved markup must pass")
     _assert(markup_integrity_ok("Plain text, no markup.", "Texto plano, sin markup."),
             "text without markup must pass")
@@ -2814,6 +3559,125 @@ def self_test_markup_integrity() -> None:
             "an already-empty pair in the source is not our defect")
 
     print("✅ Markup integrity self-test passed.")
+
+
+def self_test_counter_keywords() -> None:
+    """The coloured word must keep naming the right unit class."""
+    def _assert(condition: bool, message: str) -> None:
+        if not condition:
+            raise SystemExit(f"Counter keyword self-test failed: {message}")
+
+    target = "Latin American Spanish"
+    green = "<color=0.07, 0.68, 0.17>"      # skirmisher class
+    shock = "<color=0.92, 0.84, 0.09>"      # shock units
+    assault = "<color=0.74, 0.25, 0.11>"    # assault units
+    standing = "<color=0.74, 0.11, 0.58>"   # standing units
+    scout = "<color=0.82, 0.80, 0.60>"      # scout units
+
+    ok = counter_keyword_ok
+    # The defect the community reported: correct markup, wrong class inside it.
+    _assert(not ok(f"Improves melee attack of {green}skirmishers</color>.",
+                   f"Mejora el ataque de los {green}hostigadores</color>.", target),
+            "the old term must be rejected under the green class colour")
+    _assert(ok(f"Improves melee attack of {green}skirmishers</color>.",
+               f"Mejora el ataque de la {green}infantería a distancia</color>.", target),
+            "the canon must be accepted")
+    # An English singular rendered as a Spanish plural is not a defect.
+    _assert(ok(f"A {green}skirmisher</color> unit.",
+               f"Unidades de {green}infantería a distancia</color>.", target),
+            "another canon of the same colour must be accepted")
+    # Naming a DIFFERENT class is the worst case: the text then states a false counter.
+    _assert(not ok(f"Good against {shock}shock units</color>.",
+                   f"Eficaz contra {shock}unidades de asalto</color>.", target),
+            "one class must not be labelled with the name of another")
+    _assert(ok(f"Good against {assault}assault units</color>.",
+               f"Eficaz contra {assault}unidades de asalto</color>.", target),
+            "the same words are correct under the assault colour")
+    _assert(not ok(f"Good against {green}skirmishers</color>.",
+                   f"Eficaz contra {green}</color>.", target),
+            "an emptied class tag must be rejected")
+    # "Cazador" is the Cacadore unit; using it here makes two units look like one.
+    _assert(not ok(f"Light {green}skirmishers</color>",
+                   f"Ligeros {green}cazadores</color>", target),
+            "another unit's name must not be used for the class")
+    # Not Spanish -> no canon table -> never fails.
+    _assert(ok(f"Good against {green}skirmishers</color>.", "irrelevant", "German"),
+            "non-Spanish targets must pass unchanged")
+
+    fix = apply_counter_keyword_fixes
+    _assert(fix(f"Good against {standing}standing units</color>.",
+                f"Buena contra {standing}unidades estacionarias</color>.", target)
+            == f"Buena contra {standing}unidades estáticas</color>.",
+            "same-gender variants must be repaired deterministically")
+    _assert(fix(f"{scout}Scout cavalry </color>with a lance.",
+                f"{scout}caballería exploradora </color>con lanza.", target)
+            == f"{scout}caballería de exploración </color>con lanza.",
+            "the whitespace inside the tag is part of the sentence and must survive")
+    _assert(fix(f"Good against {assault}assault units</color>.",
+                f"Eficaz contra {assault}unidades de asalto</color>.", target)
+            == f"Eficaz contra {assault}unidades de asalto</color>.",
+            "a correct canon must never be rewritten because another colour dislikes it")
+    # The green class changes gender, so a regex must NOT touch it -- see the comment on
+    # COUNTER_KEYWORD_REPAIRS. Repairing it would produce "los infantería a distancia".
+    stale = f"Mejora el ataque de los {green}hostigadores</color>."
+    _assert(fix(f"Improves melee attack of {green}skirmishers</color>.", stale, target) == stale,
+            "the gender-changing class must be left for re-translation, never regexed")
+
+    rules = counter_keyword_rules([f"Good against {shock}shock units</color>."], target)
+    _assert("unidades de choque" in rules and "infantería a distancia" not in rules,
+            "only the colours present in the batch may reach the prompt")
+
+    print("✅ Counter keyword self-test passed.")
+
+
+def self_test_skirmisher_class() -> None:
+    """'Skirmisher' is the unit CLASS inside the green tag and the unit NAME outside it."""
+    def _assert(condition: bool, message: str) -> None:
+        if not condition:
+            raise SystemExit(f"Skirmisher class self-test failed: {message}")
+
+    target = "Latin American Spanish"
+    green = "<color=0.07, 0.68, 0.17>"
+    tagged = f"{green}Skirmisher </color>hand attack increased."
+    plain = "8 Skirmishers"
+
+    tagged_rules = terminology_overrides_for_target(target, [tagged])
+    _assert("infantería a distancia" in tagged_rules,
+            "the class rule must reach a batch that carries the green tag")
+    _assert("'Hostigador'" not in tagged_rules,
+            "the unit-name rule must be blocked when the green tag is present")
+
+    plain_rules = terminology_overrides_for_target(target, [plain])
+    _assert("'Hostigador'" in plain_rules,
+            "the unit-name rule must fire without the tag")
+    _assert("infantería a distancia" not in plain_rules,
+            "the class rule must not fire without the tag")
+
+    # A batch carrying both contexts must carry both rules: source_block is per string.
+    both = terminology_overrides_for_target(target, [tagged, plain])
+    _assert("'Hostigador'" in both and "infantería a distancia" in both,
+            "a mixed batch must keep both rules")
+
+    # No output_fixes for the class: the gender change makes a regex unsafe.
+    stale = f"Ataque de los {green}hostigadores </color>aumentado."
+    _assert(apply_postprocess_overrides(tagged, stale, target) == stale,
+            "the class must never be regex-swapped")
+    # The unit name keeps its same-gender repair.
+    _assert(apply_postprocess_overrides("Light skirmisher", "Escararuzador ligero", target)
+            == "Hostigador ligero",
+            "the misspelled unit name must still be repaired")
+
+    # The audit must split the two cases as well.
+    ok_class, bad_class = _audit_term_consistency(
+        [(tagged, stale)], "skirmisher", "infantería a distancia",
+        ["Hostigador"], None, GREEN_SKIRMISHER_RE)
+    _assert(bad_class and not ok_class, "the audit must flag the old term inside the green tag")
+    ok_unit, bad_unit = _audit_term_consistency(
+        [(plain, "8 Hostigadores")], "skirmisher", "Hostigador",
+        ["Guerrillero"], GREEN_SKIRMISHER_RE, None)
+    _assert(ok_unit and not bad_unit, "the audit must leave the unit name alone")
+
+    print("✅ Skirmisher class self-test passed.")
 
 
 def self_test_misalignment() -> None:
@@ -3050,6 +3914,43 @@ def self_test_user_glossary() -> None:
     _assert(fixed == "The Metropolitana", "whole-word: longer words must not be rewritten")
     fixed = apply_user_glossary_fixes("Train a Sepoy", "Train a Sepoy", glossary)
     _assert(fixed == "Train a Sepoy", "source == target entries must be a no-op")
+
+    # --- Per-context conditions ------------------------------------------------------------
+    # One English word, two Spanish terms, told apart by what surrounds it in the source.
+    conditional = (
+        "Skirmisher | si:<color=0.07, 0.68, 0.17> = infantería a distancia\n"
+        "Skirmisher | no:<color=0.07, 0.68, 0.17> = Hostigador\n"
+        "Broken | si: = ignored\n"
+        "Broken | maybe:x = ignored\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "conditional.txt"
+        path.write_text(conditional, encoding="utf-8")
+        cond = load_user_glossary(path)
+    _assert([e.source_term for e in cond.entries] == ["Skirmisher", "Skirmisher"],
+            f"malformed conditions must be dropped, got {[e.source_term for e in cond.entries]}")
+
+    tagged = "<color=0.07, 0.68, 0.17>Skirmisher </color>attack increased."
+    plain = "8 Skirmishers"
+    tagged_rules = user_glossary_rules([tagged], cond)
+    _assert("infantería a distancia" in tagged_rules and "Hostigador" not in tagged_rules,
+            f"only the matching condition may fire: {tagged_rules}")
+    plain_rules = user_glossary_rules([plain], cond)
+    _assert("Hostigador" in plain_rules and "infantería a distancia" not in plain_rules,
+            f"the excluded condition must fire without the tag: {plain_rules}")
+    _assert("When the text contains" in tagged_rules,
+            "a conditional rule must state its condition, since a batch can carry both contexts")
+
+    # The deterministic layer honours the condition too.
+    _assert(apply_user_glossary_fixes(tagged, "Ataque de Skirmisher aumentado.", cond)
+            == "Ataque de infantería a distancia aumentado.",
+            "the conditional fix must apply in its own context")
+    _assert(apply_user_glossary_fixes(plain, "8 Skirmisher", cond) == "8 Hostigador",
+            "the excluded-condition fix must apply outside that context")
+
+    # An unconditional plain dict still works: every caller that predates this keeps working.
+    _assert(user_glossary_rules(["Sepoy here"], {"Sepoy": "Cipayo"}).count("Cipayo") == 1,
+            "a plain dict must still produce rules")
 
     print("✅ User glossary self-test passed.")
 
@@ -3473,6 +4374,21 @@ def parse_args() -> argparse.Namespace:
         help="Only use cached translations; do not call the Gemini API.",
     )
     cache_group.add_argument(
+        "--consistency-sweep",
+        action="store_true",
+        help="After translating, re-translate once the strings whose wording disagrees with the "
+             "game's own label for the same thing. Batches run in parallel and never see each "
+             "other's word choices, so this is the only place that inconsistency can be closed. "
+             "Costs extra API calls; capped at 400 strings and a single pass.",
+    )
+    cache_group.add_argument(
+        "--retranslate-stale-terms",
+        action="store_true",
+        help="Re-translate the cached strings whose terminology rules have changed since they "
+             "were translated (tracked in the sibling <cache>.terms.json). Without it, editing "
+             "the glossary leaves every already-cached string with its old wording.",
+    )
+    cache_group.add_argument(
         "--retry-empty-cache",
         action="store_true",
         help='Retry translations that were cached as empty ("").',
@@ -3540,6 +4456,24 @@ def parse_args() -> argparse.Namespace:
              "re-translates them with the current prompt and glossary.",
     )
     diag_group.add_argument(
+        "--purge-only",
+        metavar="LABEL[,LABEL...]",
+        help="With --purge-audited: purge only the strings flagged under these audit labels "
+             "(a glossary term such as 'skirmisher', or a section: keywords, untranslated, "
+             "peninsular, markup, misaligned). Without it every flagged string is purged, which "
+             "turns one terminology decision into a re-translation of everything the audit "
+             "found. The audit prints the available labels.",
+    )
+    diag_group.add_argument(
+        "--suggest-glossary",
+        type=Path,
+        metavar="TRANSLATED_XML",
+        help="Mine the XML pair for terminology the glossary is missing: the game's own short "
+             "label strings are its glossary, so a label translated one way while the "
+             "descriptions containing it say something else is a real inconsistency. Prints "
+             "ready-to-paste glossary.txt lines. Takes the source XML as 'input'; no API call.",
+    )
+    diag_group.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose (DEBUG) logging output.",
@@ -3561,7 +4495,10 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
-    if args.audit_spanish is not None:
+    if args.suggest_glossary is not None:
+        if args.input is None:
+            parser.error("--suggest-glossary also requires the source XML as 'input'")
+    elif args.audit_spanish is not None:
         if args.input is None:
             parser.error("--audit-spanish also requires the source XML as 'input'")
         if args.repair_from is not None and args.purge_audited is None:
@@ -3596,8 +4533,15 @@ def _audit_term_consistency(
     canonical: str,
     variants: Sequence[str],
     source_block: Optional["re.Pattern[str]"] = None,
+    source_require: Optional["re.Pattern[str]"] = None,
 ) -> Tuple[int, Dict[str, List[Tuple[str, str]]]]:
-    """Count how a source term was rendered: canonical vs each known-wrong variant."""
+    """Count how a source term was rendered: canonical vs each known-wrong variant.
+
+    ``source_require`` narrows a row to one context. The same English word can be two different
+    things -- 'skirmisher' inside the green counter tag is a unit CLASS, outside it is the unit
+    NAME -- and each needs its own canon, so a row must be able to say "only when this pattern
+    is in the English".
+    """
     # Allow the plural but nothing else, so "conscripted" (the verb) is not counted as a
     # variant of the noun "Conscript" -- that inflates the report and the purge list.
     trigger = re.compile(r"\b" + re.escape(term) + r"(?:e?s)?\b", re.IGNORECASE)
@@ -3610,6 +4554,8 @@ def _audit_term_consistency(
         if not trigger.search(src):
             continue
         if source_block is not None and source_block.search(src):
+            continue
+        if source_require is not None and not source_require.search(src):
             continue
         matched = False
         for name, rx in variant_res:
@@ -3714,10 +4660,57 @@ def _structurally_broken(src: str, value: Optional[str]) -> bool:
     return False
 
 
+def _audit_label_map(pairs: Sequence[Tuple[str, str]]) -> Dict[str, "collections.Counter[str]"]:
+    """Short English label strings (unit/tech/building names) -> how they were translated.
+
+    These labels are the game telling us its own glossary, so they are the reference both for the
+    discovery sweep and for the collision check below.
+    """
+    labels: Dict[str, "collections.Counter[str]"] = {}
+    for src, tgt in pairs:
+        label = src.strip()
+        if 1 <= len(label.split()) <= 3 and re.fullmatch(r"[^\W\d_][\w \-']+", label, re.UNICODE):
+            labels.setdefault(label, collections.Counter())[tgt.strip()] += 1
+    return labels
+
+
+def _audit_name_collisions(
+    pairs: Sequence[Tuple[str, str]],
+    limit: int = 25,
+) -> List[Tuple[str, List[str]]]:
+    """Several different English names sharing ONE Spanish name.
+
+    The mirror image of ``_audit_discover_candidates``, and the dangerous direction: one English
+    word rendered two ways is untidy, but two different units rendered with the SAME word makes
+    them look like one thing on screen. That is how "Guerrillero" ended up naming both the
+    `Skirmisher` and Wars of Liberty's own `Guerrilla` unit.
+
+    Reports only; which of the two names has to change is a human decision.
+    """
+    groups: Dict[str, Tuple[str, set]] = {}
+    for label, counter in _audit_label_map(pairs).items():
+        if len(label) < 5:
+            continue
+        canonical = counter.most_common(1)[0][0].strip()
+        if len(canonical) < 5 or "<" in canonical or "%" in canonical:
+            continue
+        display, names = groups.setdefault(_fold(canonical), (canonical, set()))
+        names.add(label)
+
+    results: List[Tuple[str, List[str]]] = []
+    for display, names in groups.values():
+        # Singular/plural and casing of one same English name are not a collision.
+        if len({_fold(name).rstrip("s") for name in names}) < 2:
+            continue
+        results.append((display, sorted(names)))
+    results.sort(key=lambda item: -len(item[1]))
+    return results[:limit]
+
+
 def _audit_discover_candidates(
     pairs: Sequence[Tuple[str, str]],
     limit: int = 25,
-) -> List[Tuple[str, str, int, int]]:
+) -> List[Tuple[str, str, int, int, List[str]]]:
     """Heuristic sweep for terms that are NOT in any glossary yet.
 
     Short English label strings (unit/tech/building names) are treated as the game's own
@@ -3737,11 +4730,7 @@ def _audit_discover_candidates(
         for word in set(re.findall(r"[a-z]{4,}", text)):
             index.setdefault(word, set()).add(i)
 
-    labels: Dict[str, "collections.Counter[str]"] = {}
-    for src, tgt in pairs:
-        label = src.strip()
-        if 1 <= len(label.split()) <= 3 and re.fullmatch(r"[^\W\d_][\w \-']+", label, re.UNICODE):
-            labels.setdefault(label, collections.Counter())[tgt.strip()] += 1
+    labels = _audit_label_map(pairs)
 
     def stem(word: str) -> str:
         word = strip_accents(word)
@@ -3749,7 +4738,7 @@ def _audit_discover_candidates(
             return word[:-2]
         return word[:-1] if word.endswith("s") and len(word) > 4 else word
 
-    results: List[Tuple[str, str, int, int]] = []
+    results: List[Tuple[str, str, int, int, List[str]]] = []
     for label, counter in labels.items():
         if len(label) < 5:
             continue
@@ -3769,16 +4758,17 @@ def _audit_discover_candidates(
         if not stems:
             continue
         label_norm = strip_accents(label)
-        ok = diverging = 0
+        ok = 0
+        diverging_sources: List[str] = []
         for i in candidates:
             if pairs[i][0].strip() == label or label_norm not in en_norm[i]:
                 continue
             if all(s in es_norm[i] for s in stems):
                 ok += 1
             else:
-                diverging += 1
-        if diverging and ok >= 1 and diverging <= 30:
-            results.append((label, canonical, ok, diverging))
+                diverging_sources.append(pairs[i][0])
+        if diverging_sources and ok >= 1 and len(diverging_sources) <= 30:
+            results.append((label, canonical, ok, len(diverging_sources), diverging_sources))
 
     results.sort(key=lambda r: -r[3])
     return results[:limit]
@@ -3808,46 +4798,67 @@ def run_audit_spanish_cli(
     pairs = _audit_pairs(load(source_path), load(translated_path))
     print(f"\n📋 Spanish audit — {len(pairs)} aligned string pair(s)\n" + "=" * 72)
 
-    flagged: List[str] = []
+    # Flags are kept per label (a glossary term, or a section name) so --purge-only can drop
+    # one terminology decision without dragging every other defect into the same re-translation.
+    flagged_by_label: Dict[str, List[str]] = {}
+
+    def flag(label: str, sources: Iterable[str]) -> None:
+        flagged_by_label.setdefault(label, []).extend(sources)
 
     # --- 1) Glossary-driven consistency (precise) --------------------------------------
     print("\n1. TERMINOLOGY (from SPANISH_GLOSSARY + glossary.txt)")
-    known: List[Tuple[str, str, List[str], Optional[re.Pattern[str]]]] = [
+    # (term, canonical, wrong variants, block-if-English-matches, require-English-to-match)
+    known: List[Tuple[str, str, List[str],
+                      Optional[re.Pattern[str]], Optional[re.Pattern[str]]]] = [
         ("hitpoints", "Puntos de Vida",
-         ["Puntos de Golpe", "Puntos de Resistencia", "Puntos de Salud"], None),
-        ("shipment", "Envío", ["Cargamento"], None),
-        ("settler", "Colono", ["Aldeano"], re.compile(r"\bvillagers?\b", re.IGNORECASE)),
-        ("crate", "Caja", ["Cofre", "Cajones", "Cajón"], re.compile(r"\bchests?\b", re.IGNORECASE)),
-        ("outpost", "Avanzada", ["Puesto de Avanzada", "Puesto Avanzado"], None),
-        ("deck", "Mazo", ["Baraja"], re.compile(r"\bsteel\s+decks?\b", re.IGNORECASE)),
-        ("potato", "papa", ["patata"], None),
+         ["Puntos de Golpe", "Puntos de Resistencia", "Puntos de Salud"], None, None),
+        ("shipment", "Envío", ["Cargamento"], None, None),
+        ("settler", "Colono", ["Aldeano"], re.compile(r"\bvillagers?\b", re.IGNORECASE), None),
+        ("crate", "Caja", ["Cofre", "Cajones", "Cajón"],
+         re.compile(r"\bchests?\b", re.IGNORECASE), None),
+        ("outpost", "Avanzada", ["Puesto de Avanzada", "Puesto Avanzado"], None, None),
+        ("deck", "Mazo", ["Baraja"], re.compile(r"\bsteel\s+decks?\b", re.IGNORECASE), None),
+        ("potato", "papa", ["patata"], None, None),
         # Wars of Liberty names. The variants are the ones actually found in the shipped file.
         ("allotment", "Contingente", ["Parcela", "Reparto", "Asignación"],
-         re.compile(r"\breallotments?\b", re.IGNORECASE)),
+         re.compile(r"\breallotments?\b", re.IGNORECASE), None),
         ("boneguard", "Guardia Ósea",
-         ["Boneguard", "Guardia de Hueso", "Guardahueso", "Guardaósea"], None),
+         ["Boneguard", "Guardia de Hueso", "Guardahueso", "Guardaósea"], None, None),
         ("conscript", "Conscripto", ["Recluta", "Conscrito"],
-         re.compile(r"\bconscript\s+[A-Z]", re.UNICODE)),
-        ("skirmisher", "Hostigador", ["Escaramuzador", "Escararuzador"], None),
-        ("warlord", "Caudillo", ["Señor de la guerra"], None),
-        ("pasha", "Pasha", ["Pashá", "Bajá"], None),
-        ("madrasah", "Madrasa", ["Madraza", "Madrasah"], None),
-        ("hajduk", "Hajduk", ["Hayduk"], None),
-        ("righteous fighter", "Guerrero Justo", ["Combatiente Justo", "Luchador Justiciero"], None),
+         re.compile(r"\bconscript\s+[A-Z]", re.UNICODE), None),
+        # "Skirmisher" is two different things and needs two rows. Inside the green counter tag
+        # it is the unit CLASS the engine labels "Ranged Infantry"; outside it, the unit name.
+        # One row cannot express that, hence source_require.
+        ("skirmisher", "infantería a distancia",
+         ["Hostigador", "Escaramuzador", "Escararuzador", "Cazador"], None, GREEN_SKIRMISHER_RE),
+        ("skirmisher", "Hostigador",
+         # "Guerrillero" is WoL's own Guerrilla unit and "Cazador" its Cacadore: using either
+         # here makes two different units look like one on screen.
+         ["Guerrillero", "Escaramuzador", "Escararuzador"], GREEN_SKIRMISHER_RE, None),
+        ("hand infantry", "cuerpo a cuerpo", ["Infantería de mano", "Infanteria de mano"],
+         None, None),
+        ("hand cavalry", "cuerpo a cuerpo", ["Caballería de mano", "Caballeria de mano"],
+         None, None),
+        ("warlord", "Caudillo", ["Señor de la guerra"], None, None),
+        ("pasha", "Pasha", ["Pashá", "Bajá"], None, None),
+        ("madrasah", "Madrasa", ["Madraza", "Madrasah"], None, None),
+        ("hajduk", "Hajduk", ["Hayduk"], None, None),
+        ("righteous fighter", "Guerrero Justo",
+         ["Combatiente Justo", "Luchador Justiciero"], None, None),
         ("lodge", "Cabaña", ["Logia", "Pabellón"],
-         re.compile(r"\bmasonic\s+lodges?\b", re.IGNORECASE)),
+         re.compile(r"\bmasonic\s+lodges?\b", re.IGNORECASE), None),
         ("square", "Cuadro", ["Cuadrado", "Plaza"],
-         re.compile(r"\b(?:town|city|market|village)\s+squares?\b", re.IGNORECASE)),
-        ("zapotec", "Zapoteca", ["Zapoteco"], None),
+         re.compile(r"\b(?:town|city|market|village)\s+squares?\b", re.IGNORECASE), None),
+        ("zapotec", "Zapoteca", ["Zapoteco"], None, None),
     ]
     # Anything the user added to glossary.txt that is not already covered above.
-    covered = {term.lower() for term, _c, _v, _b in known}
+    covered = {term.lower() for term, _c, _v, _b, _r in known}
     for term, target_term in sorted(user_glossary.items()):
         if term.lower() not in covered:
-            known.append((term, target_term, [], None))
+            known.append((term, target_term, [], None, None))
 
-    for term, canonical, variants, block in known:
-        ok, found = _audit_term_consistency(pairs, term, canonical, variants, block)
+    for term, canonical, variants, block, require in known:
+        ok, found = _audit_term_consistency(pairs, term, canonical, variants, block, require)
         total_wrong = sum(len(v) for v in found.values())
         if not ok and not total_wrong:
             continue
@@ -3858,7 +4869,7 @@ def run_audit_spanish_cli(
             for src, tgt in items[:2]:
                 print(f"        EN: {src[:78]}")
                 print(f"        ES: {tgt[:78]}")
-            flagged.extend(src for src, _ in items)
+            flag(term, (src for src, _ in items))
 
     # --- 2) Strings that shipped in the source language ---------------------------------
     print("\n2. UNTRANSLATED (shipped in English)")
@@ -3871,7 +4882,7 @@ def run_audit_spanish_cli(
     print(f"  {len(untranslated)} string(s) with 5+ real words are identical to the English.")
     for src, _tgt in untranslated[:5]:
         print(f"        {src[:78]}")
-    flagged.extend(src for src, _ in untranslated)
+    flag("untranslated", (src for src, _ in untranslated))
 
     # --- 3) Peninsular forms and register (report only, never rewritten) ----------------
     print("\n3. PENINSULAR FORMS (reported, never auto-rewritten — see normalize_latam_spanish)")
@@ -3882,7 +4893,7 @@ def run_audit_spanish_cli(
     print(f"  {len(hits)} string(s).")
     for src, tgt in hits[:5]:
         print(f"        {tgt[:78]}")
-    flagged.extend(src for src, _ in hits)
+    flag("peninsular", (src for src, _ in hits))
 
     tu_re = re.compile(r"\b(debes|puedes|tienes|tus|haz|eres|quieres|selecciona|presiona)\b", re.I)
     usted_re = re.compile(r"\b(usted|debe |puede |tiene |haga|seleccione|presione|elija)\b", re.I)
@@ -3908,10 +4919,26 @@ def run_audit_spanish_cli(
     for src, tgt in broken_markup[:5]:
         print(f"        EN: {src[:78]}")
         print(f"        ES: {tgt[:78]}")
-    flagged.extend(src for src, _ in broken_markup)
+    flag("markup", (src for src, _ in broken_markup))
 
-    # --- 6) Misaligned strings -----------------------------------------------------------
-    print("\n6. MISALIGNED (the Spanish belongs to a different string)")
+    # --- 6) Unit-class keywords ------------------------------------------------------------
+    print("\n6. UNIT-CLASS KEYWORDS (the coloured word names a class, not a decoration)")
+    print("   Wars of Liberty codes each unit class with a colour, and the engine prints that")
+    print("   same class in its effect tooltips. Naming another class there tells the player the")
+    print("   wrong counter; markup_integrity_ok cannot see it because the tags are intact.")
+    keyword_bad = [(src, tgt) for src, tgt in pairs
+                   if not counter_keyword_ok(src, tgt, args.target)]
+    keyword_free = [(src, tgt) for src, tgt in keyword_bad
+                    if apply_counter_keyword_fixes(src, tgt, args.target) != tgt]
+    print(f"  {len(keyword_bad)} string(s) whose coloured keyword is wrong or empty "
+          f"({len(keyword_free)} of them are repaired for free on the next --cache-only export).")
+    for src, tgt in keyword_bad[:5]:
+        print(f"        EN: {src[:78]}")
+        print(f"        ES: {tgt[:78]}")
+    flag("keywords", (src for src, _ in keyword_bad))
+
+    # --- 7) Misaligned strings -----------------------------------------------------------
+    print("\n7. MISALIGNED (the Spanish belongs to a different string)")
     misaligned = _audit_misaligned(pairs)
     print(f"  {len(misaligned)} string(s) where the Spanish is not a translation of this English.")
     if misaligned:
@@ -3922,17 +4949,31 @@ def run_audit_spanish_cli(
     for src, tgt in misaligned[:8]:
         print(f"        EN: {_audit_strip_all(src)[:78]}")
         print(f"        ES: {_audit_strip_all(tgt)[:78]}")
-    flagged.extend(src for src, _ in misaligned)
+    flag("misaligned", (src for src, _ in misaligned))
 
-    # --- 7) Discovery (noisy on purpose) -------------------------------------------------
-    print("\n7. CANDIDATES TO REVIEW — auto-detected, NOISY")
+    # --- 8) One Spanish name serving several English names --------------------------------
+    print("\n8. NAME COLLISIONS (two different units sharing one Spanish name)")
+    print("   Reported, never auto-fixed: which of the two names must change is a human call.")
+    collisions = _audit_name_collisions(pairs)
+    print(f"  {len(collisions)} Spanish name(s) serving more than one English name.")
+    for spanish, english_names in collisions[:8]:
+        print(f"  · {spanish!r} <- {', '.join(repr(n) for n in english_names[:4])}")
+
+    # --- 9) Discovery (noisy on purpose) -------------------------------------------------
+    print("\n9. CANDIDATES TO REVIEW — auto-detected, NOISY")
     print("   Terms not in any glossary whose rendering varies. Expect false positives from")
     print("   casing, inflection and proper nouns. Add the real ones to glossary.txt.")
-    for label, canonical, ok, diverging in _audit_discover_candidates(pairs):
+    for label, canonical, ok, diverging, _sources in _audit_discover_candidates(pairs):
         print(f"  · {label!r} → {canonical!r}: {ok} consistent, {diverging} diverging")
+
+    flagged: List[str] = [src for sources in flagged_by_label.values() for src in sources]
 
     print("\n" + "=" * 72)
     print(f"Total strings flagged for re-translation: {len(set(flagged))}")
+    print("  by label: " + ", ".join(
+        f"{label}={len(set(sources))}"
+        for label, sources in sorted(flagged_by_label.items()) if sources
+    ))
     if args.purge_audited or args.repair_from:
         terms, regex, exclude = _normalize_protection(
             args.protect, compile_regex_list(args.protect_regex), args.acronym_exclude)
@@ -3999,13 +5040,34 @@ def run_audit_spanish_cli(
         # --- Then purge, but only what is not already fixed for free ----------------------
         removed = free = 0
         if args.purge_audited:
-            for src in set(flagged):
+            # --purge-only narrows the purge to one decision. Without it a terminology change
+            # would drag every unrelated defect the audit found into the same re-translation.
+            if args.purge_only:
+                wanted = {name.strip().lower() for name in args.purge_only.split(",") if name.strip()}
+                known_labels = {label.lower(): label for label in flagged_by_label}
+                unknown = wanted - set(known_labels)
+                if unknown:
+                    raise SystemExit(
+                        "--purge-only: no audit label named "
+                        + ", ".join(sorted(unknown))
+                        + ". Available: " + ", ".join(sorted(flagged_by_label))
+                    )
+                purge_targets = {
+                    src for label, sources in flagged_by_label.items()
+                    if label.lower() in wanted for src in sources
+                }
+                print(f"   --purge-only {args.purge_only}: {len(purge_targets)} of "
+                      f"{len(set(flagged))} flagged string(s) considered.")
+            else:
+                purge_targets = set(flagged)
+            for src in purge_targets:
                 key = _key(src)
                 if key not in cache or key in repaired_keys:
                     continue
                 tgt = current.get(src)
                 if tgt is not None:
                     fixed = apply_postprocess_overrides(src, tgt, args.target)
+                    fixed = apply_counter_keyword_fixes(src, fixed, args.target)
                     fixed = apply_user_glossary_fixes(src, fixed, user_glossary)
                     fixed = normalize_latam_spanish(src, fixed, args.target)
                     if fixed != tgt:
@@ -4025,6 +5087,64 @@ def run_audit_spanish_cli(
     elif flagged:
         print("Use --purge-audited CACHE.json to drop these from the cache and re-translate them,")
         print("and --repair-from GOOD_CACHE.json to recover structurally broken ones without the API.")
+
+
+def run_suggest_glossary_cli(
+    args: argparse.Namespace,
+    skip_rules: SkipRules,
+    user_glossary: Dict[str, str],
+) -> None:
+    """Mine the XML pair for terminology the glossary does not cover yet.
+
+    The game ships its own glossary: every unit, tech and building has a short label string, and
+    that label's translation is the name the player actually sees on the card. When the long
+    descriptions that mention the same English word say something else, one of the two is wrong
+    -- and the player sees two names for one thing.
+
+    That is exactly how this got noticed by hand: `_locID 430207` "Ranged Infantry" is labelled
+    "Infanteria a Distancia", while 417 descriptions called the same class "hostigador". This
+    prints those disagreements as ready-to-paste glossary.txt lines instead of requiring someone
+    to spot them.
+
+    Report only: it never edits glossary.txt, because picking the right term needs the English
+    read in full (see the Allotment note in that file).
+    """
+    for path, label in ((args.input, "source"), (args.suggest_glossary, "translated")):
+        if not path.exists():
+            raise SystemExit(f"File does not exist ({label}): {path}")
+
+    def load(path: Path) -> List[TranslationTarget]:
+        tree, _fmt = parse_strings_xml(path)
+        return [t for t in iter_translatable_elements(tree.getroot(), skip_rules) if not t.skip]
+
+    pairs = _audit_pairs(load(args.input), load(args.suggest_glossary))
+    print(f"\n🔎 Glossary suggestions — {len(pairs)} aligned string pair(s)\n" + "=" * 72)
+
+    already = {term.lower() for term in user_glossary}
+    for entry in SPANISH_GLOSSARY:
+        already.add(entry.name.replace("-", " "))
+        already.add(entry.name.split("-")[0])   # "skirmisher-class" also covers "skirmisher"
+
+    candidates = _audit_discover_candidates(pairs, limit=60)
+    fresh = [row for row in candidates if row[0].lower() not in already]
+    print(f"\n1. LABEL vs DESCRIPTIONS ({len(fresh)} term(s) not covered by any glossary yet)")
+    print("   The label is the name on the card; the count is how many descriptions agree with")
+    print("   it. READ THE FULL ENGLISH STRING before pasting a line: picking by frequency is")
+    print("   exactly how 'Allotment = Asignacion' went wrong.\n")
+    for label, canonical, ok, diverging, _sources in fresh:
+        print(f"# {label!r}: the card says {canonical!r}; "
+              f"{ok} description(s) agree, {diverging} disagree")
+        print(f"{label} = {canonical}")
+
+    collisions = _audit_name_collisions(pairs, limit=40)
+    print(f"\n2. NAME COLLISIONS ({len(collisions)}) — one Spanish name, several English names")
+    print("   These cannot be fixed by adding a line: one of the two units has to be renamed,")
+    print("   and only someone who knows the mod can say which.\n")
+    for spanish, english_names in collisions:
+        print(f"# {spanish!r} <- {', '.join(repr(n) for n in english_names)}")
+
+    print("\n" + "=" * 72)
+    print("Nothing was written. Copy the lines you agree with into glossary.txt.")
 
 
 def run_build_cache_cli(
@@ -4100,6 +5220,8 @@ def main() -> None:
         self_test_user_glossary()
         self_test_latam_spanish()
         self_test_markup_integrity()
+        self_test_counter_keywords()
+        self_test_skirmisher_class()
         self_test_misalignment()
         self_test_repair_from()
         return
@@ -4119,6 +5241,14 @@ def main() -> None:
 
     if args.build_cache_from is not None:
         run_build_cache_cli(args, skip_rules, protected_terms, protected_regex, acronym_exclude)
+        return
+
+    if args.suggest_glossary is not None:
+        suggest_glossary_path = args.glossary_file
+        if suggest_glossary_path is None:
+            default_glossary = Path(__file__).with_name("glossary.txt")
+            suggest_glossary_path = default_glossary if default_glossary.exists() else None
+        run_suggest_glossary_cli(args, skip_rules, load_user_glossary(suggest_glossary_path))
         return
 
     if args.audit_spanish is not None:
@@ -4248,13 +5378,31 @@ def main() -> None:
                 f"💾 Cache found at {cache_file} "
                 f"({_total} entries: {_full} translated, {_empty} empty/failed)."
             )
-            if _translatable_count > _full:
-                _gap = _translatable_count - _full
-                print(
-                    f"   ⚠️  Approximately {_gap} string(s) are NOT in the cache. "
-                    f"These will be (re)translated. Likely causes: interrupted previous run, "
-                    f"batch failures, or duplicate source text (counted separately)."
+            # Count the strings that are actually missing, by cache key. The old estimate
+            # subtracted the number of cache ENTRIES (unique keys) from the number of text
+            # SLOTS (which repeat the same string many times), so it always over-reported --
+            # it announced 9624 missing on the WoL table when 166 were missing. That number
+            # is what makes people re-translate a whole file for no reason.
+            _missing = {
+                key for key in (
+                    protected_cache_key(
+                        text,
+                        protected_terms=protected_terms,
+                        protected_regex=protected_regex,
+                        acronym_exclude=acronym_exclude,
+                    )
+                    for text in translatable_texts
                 )
+                if not (_preview.get(key) or "").strip()
+            }
+            if _missing:
+                print(
+                    f"   ⚠️  {len(_missing)} unique string(s) are NOT in the cache and will be "
+                    f"translated. Likely causes: a new mod version, an interrupted run, batch "
+                    f"failures, or entries purged on purpose."
+                )
+            else:
+                print("   ✅ Every string in this file is already in the cache (no API calls).")
         except Exception as _exc:
             print(f"⚠️  Cache file exists but could not be parsed: {_exc}")
     else:
@@ -4291,6 +5439,8 @@ def main() -> None:
             strict_no_english_residue=strict_no_english_residue,
             cache_only=args.cache_only,
             retry_empty_cache=args.retry_empty_cache,
+            retranslate_stale_terms=args.retranslate_stale_terms,
+            consistency_sweep=args.consistency_sweep,
             api_timeout_seconds=args.api_timeout,
             user_glossary=user_glossary or None,
         )
@@ -4323,6 +5473,14 @@ def main() -> None:
             summary.append(f"  ⚠️  Batch failures  : {stats.batch_failed} (left in source language)")
         if stats.markup_rejected:
             summary.append(f"  ⚠️  Markup broken   : {stats.markup_rejected} (<color> tags lost; see --audit-spanish)")
+        if stats.counter_keyword_rejected:
+            summary.append(
+                f"  ⚠️  Wrong unit class: {stats.counter_keyword_rejected} "
+                "(coloured keyword names the wrong class; see --audit-spanish)")
+        if stats.terms_stale:
+            summary.append(f"  ♻️  Stale terms     : {stats.terms_stale} (re-translated after a rule change)")
+        if stats.consistency_fixed:
+            summary.append(f"  🔁 Consistency fix : {stats.consistency_fixed} (aligned with the game's own labels)")
         print("\n".join(summary))
 
         # Loud warning if the job finished with untranslated material.

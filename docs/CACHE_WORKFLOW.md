@@ -112,6 +112,34 @@ Important notes:
 
 ---
 
+## 4b) The terminology sidecar (`<cache>.terms.json`)
+
+Next to every cache file the engine keeps a small companion, e.g. `wol_es.cache.json` →
+`wol_es.terms.json`. It maps each cache key to a hash of the terminology rules that produced that
+wording — only the rules that actually fired for that string, so adding an unrelated term does not
+invalidate anything else.
+
+**The cache file itself is never changed.** Its contract (every key is a real source string, `""`
+means "retry me") is the load-bearing invariant of this project, so the metadata gets its own file.
+
+Why it exists: the cache key is the source text, so editing `glossary.txt` or a canon reaches only
+the strings that happen to be re-translated afterwards. Before, the only way to force the rest was
+`--purge-audited`, which drops **everything** the audit flagged. Now:
+
+```bat
+python translate_gemini.py "stringtabley.xml" "out.xml" ^
+  --api-key "KEY" --cache-file "wol_es.cache.json" --retranslate-stale-terms
+```
+
+Only freshly translated strings get stamped. Back-filling the whole cache with today's rules would
+mark the very strings a rule change is meant to catch as already up to date, so the sidecar fills
+in gradually and a string with no stamp behaves exactly as it did before.
+
+Safe to delete (you just lose the ability to detect stale wording) and safe to commit alongside the
+cache.
+
+---
+
 ## 5) “Empty cache” entries (`""`) and why they exist
 
 Sometimes a cache entry can be stored as empty (`""`). This usually means one of these happened previously:

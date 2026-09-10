@@ -88,8 +88,26 @@ Works for any language pair (entries only fire when the source term appears in a
 layers: the prompt instructs Gemini per batch, and a deterministic pass fixes source terms left
 untranslated in the output. CLI: picked up automatically, or pass `--glossary-file "my.txt"`.
 
+### Two terms for one word (per-context conditions)
+
+Sometimes one English word needs two different translations depending on where it appears. Add
+`|`-separated conditions before the `=`; they are checked against the **English** text:
+
+```text
+Skirmisher | si:<color=0.07, 0.68, 0.17> = infantería a distancia
+Skirmisher | no:<color=0.07, 0.68, 0.17> = Hostigador
+```
+
+`si:` / `solo si:` / `if:` / `only if:` require the text; `no:` / `not:` / `unless:` forbid it. A
+conditional line splits at its **last** `=`, so a colour code inside the condition is safe. The
+condition is sent to the model along with the rule, because one batch can carry both contexts.
+
+(That particular example already lives in the engine — see `COUNTER_KEYWORDS` — it is shown here
+only as the syntax.)
+
 Note: the glossary does NOT change cache keys — strings translated before you added a term keep
-their old wording until re-translated.
+their old wording until re-translated. `--retranslate-stale-terms` is the targeted way to refresh
+exactly those; see below.
 
 ---
 
@@ -221,6 +239,15 @@ python translate_gemini.py --self-test-merge
 * `--cache-file "PATH"`: use a specific cache file instead of the default `<output>.cache.json`.
 * `--cache-only`: never call the API; only apply cache.
 * `--retry-empty-cache`: retry entries cached as empty (`""`). Use this only if you want to force retries.
+* `--retranslate-stale-terms`: re-translate the cached strings whose **terminology rules changed**
+  since they were translated. Each freshly translated string is stamped with a hash of the rules
+  that produced it, in a sibling `<cache>.terms.json` (the cache file itself is never touched).
+  Without a stamp a string is simply "unknown" and behaves as before, so the sidecar fills in over
+  time. This is the narrow alternative to purging everything the audit flags.
+* `--consistency-sweep`: after translating, re-translate **once** the strings whose wording
+  disagrees with the game's own label for the same thing. Batches run in parallel and never see
+  each other's word choices, so this is the only place that inconsistency can be closed. Costs
+  extra API calls; capped at 400 strings and a single pass.
 * `--build-cache-from "TRANSLATED.xml"`: build the cache from an already-translated XML instead
   of translating. Takes the source XML as the `input` positional and writes to `--cache-file`;
   `output` is not required and the API is never called. See "Rebuild cache" above.
@@ -242,11 +269,22 @@ Takes the XML **pair** — the source as `input`, the translation as the flag va
 checks have to be triggered by the English. Without the source you would flag "Tarjeta de Navidad"
 (correct for "Christmas Card") and miss that "Cofre" is right when "Chest" is in the source.
 
-It reports seven things: glossary terminology (canon vs each wrong variant), strings that shipped
+It reports nine things: glossary terminology (canon vs each wrong variant), strings that shipped
 untranslated, peninsular forms and tú/usted balance, punctuation the LatAm gate would fix, broken
-`<color>` markup, strings whose Spanish belongs to a *different* string (see Troubleshooting 14),
-and a final **noisy** "candidates to review" list of terms whose rendering varies but that are in
-no glossary yet — add the real ones to `glossary.txt`.
+`<color>` markup, **coloured keywords naming the wrong unit class**, strings whose Spanish belongs
+to a *different* string (see Troubleshooting 14), **one Spanish name serving several English
+names**, and a final **noisy** "candidates to review" list of terms whose rendering varies but that
+are in no glossary yet — add the real ones to `glossary.txt`.
+
+Section 6 (unit-class keywords) is the one that catches the worst class of error: the `<color>`
+tags are intact, so the markup check passes, but the word inside names a *different* unit class —
+15 strings told the player that a unit was good against "unidades de asalto" when the English said
+`shock units`. Section 8 (name collisions) is report-only: it finds two different units sharing one
+Spanish name, which makes them look like one thing on screen, but which of the two has to be
+renamed is a human decision.
+
+The summary ends with a per-label breakdown (`skirmisher=294, keywords=425, untranslated=163, …`).
+Those labels are what `--purge-only` accepts.
 
 When adding a term to `glossary.txt`, read the full English string first: `Allotment` looks like a
 plot of land but the English says it "musters" and "contains units", so it is a block of troops.
@@ -255,6 +293,22 @@ Add `--purge-audited wol_es.cache.json` to delete the flagged strings from a cac
 run re-translates them with the current prompt and glossary. It **keeps** the strings the
 deterministic post-process already repairs on export — purging those would throw away a good
 translation and pay for it again.
+
+Add `--purge-only LABEL[,LABEL...]` to narrow that to one decision, e.g. `--purge-only skirmisher`
+or `--purge-only keywords,markup`. Without it, changing a single term re-translates everything the
+audit found (≈1200 strings on the shipped table), which makes the change impossible to review.
+
+### Finding terminology the glossary is missing (0 API calls)
+
+```bat
+python translate_gemini.py "stringtabley.xml" --suggest-glossary "stringtabley_es_latam.xml"
+```
+
+The game ships its own glossary: every unit, tech and building has a short label string, and that
+label's translation is the name the player reads on the card. When the long descriptions mentioning
+the same English word say something else, one of the two is wrong — and the player sees two names
+for one thing. This prints those disagreements as ready-to-paste `glossary.txt` lines, plus the
+name collisions. It never writes the file: picking the right term needs the English read in full.
 
 Add `--repair-from GOOD_CACHE.json` alongside it to recover **structurally broken** strings from
 an older, known-good cache instead of re-translating them. "Structural" means the slot holds

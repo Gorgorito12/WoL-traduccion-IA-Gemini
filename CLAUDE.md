@@ -101,7 +101,7 @@ when touching them.
    **`markup_integrity_ok`** is the one gate that is NOT language-gated: `<color=...>` markup is
    identical in every target. In this game the coloured word is the *counter keyword* (what a unit
    is strong against), so losing it loses information, not styling. Spanish reorders adjective and
-   noun ("Nepalese skirmisher" → "Hostigador nepalí") and the model routinely leaves the pair empty
+   noun ("Nepalese skirmisher" → "infantería a distancia nepalí") and the model leaves the pair empty
    or drops it — 61 strings in the shipped translation. It only **detects**: once the sentence is
    reordered a regex cannot know where the word went, so `translate_batch_with_retry` retries with
    `STRICT_MARKUP_RULES` exactly the way the residue gate retries, and `MARKUP_PROMPT_RULE` is sent
@@ -109,6 +109,41 @@ when touching them.
    retries are kept — a broken tag still beats an untranslated string — but counted in
    `TranslationStats.markup_rejected` and listed by `--audit-spanish`. Guarded by
    `self_test_markup_integrity`.
+
+   **`COUNTER_KEYWORDS` — the coloured word is vocabulary, not decoration.** WoL does not use
+   vanilla AoE3 counter wording: it defines seven unit classes and codes each with a colour
+   (`line unit`, `skirmisher`, `shock unit`, `standing unit`, `maneuver …`, `assault …`,
+   `scout …`), and the **engine prints that same class in its effect tooltips**. `markup_integrity_ok`
+   only counts tags, so nothing checked *what was inside them* and the vocabulary rotted silently:
+   15 strings called `shock units` "unidades de asalto" — the name of a **different** class —
+   `standing units` shipped under four names, and the green class shipped as "hostigador", a word
+   the game never displays anywhere else. That last one is the bug the community reported: the card
+   said *hostigadores* while the tooltip said *Infantería a Distancia*, so the Peruvian Legion (line
+   infantry) looked like it should not get a bonus it does get.
+
+   Three layers off one table, the same shape as `GlossaryEntry`: `counter_keyword_rules` injects
+   the canons into batches that contain that colour, `counter_keyword_ok` verifies the span still
+   names a class of its own colour (retried with `STRICT_COUNTER_KEYWORD_RULES`, counted in
+   `TranslationStats.counter_keyword_rejected`, listed by `--audit-spanish` section 6), and
+   `apply_counter_keyword_fixes` repairs deterministically. **That repair is colour-scoped and this
+   is load-bearing**: "unidades de asalto" is the *correct* canon under the assault colour and a
+   wrong-class defect under the shock colour, so it can never be a global regex.
+
+   **The green class is prompt-only on purpose** (`COUNTER_KEYWORD_REPAIRS` has no entry for it):
+   `hostigador` (m.) → `infantería a distancia` (f.) changes gender *and* head noun, so a regex
+   would leave "los infantería a distancia". Same rule as `crate`/`outpost`/`deck` — re-translate
+   instead. The other six classes keep gender, so they are repaired for free by `--cache-only`.
+   Guarded by `self_test_counter_keywords`.
+
+   **`skirmisher` is split in two** (`self_test_skirmisher_class`): the green tag wraps only that
+   word, in all 475 of its occurrences, so its presence separates the CLASS
+   (`skirmisher-class`, canon *infantería a distancia*, `output_fixes=()`) from the unit NAME
+   (`skirmisher-unit`, canon *Hostigador*, blocked by `source_block=GREEN_SKIRMISHER_RE`). The unit
+   name must never be *Guerrillero* (WoL's own `Guerrilla` unit) nor *Cazador* (its `Cacadore`) —
+   and no historically period-correct term is available either, because the mod's roster is made
+   of them: Cazador, Tirador, Fusilero, Carabinero and Guerrillero are all units in this game.
+   Note `terminology_overrides_for_target` now honours `source_block` **per string, not per
+   batch**, or one blocked string would silence a rule for everything travelling with it.
 
    **`has_english_residue` fails INTO the source language**: a flagged string is not written and not
    cached, so the English ships. Its stopword list must therefore stay narrow — `original` and
@@ -124,8 +159,13 @@ when touching them.
    `base_extra_rules`, composed with the strict-retry rules), and `apply_user_glossary_fixes`
    deterministically replaces a source term the model left untranslated (whole-word for Latin,
    plain replace for CJK) — it runs at both postprocess points, so it also fixes cache hits. It
-   canNOT fix a wrong-but-translated synonym (that's the prompt layer's job). Glossary changes do
-   not alter cache keys, so already-cached strings keep their old wording. Threaded through
+   canNOT fix a wrong-but-translated synonym (that's the prompt layer's job). A line may carry
+   `|`-separated **conditions** checked against the English original — `Term | si:TEXT = target`
+   requires it, `| no:TEXT` forbids it — so one English word can map to two terms by context; a
+   conditional line splits at its LAST `=`, since a colour code contains one. The condition travels
+   into the prompt text itself, because a batch can carry both contexts of the same word. Glossary
+   changes do not alter cache keys, so already-cached strings keep their old wording unless
+   `--retranslate-stale-terms` is used. Threaded through
    `translate_strings(user_glossary=...)`; the GUI auto-loads `glossary.txt` on each run and its
    "Glosario…" button (Avanzado) creates/opens it. Guarded by `self_test_user_glossary`.
 7. **Reassemble & write.** `assemble_full_texts` merges translated + skipped text back in original
@@ -146,6 +186,14 @@ language" pattern — see `docs/CACHE_WORKFLOW.md`).
   silently poisons future runs. The existing code guards this (`translated_batch = None` path).
 - Cache writes are debounced (`CACHE_FLUSH_EVERY_N_BATCHES` / `CACHE_FLUSH_EVERY_SECONDS`) and
   atomic (`_write_cache_atomic`).
+- **Terminology fingerprints live in a SIBLING file, never in the cache**: `<cache>.terms.json`
+  (`_terms_sidecar_path`) maps cache key → `terminology_fingerprint`, a hash of only the rules that
+  actually fire for that string. The cache's every key is a real source string and that namespace
+  stays clean. `--retranslate-stale-terms` re-translates the entries whose rules changed since —
+  the narrow alternative to purging everything the audit flags. **Only freshly translated strings
+  are stamped**: back-filling the whole cache with today's rules would mark the very strings a rule
+  change is meant to catch as already up to date. A missing sidecar means "unknown", which behaves
+  exactly like the old code, so `self_test_cache_key_parity` is untouched.
 
 ### Resumability
 
@@ -302,6 +350,20 @@ identically" is unenforceable and the SDK's default temperature of 1.0 made one 
 ways *on the same screen* (`deck` → both "mazo" and "baraja"). `seed` is added in its own
 try/except because not every `google-genai` release accepts it.
 
+`--consistency-sweep` closes what temperature and seed cannot: they make one batch deterministic,
+but eight parallel batches never see each other's word choices, so one TERM can still come out two
+ways in one run. `run_consistency_sweep` compares the finished strings against the game's own short
+labels and re-translates the minority once, with the label's wording passed in as an explicit rule.
+Deliberately **one pass, capped at 400 strings, opt-in**: it is a cleanup, not a search, and it
+must never become an unbounded spend. Candidates are refused unless they clear the same residue,
+markup and unit-class guards as the main path. It operates on the PROTECTED strings, like the rest
+of the pipeline, so cache keys stay identical.
+
+`finalize_translation` is the single deterministic last mile (`apply_postprocess_overrides` →
+`apply_counter_keyword_fixes` → `apply_user_glossary_fixes` → `normalize_latam_spanish` →
+`enforce_acronym_integrity` → `apply_source_casing`), shared by cache hits, fresh translations and
+the sweep so all three cannot drift apart.
+
 `translate_batch_gemini` sets `thinking_config=ThinkingConfig(thinking_budget=0)`: 2.5 Flash's
 default *dynamic thinking* bills its hidden reasoning tokens at the output price and adds nothing
 to mechanical translation — do not remove this without a reason (it silently multiplies cost). The
@@ -345,9 +407,35 @@ source language", or the 4463 proper nouns that survive translation would all qu
 was just fixed. `--purge-audited` also now skips anything the deterministic post-process already
 repairs on export — purging those would discard a good translation and pay for it again.
 
+The audit flags are kept **per label** (`flagged_by_label`: a glossary term, or a section name such
+as `keywords`, `untranslated`, `markup`, `misaligned`, `peninsular`) and the summary prints the
+breakdown. `--purge-only LABEL[,LABEL...]` narrows the purge to those, so one terminology decision
+does not drag every other defect into the same re-translation — without it a single term change
+means re-translating everything the audit found (≈1200 strings on the shipped table).
+
+Two sections were added. **6. UNIT-CLASS KEYWORDS** runs `counter_keyword_ok` over the pair and
+separates the ones `apply_counter_keyword_fixes` repairs for free. **8. NAME COLLISIONS**
+(`_audit_name_collisions`) is the mirror of `_audit_discover_candidates`: that one finds one English
+word rendered several ways, this one finds several English names sharing ONE Spanish name — the
+dangerous direction, because it makes two different units look like one thing on screen (that is
+how *Guerrillero* ended up naming both `Skirmisher` and WoL's own `Guerrilla`). Report-only: which
+of the two names must change is a human call. Both reuse `_audit_label_map`.
+
+`--suggest-glossary TRANSLATED_XML` (`run_suggest_glossary_cli`) mines the pair for terminology no
+glossary covers, and prints ready-to-paste `glossary.txt` lines. The premise is that the game ships
+its own glossary: every unit has a short label string whose translation is the name on the card, so
+a description disagreeing with its own label is a real inconsistency. It never writes the file —
+picking the right term needs the English read in full.
+
 Note `_FORMAT_SPECIFIER_RE` was widened to cover WoL's own `%1s`/`%2.2f` forms (it only matched
 `%s` and `%1$s`), so `placeholders_compatible` — and with it the merge guard and the repair
 guard — finally sees them.
+
+**`Skirmisher` is the exception that proves the rule and stays in code**: it needs the colour tag
+to tell its two meanings apart, so it lives in `COUNTER_KEYWORDS` + the two `SPANISH_GLOSSARY`
+entries, and `glossary.txt` carries only a comment pointing there. Its old flat line
+(`Skirmisher = Hostigador`) had to go: `user_glossary_rules` would have injected it into the green
+batches too, contradicting the class rule.
 
 **Mod terminology lives in `glossary.txt`, not in code.** Twelve Wars of Liberty terms were each
 shipping under several Spanish names (`Allotment` alone had four: *Parcela*, *Reparto*,
